@@ -18,6 +18,8 @@
 #include <cudf/detail/iterator.cuh>
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/search.hpp>
+#include <cudf/dictionary/detail/search.hpp>
+#include <cudf/dictionary/detail/update_keys.hpp>
 #include <cudf/scalar/scalar_device_view.cuh>
 #include <cudf/search.hpp>
 #include <cudf/table/row_operators.cuh>
@@ -139,35 +141,30 @@ struct contains_scalar_dispatch {
   template <typename Element>
   bool operator()(column_view const& col, scalar const& value, cudaStream_t stream)
   {
+    CUDF_EXPECTS(col.type() == value.type(), "scalar and column types must match");
+
+    using Type       = device_storage_type_t<Element>;
     using ScalarType = cudf::scalar_type_t<Element>;
     auto d_col       = column_device_view::create(col, stream);
     auto s           = static_cast<const ScalarType*>(&value);
 
     if (col.has_nulls()) {
       auto found_iter = thrust::find(rmm::exec_policy(stream)->on(stream),
-                                     d_col->pair_begin<Element, true>(),
-                                     d_col->pair_end<Element, true>(),
+                                     d_col->pair_begin<Type, true>(),
+                                     d_col->pair_end<Type, true>(),
                                      thrust::make_pair(s->value(), true));
 
-      return found_iter != d_col->pair_end<Element, true>();
+      return found_iter != d_col->pair_end<Type, true>();
     } else {
-      auto found_iter = thrust::find(rmm::exec_policy(stream)->on(stream),
-                                     d_col->begin<Element>(),
-                                     d_col->end<Element>(),
+      auto found_iter = thrust::find(rmm::exec_policy(stream)->on(stream),  //
+                                     d_col->begin<Type>(),
+                                     d_col->end<Type>(),
                                      s->value());
 
-      return found_iter != d_col->end<Element>();
+      return found_iter != d_col->end<Type>();
     }
   }
 };
-
-template <>
-bool contains_scalar_dispatch::operator()<cudf::dictionary32>(column_view const& col,
-                                                              scalar const& value,
-                                                              cudaStream_t stream)
-{
-  CUDF_FAIL("dictionary type not supported yet");
-}
 
 template <>
 bool contains_scalar_dispatch::operator()<cudf::list_view>(column_view const& col,
@@ -185,13 +182,29 @@ bool contains_scalar_dispatch::operator()<cudf::struct_view>(column_view const& 
   CUDF_FAIL("struct_view type not supported yet");
 }
 
+template <>
+bool contains_scalar_dispatch::operator()<cudf::dictionary32>(column_view const& col,
+                                                              scalar const& value,
+                                                              cudaStream_t stream)
+{
+  auto dict_col = cudf::dictionary_column_view(col);
+  // first, find the value in the dictionary's key set
+  auto index = cudf::dictionary::detail::get_index(
+    dict_col, value, rmm::mr::get_current_device_resource(), stream);
+  // if found, check the index is actually in the indices column
+  return index->is_valid() ? cudf::type_dispatcher(dict_col.indices().type(),
+                                                   contains_scalar_dispatch{},
+                                                   dict_col.indices(),
+                                                   *index,
+                                                   stream)
+                           : false;
+}
+
 }  // namespace
 
 namespace detail {
 bool contains(column_view const& col, scalar const& value, cudaStream_t stream)
 {
-  CUDF_EXPECTS(col.type() == value.type(), "DTYPE mismatch");
-
   if (col.size() == 0) { return false; }
 
   if (not value.is_valid()) { return col.has_nulls(); }
@@ -255,16 +268,6 @@ struct multi_contains_dispatch {
 };
 
 template <>
-std::unique_ptr<column> multi_contains_dispatch::operator()<dictionary32>(
-  column_view const& haystack,
-  column_view const& needles,
-  rmm::mr::device_memory_resource* mr,
-  cudaStream_t stream)
-{
-  CUDF_FAIL("dictionary type not supported");
-}
-
-template <>
 std::unique_ptr<column> multi_contains_dispatch::operator()<list_view>(
   column_view const& haystack,
   column_view const& needles,
@@ -282,6 +285,34 @@ std::unique_ptr<column> multi_contains_dispatch::operator()<struct_view>(
   cudaStream_t stream)
 {
   CUDF_FAIL("struct_view type not supported");
+}
+
+template <>
+std::unique_ptr<column> multi_contains_dispatch::operator()<dictionary32>(
+  column_view const& haystack_in,
+  column_view const& needles_in,
+  rmm::mr::device_memory_resource* mr,
+  cudaStream_t stream)
+{
+  dictionary_column_view const haystack(haystack_in);
+  dictionary_column_view const needles(needles_in);
+  // first combine keys so both dictionaries have the same set
+  auto haystack_matched = dictionary::detail::add_keys(
+    haystack, needles.keys(), rmm::mr::get_current_device_resource(), stream);
+  auto const haystack_view = dictionary_column_view(haystack_matched->view());
+  auto needles_matched     = dictionary::detail::set_keys(
+    needles, haystack_view.keys(), rmm::mr::get_current_device_resource(), stream);
+  auto const needles_view = dictionary_column_view(needles_matched->view());
+
+  // now just use the indices for the contains
+  column_view const haystack_indices = haystack_view.get_indices_annotated();
+  column_view const needles_indices  = needles_view.get_indices_annotated();
+  return cudf::type_dispatcher(haystack_indices.type(),
+                               multi_contains_dispatch{},
+                               haystack_indices,
+                               needles_indices,
+                               mr,
+                               stream);
 }
 
 std::unique_ptr<column> contains(column_view const& haystack,

@@ -22,6 +22,8 @@
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/replace.hpp>
 #include <cudf/detail/utilities/cuda.cuh>
+#include <cudf/dictionary/detail/replace.hpp>
+#include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/replace.hpp>
 #include <cudf/scalar/scalar.hpp>
@@ -259,6 +261,18 @@ std::unique_ptr<cudf::column> replace_nulls_column_kernel_forwarder::operator()<
                                    mr);
 }
 
+template <>
+std::unique_ptr<cudf::column> replace_nulls_column_kernel_forwarder::operator()<cudf::dictionary32>(
+  cudf::column_view const& input,
+  cudf::column_view const& replacement,
+  rmm::mr::device_memory_resource* mr,
+  cudaStream_t stream)
+{
+  cudf::dictionary_column_view dict_input(input);
+  cudf::dictionary_column_view dict_repl(replacement);
+  return cudf::dictionary::detail::replace_nulls(dict_input, dict_repl, mr, stream);
+}
+
 template <typename T>
 struct replace_nulls_functor {
   T* value_it;
@@ -271,26 +285,29 @@ struct replace_nulls_functor {
  *        `replace_nulls` with the appropriate data types.
  */
 struct replace_nulls_scalar_kernel_forwarder {
-  template <typename col_type, std::enable_if_t<cudf::is_fixed_width<col_type>()>* = nullptr>
+  template <typename col_type,
+            typename std::enable_if_t<cudf::is_fixed_width<col_type>()>* = nullptr>
   std::unique_ptr<cudf::column> operator()(cudf::column_view const& input,
                                            cudf::scalar const& replacement,
                                            rmm::mr::device_memory_resource* mr,
                                            cudaStream_t stream = 0)
   {
+    CUDF_EXPECTS(input.type() == replacement.type(), "Data type mismatch");
     std::unique_ptr<cudf::column> output =
       cudf::allocate_like(input, cudf::mask_allocation_policy::NEVER, mr);
     auto output_view = output->mutable_view();
 
+    using Type       = cudf::device_storage_type_t<col_type>;
     using ScalarType = cudf::scalar_type_t<col_type>;
     auto s1          = static_cast<ScalarType const&>(replacement);
     auto device_in   = cudf::column_device_view::create(input);
 
-    replace_nulls_functor<col_type> func(s1.data());
+    auto func = replace_nulls_functor<Type>{s1.data()};
     thrust::transform(rmm::exec_policy(stream)->on(stream),
-                      input.data<col_type>(),
-                      input.data<col_type>() + input.size(),
+                      input.data<Type>(),
+                      input.data<Type>() + input.size(),
                       cudf::detail::make_validity_iterator(*device_in),
-                      output_view.data<col_type>(),
+                      output_view.data<Type>(),
                       func);
     return output;
   }
@@ -312,9 +329,21 @@ std::unique_ptr<cudf::column> replace_nulls_scalar_kernel_forwarder::operator()<
   rmm::mr::device_memory_resource* mr,
   cudaStream_t stream)
 {
+  CUDF_EXPECTS(input.type() == replacement.type(), "Data type mismatch");
   cudf::strings_column_view input_s(input);
   const cudf::string_scalar& repl = static_cast<const cudf::string_scalar&>(replacement);
   return cudf::strings::replace_nulls(input_s, repl, mr);
+}
+
+template <>
+std::unique_ptr<cudf::column> replace_nulls_scalar_kernel_forwarder::operator()<cudf::dictionary32>(
+  cudf::column_view const& input,
+  cudf::scalar const& replacement,
+  rmm::mr::device_memory_resource* mr,
+  cudaStream_t stream)
+{
+  cudf::dictionary_column_view dict_input(input);
+  return cudf::dictionary::detail::replace_nulls(dict_input, replacement, mr, stream);
 }
 
 }  // end anonymous namespace
@@ -347,8 +376,6 @@ std::unique_ptr<cudf::column> replace_nulls(cudf::column_view const& input,
   if (!input.has_nulls() || !replacement.is_valid()) {
     return std::make_unique<cudf::column>(input, stream, mr);
   }
-
-  CUDF_EXPECTS(input.type() == replacement.type(), "Data type mismatch");
 
   return cudf::type_dispatcher(
     input.type(), replace_nulls_scalar_kernel_forwarder{}, input, replacement, mr, stream);
