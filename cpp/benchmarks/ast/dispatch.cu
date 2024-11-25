@@ -38,69 +38,112 @@ enum class binary_op : int32_t {
   FLOOR_DIV = 5,
   MOD       = 6,
   PYMOD     = 7,
-  POW       = 8
+  POW       = 8,
+  SINCOS    = 9
 };
 
-__device__ float add(float a, float b) { return a + b; }
+template <typename T>
+__device__ T xadd(T a, T b)
+{
+  return a + b;
+}
 
-__device__ float sub(float a, float b) { return a - b; }
+template <typename T>
+__device__ T xsub(T a, T b)
+{
+  return a - b;
+}
 
-__device__ float mul(float a, float b) { return a * b; }
+template <typename T>
+__device__ T xmul(T a, T b)
+{
+  return a * b;
+}
 
-__device__ float div(float a, float b) { return a / b; }
+template <typename T>
+__device__ T xdiv(T a, T b)
+{
+  return a / b;
+}
 
-__device__ float true_div(float a, float b) { return a / b; }
+template <typename T>
+__device__ T xtrue_div(T a, T b)
+{
+  return (T)((float)a / (float)b);
+}
 
-__device__ float floor_div(float a, float b) { return a / b; }
+template <typename T>
+__device__ T xfloor_div(T a, T b)
+{
+  return (T)((int64_t)(a / b));
+}
 
-__device__ float mod(float a, float b) { return (float)((int64_t)(a) % (int64_t)b); }
+template <typename T>
+__device__ T xmod(T a, T b)
+{
+  return (T)((int64_t)(a) % (int64_t)b);
+}
 
-__device__ float pymod(float a, float b) { return (float)((int64_t)(a) % (int64_t)b); }
+template <typename T>
+__device__ T xpymod(T a, T b)
+{
+  return (T)((int64_t)(a) % (int64_t)b);
+}
 
-__device__ float pow_fn(float a, float b) { return std::pow(a, b); }
+template <typename T>
+__device__ T xpow_fn(T a, T b)
+{
+  return (T)std::pow(a, b);
+}
 
-__global__ void switch_dispatch(float const* __restrict a,
-                                float const* __restrict b,
-                                float* __restrict c,
+template <typename T>
+__device__ T xsincos(T a, T b)
+{
+  return (T)(std::sin(a) * std::cos(b));
+}
+
+template <typename T>
+using binary_func = T (*)(T, T);
+
+template <typename T>
+__global__ void switch_dispatch(T const* __restrict a,
+                                T const* __restrict b,
+                                T* __restrict c,
                                 int64_t n,
                                 cudf::ast::ast_operator op)
 {
   uint64_t i = (uint64_t)threadIdx.x + (uint64_t)blockDim.x * (uint64_t)blockIdx.x;
 
   switch (op) {
-    case cudf::ast::ast_operator::ADD: c[i] = add(a[i], b[i]); return;
-    case cudf::ast::ast_operator::SUB: c[i] = sub(a[i], b[i]); return;
-    case cudf::ast::ast_operator::MUL: c[i] = mul(a[i], b[i]); return;
-    case cudf::ast::ast_operator::DIV: c[i] = div(a[i], b[i]); return;
-    case cudf::ast::ast_operator::TRUE_DIV: c[i] = true_div(a[i], b[i]); return;
-    case cudf::ast::ast_operator::FLOOR_DIV: c[i] = floor_div(a[i], b[i]); return;
-    case cudf::ast::ast_operator::MOD: c[i] = mod(a[i], b[i]); return;
-    case cudf::ast::ast_operator::PYMOD: c[i] = pymod(a[i], b[i]); return;
-    case cudf::ast::ast_operator::POW: c[i] = pow_fn(a[i], b[i]); return;
+    case cudf::ast::ast_operator::ADD: c[i] = xadd(a[i], b[i]); return;
+    case cudf::ast::ast_operator::SUB: c[i] = xsub(a[i], b[i]); return;
+    case cudf::ast::ast_operator::MUL: c[i] = xmul(a[i], b[i]); return;
+    case cudf::ast::ast_operator::DIV: c[i] = xdiv(a[i], b[i]); return;
+    case cudf::ast::ast_operator::TRUE_DIV: c[i] = xtrue_div(a[i], b[i]); return;
+    case cudf::ast::ast_operator::FLOOR_DIV: c[i] = xfloor_div(a[i], b[i]); return;
+    case cudf::ast::ast_operator::MOD: c[i] = xmod(a[i], b[i]); return;
+    case cudf::ast::ast_operator::PYMOD: c[i] = xpymod(a[i], b[i]); return;
+    case cudf::ast::ast_operator::POW: c[i] = xpow_fn(a[i], b[i]); return;
+    case cudf::ast::ast_operator::SINH: c[i] = xsincos(a[i], b[i]); return;
     default: CUDF_UNREACHABLE("");
   }
 }
 
-__global__ void index_dispatch(float const* __restrict a,
-                               float const* __restrict b,
-                               float* __restrict c,
-                               int64_t n,
-                               binary_op op)
+template <typename T>
+__global__ void index_dispatch(
+  T const* __restrict a, T const* __restrict b, T* __restrict c, int64_t n, binary_op op)
 {
   uint64_t i = (uint64_t)threadIdx.x + (uint64_t)blockDim.x * (uint64_t)blockIdx.x;
 
-  static constexpr __device__ decltype(add)* ops[] = {
-    add, sub, mul, div, true_div, floor_div, mod, pymod, pow_fn};
+  static constexpr __device__ binary_func<T> ops[] = {
+    xadd, xsub, xmul, xdiv, xtrue_div, xfloor_div, xmod, xpymod, xpow_fn};
 
   c[i] = ops[(int32_t)op](a[i], b[i]);
 }
 
-void launch_switch(float const* a,
-                   float const* b,
-                   float* c,
-                   int64_t n,
-                   cudf::ast::ast_operator op,
-                   cudaStream_t stream)
+template <typename T>
+void launch_switch(
+  T const* a, T const* b, T* c, int64_t n, cudf::ast::ast_operator op, cudaStream_t stream)
 {
   CUDF_EXPECTS((n & 1023ULL) == 0, "");
   CUDF_EXPECTS((n / 1024ULL) < std::numeric_limits<int32_t>::max(), "");
@@ -109,8 +152,8 @@ void launch_switch(float const* a,
   switch_dispatch<<<grid_dim, block_dim, 0, stream>>>(a, b, c, n, op);
 }
 
-void launch_index(
-  float const* a, float const* b, float* c, int64_t n, binary_op op, cudaStream_t stream)
+template <typename T>
+void launch_index(T const* a, T const* b, T* c, int64_t n, binary_op op, cudaStream_t stream)
 {
   CUDF_EXPECTS((n & 1023ULL) == 0, "");
   CUDF_EXPECTS((n / 1024ULL) < std::numeric_limits<int32_t>::max(), "");
@@ -119,14 +162,14 @@ void launch_index(
   index_dispatch<<<grid_dim, block_dim, 0, stream>>>(a, b, c, n, op);
 }
 
-template <cudf::ast::ast_operator op>
-static void BM_switch(nvbench::state& state, nvbench::type_list<nvbench::enum_type<op>>)
+template <typename T, cudf::ast::ast_operator op>
+static void BM_switch(nvbench::state& state, nvbench::type_list<T, nvbench::enum_type<op>>)
 {
   auto const num_rows = static_cast<cudf::size_type>(state.get_int64("num_rows"));
 
-  thrust::device_vector<float> a;
-  thrust::device_vector<float> b;
-  thrust::device_vector<float> c;
+  thrust::device_vector<T> a;
+  thrust::device_vector<T> b;
+  thrust::device_vector<T> c;
 
   a.resize(num_rows);
   b.resize(num_rows);
@@ -134,23 +177,22 @@ static void BM_switch(nvbench::state& state, nvbench::type_list<nvbench::enum_ty
 
   // Use the number of bytes read from global memory
   state.add_element_count(num_rows, "num_ops");
-  state.add_global_memory_reads<nvbench::uint8_t>(a.size() * sizeof(float) +
-                                                  b.size() * sizeof(float));
-  state.add_global_memory_writes<nvbench::int32_t>(c.size() * sizeof(float));
+  state.add_global_memory_reads<nvbench::uint8_t>(a.size() * sizeof(T) + b.size() * sizeof(T));
+  state.add_global_memory_writes<nvbench::int32_t>(c.size() * sizeof(T));
 
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& l) {
     launch_switch(a.data().get(), b.data().get(), c.data().get(), num_rows, op, l.get_stream());
   });
 }
 
-template <binary_op op>
-static void BM_index(nvbench::state& state, nvbench::type_list<nvbench::enum_type<op>>)
+template <typename T, binary_op op>
+static void BM_index(nvbench::state& state, nvbench::type_list<T, nvbench::enum_type<op>>)
 {
   auto const num_rows = static_cast<cudf::size_type>(state.get_int64("num_rows"));
 
-  thrust::device_vector<float> a;
-  thrust::device_vector<float> b;
-  thrust::device_vector<float> c;
+  thrust::device_vector<T> a;
+  thrust::device_vector<T> b;
+  thrust::device_vector<T> c;
 
   a.resize(num_rows);
   b.resize(num_rows);
@@ -158,9 +200,8 @@ static void BM_index(nvbench::state& state, nvbench::type_list<nvbench::enum_typ
 
   // Use the number of bytes read from global memory
   state.add_element_count(num_rows, "num_ops");
-  state.add_global_memory_reads<nvbench::uint8_t>(a.size() * sizeof(float) +
-                                                  b.size() * sizeof(float));
-  state.add_global_memory_writes<nvbench::int32_t>(c.size() * sizeof(float));
+  state.add_global_memory_reads<nvbench::uint8_t>(a.size() * sizeof(T) + b.size() * sizeof(T));
+  state.add_global_memory_writes<nvbench::int32_t>(c.size() * sizeof(T));
 
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& l) {
     launch_index(a.data().get(), b.data().get(), c.data().get(), num_rows, op, l.get_stream());
@@ -179,6 +220,7 @@ static char const* to_string(cudf::ast::ast_operator op)
     case cudf::ast::ast_operator::MOD: return "MOD";
     case cudf::ast::ast_operator::PYMOD: return "PYMOD";
     case cudf::ast::ast_operator::POW: return "POW";
+    case cudf::ast::ast_operator::SINH: return "SINCOS";
     default: return "Unidentified";
   }
 }
@@ -195,6 +237,7 @@ static char const* to_string(binary_op op)
     case binary_op::MOD: return "MOD";
     case binary_op::PYMOD: return "PYMOD";
     case binary_op::POW: return "POW";
+    case binary_op::SINCOS: return "SINCOS";
     default: return "Unidentified";
   }
 }
@@ -203,29 +246,33 @@ NVBENCH_DECLARE_ENUM_TYPE_STRINGS(cudf::ast::ast_operator, to_string, to_string)
 NVBENCH_DECLARE_ENUM_TYPE_STRINGS(binary_op, to_string, to_string)
 
 using switch_binops = nvbench::enum_type_list<cudf::ast::ast_operator::ADD,
-                                              // cudf::ast::ast_operator::SUB,
-                                              // cudf::ast::ast_operator::MUL,
+                                              cudf::ast::ast_operator::SUB,
+                                              cudf::ast::ast_operator::MUL,
                                               cudf::ast::ast_operator::DIV,
-                                              // cudf::ast::ast_operator::TRUE_DIV,
-                                              // cudf::ast::ast_operator::FLOOR_DIV,
+                                              cudf::ast::ast_operator::TRUE_DIV,
+                                              cudf::ast::ast_operator::FLOOR_DIV,
                                               cudf::ast::ast_operator::MOD,
-                                              // cudf::ast::ast_operator::PYMOD,
-                                              cudf::ast::ast_operator::POW>;
+                                              cudf::ast::ast_operator::PYMOD,
+                                              cudf::ast::ast_operator::POW,
+                                              cudf::ast::ast_operator::SINH>;
 
 using index_binops = nvbench::enum_type_list<binary_op::ADD,
-                                             //  binary_op::SUB,
-                                             //  binary_op::MUL,
+                                             binary_op::SUB,
+                                             binary_op::MUL,
                                              binary_op::DIV,
-                                             //  binary_op::TRUE_DIV,
-                                             //  binary_op::FLOOR_DIV,
+                                             binary_op::TRUE_DIV,
+                                             binary_op::FLOOR_DIV,
                                              binary_op::MOD,
-                                             //  binary_op::PYMOD,
-                                             binary_op::POW>;
+                                             binary_op::PYMOD,
+                                             binary_op::POW,
+                                             binary_op::SINCOS>;
 
-NVBENCH_BENCH_TYPES(BM_switch, NVBENCH_TYPE_AXES(switch_binops))
+using types = nvbench::type_list<int32_t, float>;
+
+NVBENCH_BENCH_TYPES(BM_switch, NVBENCH_TYPE_AXES(types, switch_binops))
   .set_name("switch_dispatch")
   .add_int64_power_of_two_axis("num_rows", nvbench::range(10, 22, 4));
 
-NVBENCH_BENCH_TYPES(BM_index, NVBENCH_TYPE_AXES(index_binops))
+NVBENCH_BENCH_TYPES(BM_index, NVBENCH_TYPE_AXES(types, index_binops))
   .set_name("index_dispatch")
   .add_int64_power_of_two_axis("num_rows", nvbench::range(10, 22, 4));
