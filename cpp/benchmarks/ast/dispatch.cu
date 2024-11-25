@@ -139,8 +139,6 @@ static void BM_switch(nvbench::state& state, nvbench::type_list<nvbench::enum_ty
   state.add_global_memory_writes<nvbench::int32_t>(c.size() * sizeof(float));
 
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& l) {
-    thrust::fill(thrust::cuda::par.on(l.get_stream()), a.begin(), a.end(), 10);
-    thrust::fill(thrust::cuda::par.on(l.get_stream()), b.begin(), b.end(), 20);
     launch_switch(a.data().get(), b.data().get(), c.data().get(), num_rows, op, l.get_stream());
   });
 }
@@ -165,8 +163,6 @@ static void BM_index(nvbench::state& state, nvbench::type_list<nvbench::enum_typ
   state.add_global_memory_writes<nvbench::int32_t>(c.size() * sizeof(float));
 
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& l) {
-    thrust::fill(thrust::cuda::par.on(l.get_stream()), a.begin(), a.end(), 10);
-    thrust::fill(thrust::cuda::par.on(l.get_stream()), b.begin(), b.end(), 20);
     launch_index(a.data().get(), b.data().get(), c.data().get(), num_rows, op, l.get_stream());
   });
 }
