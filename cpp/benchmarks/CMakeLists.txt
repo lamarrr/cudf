@@ -345,6 +345,8 @@ ConfigureNVBench(CSV_WRITER_NVBENCH io/csv/csv_writer.cpp)
 # * ast benchmark ---------------------------------------------------------------------------------
 ConfigureNVBench(AST_NVBENCH ast/transform.cpp)
 
+ConfigureNVBench(DISPATCH_NVBENCH ast/dispatch.cu)
+
 # ##################################################################################################
 # * binaryop benchmark ----------------------------------------------------------------------------
 ConfigureNVBench(BINARYOP_NVBENCH binaryop/binaryop.cpp binaryop/compiled_binaryop.cpp)
