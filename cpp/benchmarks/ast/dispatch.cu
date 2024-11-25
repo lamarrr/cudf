@@ -224,8 +224,8 @@ using index_binops = nvbench::enum_type_list<binary_op::ADD,
 
 NVBENCH_BENCH_TYPES(BM_switch, NVBENCH_TYPE_AXES(switch_binops))
   .set_name("switch_dispatch")
-  .add_int64_power_of_two_axis("num_rows", {10, 16, 18, 26, 30, 32});
+  .add_int64_power_of_two_axis("num_rows", nvbench::range(10, 28, 4));
 
 NVBENCH_BENCH_TYPES(BM_index, NVBENCH_TYPE_AXES(index_binops))
   .set_name("index_dispatch")
-  .add_int64_power_of_two_axis("num_rows", {10, 16, 18, 26, 30, 32});
+  .add_int64_power_of_two_axis("num_rows", nvbench::range(10, 28, 4));
