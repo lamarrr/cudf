@@ -55,7 +55,7 @@ __device__ inline static cudf::size_type bytes_in_null_terminated_string(char co
  */
 __device__ inline char* udf_string::allocate(cudf::size_type bytes)
 {
-  char* data  = static_cast<char*>(malloc(bytes + 1));
+  char* data  = static_cast<char*>(m_scope.allocate(bytes + 1));
   data[bytes] = '\0';  // add null-terminator so we can printf strings in device code
   return data;
 }
@@ -65,9 +65,9 @@ __device__ inline char* udf_string::allocate(cudf::size_type bytes)
  *
  * @param data Pointer to allocated memory
  */
-__device__ inline void udf_string::deallocate(char* data)
+__device__ inline void udf_string::deallocate(char* data, cudf::size_type bytes)
 {
-  if (data) free(data);
+  m_scope.deallocate(data, bytes);
 }
 
 /**
@@ -79,61 +79,76 @@ __device__ inline void udf_string::deallocate(char* data)
  * @param bytes Number of bytes in to allocate
  * @return Pointer to allocated memory
  */
-__device__ void udf_string::reallocate(cudf::size_type bytes)
+/*__device__ void udf_string::reallocate(cudf::size_type bytes)
 {
-  m_capacity    = bytes;
-  auto new_data = allocate(m_capacity);
-  memcpy(new_data, m_data, std::min(m_bytes, bytes));
-  deallocate(m_data);
-  m_data = new_data;
+  auto new_data = m_scope.reallocate(m_data, m_capacity, bytes);
+  assert(new_memory != nullptr);
+  m_capacity = bytes;
+  m_data     = static_cast<char*>(new_data);
+}
+  */
+
+template <typename Storage>
+__device__ string<Storage>::string(allocation_scope scope) : Storage{scope}, m_size_bytes{0}
+{
 }
 
-__device__ inline udf_string::udf_string(char const* data, cudf::size_type bytes)
-  : m_bytes(bytes), m_capacity(bytes)
+template <typename Storage>
+__device__ string<Storage>::string(char const* data, cudf::size_type bytes, allocation_scope scope)
+  : Storage{make_storage_copy<Storage>(data, bytes, scope)}, m_size_bytes{bytes}
 {
-  m_data = allocate(m_capacity);
-  memcpy(m_data, data, bytes);
 }
 
-__device__ udf_string::udf_string(cudf::size_type count, cudf::char_utf8 chr)
+template <typename Storage>
+__device__ string<Storage>::string(cudf::size_type count,
+                                   cudf::char_utf8 chr,
+                                   allocation_scope scope)
+  : Storage{scope}
 {
   if (count <= 0) { return; }
-  m_bytes = m_capacity = cudf::strings::detail::bytes_in_char_utf8(chr) * count;
-  m_data               = allocate(m_capacity);
-  auto out_ptr         = m_data;
+  auto size = cudf::strings::detail::bytes_in_char_utf8(chr) * count;
+  Storage::reserve(size);
+  m_size_bytes = size;
+
+  auto out = data();
   for (cudf::size_type idx = 0; idx < count; ++idx) {
-    out_ptr += cudf::strings::detail::from_char_utf8(chr, out_ptr);
+    out += cudf::strings::detail::from_char_utf8(chr, out);
   }
 }
 
-__device__ inline udf_string::udf_string(char const* data)
-  : udf_string(data, detail::bytes_in_null_terminated_string(data))
+template <typename Storage>
+__device__ string<Storage>::string(char const* data, allocation_scope scope)
+  : string{data, detail::bytes_in_null_terminated_string(data), scope}
 {
 }
 
-__device__ inline udf_string::udf_string(udf_string const& src)
-  : udf_string(src.m_data, src.m_bytes)
+template <typename Storage>
+__device__ inline string<Storage>::string(string const& src)
+  : string{src.data(), src.m_size_bytes, src.m_scope}
 {
 }
 
-__device__ inline udf_string::udf_string(udf_string&& src) noexcept
-  : m_data(src.m_data), m_bytes(src.m_bytes), m_capacity(src.m_capacity)
+template <typename Storage>
+__device__ inline string<Storage>::string(string&& src) noexcept
+  : Storage{std::move(static_cast<Storage&>(src))}, m_size_bytes{src.m_size_bytes}
 {
-  src.m_data     = nullptr;
-  src.m_bytes    = 0;
-  src.m_capacity = 0;
+  src.m_size_bytes = 0;
 }
 
-__device__ inline udf_string::udf_string(cudf::string_view str)
-  : udf_string(str.data(), str.size_bytes())
+template <typename Storage>
+__device__ inline string<Storage>::string(cudf::string_view str, allocation_scope scope)
+  : string(str.data(), str.size_bytes(), scope)
 {
 }
 
-__device__ inline udf_string::~udf_string() { deallocate(m_data); }
+template <typename Storage>
+__device__ inline string<Storage>& string<Storage>::operator=(string const& str)
+{
+  return assign(str);
+}
 
-__device__ inline udf_string& udf_string::operator=(udf_string const& str) { return assign(str); }
-
-__device__ inline udf_string& udf_string::operator=(udf_string&& str) noexcept
+template <typename Storage>
+__device__ inline string<Storage>& string<Storage>::operator=(string&& str) noexcept
 {
   return assign(std::move(str));
 }
@@ -145,10 +160,11 @@ __device__ inline udf_string& udf_string::operator=(char const* str) { return as
 __device__ udf_string& udf_string::assign(udf_string&& str) noexcept
 {
   if (this == &str) { return *this; }
-  deallocate(m_data);
+  deallocate(m_data, m_capacity);
   m_data         = str.m_data;
   m_bytes        = str.m_bytes;
   m_capacity     = str.m_capacity;
+  m_scope        = str.m_scope;
   str.m_data     = nullptr;
   str.m_bytes    = 0;
   str.m_capacity = 0;
@@ -168,9 +184,10 @@ __device__ udf_string& udf_string::assign(char const* str)
 __device__ udf_string& udf_string::assign(char const* str, cudf::size_type bytes)
 {
   if (bytes >= m_capacity) {
-    deallocate(m_data);
+    auto* new_data = static_cast<char*>(m_scope.reallocate(m_data, m_capacity, bytes));
+    assert(new_data != nullptr);
     m_capacity = bytes;
-    m_data     = allocate(m_capacity);
+    m_data     = new_data;
   }
   m_bytes = bytes;
   memcpy(m_data, str, bytes);
@@ -277,7 +294,7 @@ __device__ inline bool udf_string::operator>=(cudf::string_view rhs) const noexc
 
 __device__ inline void udf_string::clear() noexcept
 {
-  deallocate(m_data);
+  deallocate(m_data, m_capacity);
   m_data     = nullptr;
   m_bytes    = 0;
   m_capacity = 0;
