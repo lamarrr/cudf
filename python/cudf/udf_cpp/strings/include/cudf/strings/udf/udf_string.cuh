@@ -47,47 +47,6 @@ __device__ inline static cudf::size_type bytes_in_null_terminated_string(char co
 
 }  // namespace detail
 
-/**
- * @brief Allocate memory for strings operation
- *
- * @param bytes Number of bytes in to allocate
- * @return Pointer to allocated memory
- */
-__device__ inline char* udf_string::allocate(cudf::size_type bytes)
-{
-  char* data  = static_cast<char*>(m_scope.allocate(bytes + 1));
-  data[bytes] = '\0';  // add null-terminator so we can printf strings in device code
-  return data;
-}
-
-/**
- * @brief Free memory created by allocate()
- *
- * @param data Pointer to allocated memory
- */
-__device__ inline void udf_string::deallocate(char* data, cudf::size_type bytes)
-{
-  m_scope.deallocate(data, bytes);
-}
-
-/**
- * @brief Allocate memory for strings operation
- *
- * Reallocates memory for `m_data` with new size `bytes`
- * The original data in `m_data` is preserved up to `min(bytes,m_bytes)`
- *
- * @param bytes Number of bytes in to allocate
- * @return Pointer to allocated memory
- */
-/*__device__ void udf_string::reallocate(cudf::size_type bytes)
-{
-  auto new_data = m_scope.reallocate(m_data, m_capacity, bytes);
-  assert(new_memory != nullptr);
-  m_capacity = bytes;
-  m_data     = static_cast<char*>(new_data);
-}
-  */
-
 template <typename Storage>
 __device__ string<Storage>::string(allocation_scope scope) : Storage{scope}, m_size_bytes{0}
 {
@@ -123,14 +82,16 @@ __device__ string<Storage>::string(char const* data, allocation_scope scope)
 }
 
 template <typename Storage>
-__device__ inline string<Storage>::string(string const& src)
+template <typename SrcStorage>
+__device__ inline string<Storage>::string(string<SrcStorage> const& src)
   : string{src.data(), src.m_size_bytes, src.m_scope}
 {
 }
 
 template <typename Storage>
-__device__ inline string<Storage>::string(string&& src) noexcept
-  : Storage{std::move(static_cast<Storage&>(src))}, m_size_bytes{src.m_size_bytes}
+template <typename SrcStorage>
+__device__ inline string<Storage>::string(string<SrcStorage>&& src) noexcept
+  : Storage{std::move(static_cast<SrcStorage&>(src))}, m_size_bytes{src.m_size_bytes}
 {
   src.m_size_bytes = 0;
 }
@@ -142,106 +103,133 @@ __device__ inline string<Storage>::string(cudf::string_view str, allocation_scop
 }
 
 template <typename Storage>
-__device__ inline string<Storage>& string<Storage>::operator=(string const& str)
+template <typename SrcStorage>
+__device__ inline string<Storage>& string<Storage>::operator=(string<SrcStorage> const& str)
 {
   return assign(str);
 }
 
 template <typename Storage>
-__device__ inline string<Storage>& string<Storage>::operator=(string&& str) noexcept
+template <typename SrcStorage>
+__device__ inline string<Storage>& string<Storage>::operator=(string<SrcStorage>&& str) noexcept
 {
   return assign(std::move(str));
 }
 
-__device__ inline udf_string& udf_string::operator=(cudf::string_view str) { return assign(str); }
+template <typename Storage>
+__device__ inline string<Storage>& string<Storage>::operator=(cudf::string_view str)
+{
+  return assign(str);
+}
 
-__device__ inline udf_string& udf_string::operator=(char const* str) { return assign(str); }
+template <typename Storage>
+__device__ inline string<Storage>& string<Storage>::operator=(char const* str)
+{
+  return assign(str);
+}
 
-__device__ udf_string& udf_string::assign(udf_string&& str) noexcept
+template <typename Storage>
+template <typename SrcStorage>
+__device__ string<Storage>& string<Storage>::assign(string<SrcStorage>&& str) noexcept
 {
   if (this == &str) { return *this; }
-  deallocate(m_data, m_capacity);
-  m_data         = str.m_data;
-  m_bytes        = str.m_bytes;
-  m_capacity     = str.m_capacity;
-  m_scope        = str.m_scope;
-  str.m_data     = nullptr;
-  str.m_bytes    = 0;
-  str.m_capacity = 0;
+
+  Storage::receive(std::move(static_cast<SrcStorage&&>(str)), str.m_size_bytes);
+  str.m_size_bytes = 0;
+
   return *this;
 }
 
-__device__ udf_string& udf_string::assign(cudf::string_view str)
+template <typename Storage>
+__device__ string<Storage>& string<Storage>::assign(cudf::string_view str)
 {
   return assign(str.data(), str.size_bytes());
 }
 
-__device__ udf_string& udf_string::assign(char const* str)
+template <typename Storage>
+__device__ string<Storage>& string<Storage>::assign(char const* str)
 {
   return assign(str, detail::bytes_in_null_terminated_string(str));
 }
 
-__device__ udf_string& udf_string::assign(char const* str, cudf::size_type bytes)
+template <typename Storage>
+__device__ string<Storage>& string<Storage>::assign(char const* str, cudf::size_type bytes)
 {
-  if (bytes >= m_capacity) {
-    auto* new_data = static_cast<char*>(m_scope.reallocate(m_data, m_capacity, bytes));
-    assert(new_data != nullptr);
-    m_capacity = bytes;
-    m_data     = new_data;
-  }
-  m_bytes = bytes;
-  memcpy(m_data, str, bytes);
-  m_data[m_bytes] = '\0';
+  Storage::reserve(m_size_bytes);
+  memcpy(data(), str, bytes);
   return *this;
 }
 
-__device__ inline cudf::size_type udf_string::size_bytes() const noexcept { return m_bytes; }
-
-__device__ inline cudf::size_type udf_string::length() const noexcept
+template <typename Storage>
+__device__ inline cudf::size_type string<Storage>::size_bytes() const noexcept
 {
-  return cudf::strings::detail::characters_in_string(m_data, m_bytes);
+  return m_size_bytes;
 }
 
-__device__ constexpr cudf::size_type udf_string::max_size() const noexcept
+template <typename Storage>
+__device__ inline cudf::size_type string<Storage>::length() const noexcept
+{
+  return cudf::strings::detail::characters_in_string(data(), m_size_bytes);
+}
+
+template <typename Storage>
+__device__ constexpr cudf::size_type string<Storage>::max_size() const noexcept
 {
   return std::numeric_limits<cudf::size_type>::max() - 1;
 }
 
-__device__ inline char* udf_string::data() noexcept { return m_data; }
-
-__device__ inline char const* udf_string::data() const noexcept { return m_data; }
-
-__device__ inline bool udf_string::is_empty() const noexcept { return m_bytes == 0; }
-
-__device__ inline cudf::string_view::const_iterator udf_string::begin() const noexcept
+template <typename Storage>
+__device__ inline char* string<Storage>::data() noexcept
 {
-  return cudf::string_view::const_iterator(cudf::string_view(m_data, m_bytes), 0);
+  return static_cast<char*>(Storage::memory());
 }
 
-__device__ inline cudf::string_view::const_iterator udf_string::end() const noexcept
+template <typename Storage>
+__device__ inline char const* string<Storage>::data() const noexcept
 {
-  return cudf::string_view::const_iterator(cudf::string_view(m_data, m_bytes), length());
+  return static_cast<char const*>(Storage::memory());
 }
 
-__device__ inline cudf::char_utf8 udf_string::at(cudf::size_type pos) const
+template <typename Storage>
+__device__ inline bool string<Storage>::is_empty() const noexcept
+{
+  return m_size_bytes == 0;
+}
+
+template <typename Storage>
+__device__ inline cudf::string_view::const_iterator string<Storage>::begin() const noexcept
+{
+  return cudf::string_view::const_iterator(cudf::string_view(data(), m_size_bytes), 0);
+}
+
+template <typename Storage>
+__device__ inline cudf::string_view::const_iterator string<Storage>::end() const noexcept
+{
+  return cudf::string_view::const_iterator(cudf::string_view(data(), m_size_bytes), length());
+}
+
+template <typename Storage>
+__device__ inline cudf::char_utf8 string<Storage>::at(cudf::size_type pos) const
 {
   auto const offset = byte_offset(pos);
   auto chr          = cudf::char_utf8{0};
-  if (offset < m_bytes) { cudf::strings::detail::to_char_utf8(data() + offset, chr); }
+  if (offset < m_size_bytes) { cudf::strings::detail::to_char_utf8(data() + offset, chr); }
   return chr;
 }
 
-__device__ inline cudf::char_utf8 udf_string::operator[](cudf::size_type pos) const
+template <typename Storage>
+__device__ inline cudf::char_utf8 string<Storage>::operator[](cudf::size_type pos) const
 {
   return at(pos);
 }
 
-__device__ inline cudf::size_type udf_string::byte_offset(cudf::size_type pos) const
+template <typename Storage>
+__device__ inline cudf::size_type string<Storage>::byte_offset(cudf::size_type pos) const
 {
   cudf::size_type offset = 0;
 
-  auto start = m_data;
-  auto end   = start + m_bytes;
+  auto start = data();
+  auto end   = start + m_size_bytes;
   while ((pos > 0) && (start < end)) {
     auto const byte       = static_cast<uint8_t>(*start++);
     auto const char_bytes = cudf::strings::detail::bytes_in_utf8_byte(byte);
@@ -251,221 +239,267 @@ __device__ inline cudf::size_type udf_string::byte_offset(cudf::size_type pos) c
   return offset;
 }
 
-__device__ inline int udf_string::compare(cudf::string_view in) const noexcept
+template <typename Storage>
+__device__ inline int string<Storage>::compare(cudf::string_view in) const noexcept
 {
   return compare(in.data(), in.size_bytes());
 }
 
-__device__ inline int udf_string::compare(char const* data, cudf::size_type bytes) const
+template <typename Storage>
+__device__ inline int string<Storage>::compare(char const* data, cudf::size_type bytes) const
 {
   auto const view = static_cast<cudf::string_view>(*this);
   return view.compare(data, bytes);
 }
 
-__device__ inline bool udf_string::operator==(cudf::string_view rhs) const noexcept
+template <typename Storage>
+__device__ inline bool string<Storage>::operator==(cudf::string_view rhs) const noexcept
 {
-  return m_bytes == rhs.size_bytes() && compare(rhs) == 0;
+  return m_size_bytes == rhs.size_bytes() && compare(rhs) == 0;
 }
 
-__device__ inline bool udf_string::operator!=(cudf::string_view rhs) const noexcept
+template <typename Storage>
+__device__ inline bool string<Storage>::operator!=(cudf::string_view rhs) const noexcept
 {
   return compare(rhs) != 0;
 }
 
-__device__ inline bool udf_string::operator<(cudf::string_view rhs) const noexcept
+template <typename Storage>
+__device__ inline bool string<Storage>::operator<(cudf::string_view rhs) const noexcept
 {
   return compare(rhs) < 0;
 }
 
-__device__ inline bool udf_string::operator>(cudf::string_view rhs) const noexcept
+template <typename Storage>
+__device__ inline bool string<Storage>::operator>(cudf::string_view rhs) const noexcept
 {
   return compare(rhs) > 0;
 }
 
-__device__ inline bool udf_string::operator<=(cudf::string_view rhs) const noexcept
+template <typename Storage>
+__device__ inline bool string<Storage>::operator<=(cudf::string_view rhs) const noexcept
 {
   return compare(rhs) <= 0;
 }
 
-__device__ inline bool udf_string::operator>=(cudf::string_view rhs) const noexcept
+template <typename Storage>
+__device__ inline bool string<Storage>::operator>=(cudf::string_view rhs) const noexcept
 {
   return compare(rhs) >= 0;
 }
 
-__device__ inline void udf_string::clear() noexcept
+template <typename Storage>
+__device__ inline void string<Storage>::clear() noexcept
 {
-  deallocate(m_data, m_capacity);
-  m_data     = nullptr;
-  m_bytes    = 0;
-  m_capacity = 0;
+  m_size_bytes = 0;
 }
 
-__device__ inline void udf_string::resize(cudf::size_type count)
+template <typename Storage>
+__device__ inline void string<Storage>::reset() noexcept
+{
+  Storage::reset();
+  m_size_bytes = 0;
+}
+
+template <typename Storage>
+__device__ inline void string<Storage>::resize(cudf::size_type count)
 {
   if (count > max_size()) { return; }
-  if (count > m_capacity) { reallocate(count); }
+  Storage::reserve(count);
 
-  // add padding if necessary (null chars)
-  if (count > m_bytes) { memset(m_data + m_bytes, 0, count - m_bytes); }
+  if (count > m_size_bytes) { memset(data() + m_size_bytes, 0, count - m_size_bytes); }
 
-  m_bytes         = count;
-  m_data[m_bytes] = '\0';
+  m_size_bytes = count;
 }
 
-__device__ void udf_string::reserve(cudf::size_type count)
+template <typename Storage>
+__device__ void string<Storage>::reserve(cudf::size_type count)
 {
-  if (count < max_size() && count > m_capacity) { reallocate(count); }
+  if (count < max_size()) { Storage::reserve(count); }
 }
 
-__device__ cudf::size_type udf_string::capacity() const noexcept { return m_capacity; }
-
-__device__ void udf_string::shrink_to_fit()
+template <typename Storage>
+__device__ cudf::size_type string<Storage>::capacity() const noexcept
 {
-  if (m_bytes < m_capacity) { reallocate(m_bytes); }
+  return Storage::capacity();
 }
 
-__device__ inline udf_string& udf_string::append(char const* str, cudf::size_type bytes)
+template <typename Storage>
+__device__ void string<Storage>::shrink_to_fit()
 {
-  if (bytes <= 0) { return *this; }
-  auto const nbytes = m_bytes + bytes;
-  if (nbytes > m_capacity) { reallocate(2 * nbytes); }
-  memcpy(m_data + m_bytes, str, bytes);
-  m_bytes         = nbytes;
-  m_data[m_bytes] = '\0';
+  if (m_size_bytes < Storage::capacity()) { Storage::reallocate(m_size_bytes); }
+}
+
+template <typename Storage>
+__device__ inline string<Storage>& string<Storage>::append(char const* str, cudf::size_type bytes)
+{
+  auto const new_size_bytes = m_size_bytes + bytes;
+  Storage::grow(new_size_bytes);
+  memcpy(data() + m_size_bytes, str, bytes);
+  m_size_bytes = new_size_bytes;
   return *this;
 }
 
-__device__ inline udf_string& udf_string::append(char const* str)
+template <typename Storage>
+__device__ inline string<Storage>& string<Storage>::append(char const* str)
 {
   return append(str, detail::bytes_in_null_terminated_string(str));
 }
 
-__device__ inline udf_string& udf_string::append(cudf::char_utf8 chr, cudf::size_type count)
+template <typename Storage>
+__device__ inline string<Storage>& string<Storage>::append(cudf::char_utf8 chr,
+                                                           cudf::size_type count)
 {
-  auto d_str = udf_string(count, chr);
+  auto d_str = string<Storage>(count, chr);
   return append(d_str);
 }
 
-__device__ inline udf_string& udf_string::append(cudf::string_view in)
+template <typename Storage>
+__device__ inline string<Storage>& string<Storage>::append(cudf::string_view in)
 {
   return append(in.data(), in.size_bytes());
 }
 
-__device__ inline udf_string& udf_string::operator+=(cudf::string_view in) { return append(in); }
+template <typename Storage>
+__device__ inline string<Storage>& string<Storage>::operator+=(cudf::string_view in)
+{
+  return append(in);
+}
 
-__device__ inline udf_string& udf_string::operator+=(cudf::char_utf8 chr) { return append(chr); }
+template <typename Storage>
+__device__ inline string<Storage>& string<Storage>::operator+=(cudf::char_utf8 chr)
+{
+  return append(chr);
+}
 
-__device__ inline udf_string& udf_string::operator+=(char const* str) { return append(str); }
+template <typename Storage>
+__device__ inline string<Storage>& string<Storage>::operator+=(char const* str)
+{
+  return append(str);
+}
 
-__device__ inline udf_string& udf_string::insert(cudf::size_type pos,
-                                                 char const* str,
-                                                 cudf::size_type in_bytes)
+template <typename Storage>
+__device__ inline string<Storage>& string<Storage>::insert(cudf::size_type pos,
+                                                           char const* str,
+                                                           cudf::size_type in_bytes)
 {
   return replace(pos, 0, str, in_bytes);
 }
 
-__device__ inline udf_string& udf_string::insert(cudf::size_type pos, char const* str)
+template <typename Storage>
+__device__ inline string<Storage>& string<Storage>::insert(cudf::size_type pos, char const* str)
 {
   return insert(pos, str, detail::bytes_in_null_terminated_string(str));
 }
 
-__device__ inline udf_string& udf_string::insert(cudf::size_type pos, cudf::string_view in)
+template <typename Storage>
+__device__ inline string<Storage>& string<Storage>::insert(cudf::size_type pos,
+                                                           cudf::string_view in)
 {
   return insert(pos, in.data(), in.size_bytes());
 }
 
-__device__ inline udf_string& udf_string::insert(cudf::size_type pos,
-                                                 cudf::size_type count,
-                                                 cudf::char_utf8 chr)
+template <typename Storage>
+__device__ inline string<Storage>& string<Storage>::insert(cudf::size_type pos,
+                                                           cudf::size_type count,
+                                                           cudf::char_utf8 chr)
 {
   return replace(pos, 0, count, chr);
 }
 
-__device__ inline udf_string udf_string::substr(cudf::size_type pos, cudf::size_type count) const
+template <typename Storage>
+__device__ inline string<Storage> string<Storage>::substr(cudf::size_type pos,
+                                                          cudf::size_type count) const
 {
-  if (pos < 0) { return udf_string{"", 0}; }
+  if (pos < 0) { return string<Storage>{"", 0}; }
   auto const start_pos = byte_offset(pos);
-  if (start_pos >= m_bytes) { return udf_string{"", 0}; }
-  auto const end_pos = count < 0 ? m_bytes : std::min(byte_offset(pos + count), m_bytes);
-  return udf_string{data() + start_pos, end_pos - start_pos};
+  if (start_pos >= m_size_bytes) { return string<Storage>{"", 0}; }
+  auto const end_pos = count < 0 ? m_size_bytes : std::min(byte_offset(pos + count), m_size_bytes);
+  return string<Storage>{data() + start_pos, end_pos - start_pos};
 }
 
 // utility for replace()
-__device__ void udf_string::shift_bytes(cudf::size_type start_pos,
-                                        cudf::size_type end_pos,
-                                        cudf::size_type nbytes)
+template <typename Storage>
+__device__ void string<Storage>::shift_bytes(cudf::size_type start_pos,
+                                             cudf::size_type end_pos,
+                                             cudf::size_type nbytes)
 {
-  if (nbytes < m_bytes) {
+  if (nbytes < m_size_bytes) {
     // shift bytes to the left [...wxyz] -> [wxyzxyz]
     auto src = end_pos;
     auto tgt = start_pos;
     while (tgt < nbytes) {
-      m_data[tgt++] = m_data[src++];
+      data()[tgt++] = data()[src++];
     }
-  } else if (nbytes > m_bytes) {
+  } else if (nbytes > m_size_bytes) {
     // shift bytes to the right [abcd...] -> [abcabcd]
-    auto src = m_bytes;
+    auto src = m_size_bytes;
     auto tgt = nbytes;
     while (src > end_pos) {
-      m_data[--tgt] = m_data[--src];
+      data()[--tgt] = data()[--src];
     }
   }
 }
 
-__device__ inline udf_string& udf_string::replace(cudf::size_type pos,
-                                                  cudf::size_type count,
-                                                  char const* str,
-                                                  cudf::size_type in_bytes)
+template <typename Storage>
+__device__ inline string<Storage>& string<Storage>::replace(cudf::size_type pos,
+                                                            cudf::size_type count,
+                                                            char const* str,
+                                                            cudf::size_type in_bytes)
 {
   if (pos < 0 || in_bytes < 0) { return *this; }
   auto const start_pos = byte_offset(pos);
-  if (start_pos > m_bytes) { return *this; }
-  auto const end_pos = count < 0 ? m_bytes : std::min(byte_offset(pos + count), m_bytes);
+  if (start_pos > m_size_bytes) { return *this; }
+  auto const end_pos = count < 0 ? m_size_bytes : std::min(byte_offset(pos + count), m_size_bytes);
 
   // compute new size
-  auto const nbytes = m_bytes + in_bytes - (end_pos - start_pos);
-  if (nbytes > m_capacity) { reallocate(2 * nbytes); }
+  auto const nbytes = m_size_bytes + in_bytes - (end_pos - start_pos);
+  Storage::grow(nbytes);
 
   // move bytes -- make room for replacement
   shift_bytes(start_pos + in_bytes, end_pos, nbytes);
 
   // insert the replacement
-  memcpy(m_data + start_pos, str, in_bytes);
+  memcpy(data() + start_pos, str, in_bytes);
 
-  m_bytes         = nbytes;
-  m_data[m_bytes] = '\0';
+  m_size_bytes = nbytes;
   return *this;
 }
 
-__device__ inline udf_string& udf_string::replace(cudf::size_type pos,
-                                                  cudf::size_type count,
-                                                  char const* str)
+template <typename Storage>
+__device__ inline string<Storage>& string<Storage>::replace(cudf::size_type pos,
+                                                            cudf::size_type count,
+                                                            char const* str)
 {
   return replace(pos, count, str, detail::bytes_in_null_terminated_string(str));
 }
 
-__device__ inline udf_string& udf_string::replace(cudf::size_type pos,
-                                                  cudf::size_type count,
-                                                  cudf::string_view in)
+template <typename Storage>
+__device__ inline string<Storage>& string<Storage>::replace(cudf::size_type pos,
+                                                            cudf::size_type count,
+                                                            cudf::string_view in)
 {
   return replace(pos, count, in.data(), in.size_bytes());
 }
 
-__device__ inline udf_string& udf_string::replace(cudf::size_type pos,
-                                                  cudf::size_type count,
-                                                  cudf::size_type chr_count,
-                                                  cudf::char_utf8 chr)
+template <typename Storage>
+__device__ inline string<Storage>& string<Storage>::replace(cudf::size_type pos,
+                                                            cudf::size_type count,
+                                                            cudf::size_type chr_count,
+                                                            cudf::char_utf8 chr)
 {
-  auto d_str = udf_string(chr_count, chr);
+  auto d_str = string<Storage>(chr_count, chr);
   return replace(pos, count, d_str);
 }
 
-__device__ udf_string& udf_string::erase(cudf::size_type pos, cudf::size_type count)
+template <typename Storage>
+__device__ string<Storage>& string<Storage>::erase(cudf::size_type pos, cudf::size_type count)
 {
   return replace(pos, count, nullptr, 0);
 }
 
-__device__ inline cudf::size_type udf_string::char_offset(cudf::size_type byte_pos) const
+template <typename Storage>
+__device__ inline cudf::size_type string<Storage>::char_offset(cudf::size_type byte_pos) const
 {
   return cudf::strings::detail::characters_in_string(data(), byte_pos);
 }

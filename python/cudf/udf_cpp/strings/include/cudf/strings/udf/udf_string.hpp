@@ -159,8 +159,7 @@ class alignas(32) arena {
 };
 
 /**
- * @brief A mult-threaded arena, This is ideal for allocating string outputs. It can be reset at
- * the end of the program.
+ * @brief A multi-threaded arena, This is ideal for allocating string outputs.
  */
 template <cuda::thread_scope Scope>
 class alignas(32) mt_arena {
@@ -250,7 +249,6 @@ class alignas(32) mt_arena {
     return allocation;
   }
 
-  // TODO: handle nullptrs
   void deallocate(void* memory, size_t size)
   {
     if (memory == nullptr || size == 0) { return; }
@@ -493,7 +491,62 @@ class allocation_scope {
   }
 };
 
-class heap_storage {
+template <typename Storage>
+static __device__ Storage make_storage(size_t capacity, allocation_scope scope)
+{
+  Storage s{scope};
+  s.reserve(capacity);
+  return s;
+}
+
+template <typename Storage>
+static __device__ Storage make_storage_copy(void const* data, size_t size, allocation_scope scope)
+{
+  Storage s{scope};
+  s.reserve(size);
+  memcpy(s.memory(), data, size);
+  return s;
+}
+
+template <typename Storage>
+class storage_base {
+ protected:
+  Storage& super() { return static_cast<Storage&>(*this); }
+
+  Storage const& super() const { return static_cast<Storage const&>(*this); }
+
+  __device__ void reallocate(size_t capacity)
+  {
+    CUDF_EXPECTS(super().try_reallocate(capacity), "");
+  }
+
+  __device__ bool try_reserve(size_t capacity)
+  {
+    if (super().m_capacity >= capacity) { return true; }
+
+    return super().try_reallocate(capacity);
+  }
+
+  __device__ void reserve(size_t capacity)
+  {
+    // TODO:
+    CUDF_EXPECTS(try_reserve(capacity), "");
+  }
+
+  __device__ bool try_grow(size_t target_size)
+  {
+    if (super().m_capacity >= target_size) { return true; }
+
+    return super().try_reallocate(target_size << 1);
+  }
+
+  __device__ void grow(size_t target_size) { CUDF_EXPECTS(try_grow(target_size), ""); }
+};
+
+template <storage_type Type>
+class scoped_storage;
+
+class heap_storage : protected storage_base<heap_storage> {
  protected:
   void* m_memory;
 
@@ -552,10 +605,8 @@ class heap_storage {
 
   __device__ size_t capacity() const { return m_capacity; }
 
-  __device__ bool try_reserve(size_t capacity)
+  __device__ bool try_reallocate(size_t capacity)
   {
-    if (m_capacity >= capacity) { return true; }
-
     void* alloc;
     if (alloc = heap_allocator::reallocate(m_memory, m_capacity, capacity); alloc == nullptr) {
       return false;
@@ -567,18 +618,24 @@ class heap_storage {
     return true;
   }
 
-  __device__ void reserve(size_t capacity) { 
-    // TODO:
-    CUDF_EXPECTS(try_reserve(capacity), "");
- }
+  /// @brief Take ownership of the storage if the storage types and memory sources are compatible,
+  /// otherwise copy the bytes
+  template <storage_type SrcType>
+  __device__ void receive(scoped_storage<SrcType> other, size_t max_copy_size = -1);
+
+  __device__ void receive(heap_storage other, [[maybe_unused]] size_t max_copy_size = -1)
+  {
+    *this = std::move(other);
+  }
 
   template <storage_type Type>
   friend class scoped_storage;
 };
 
-
 template <storage_type Type>
-class scoped_storage {
+class scoped_storage : protected storage_base<scoped_storage<Type>> {
+  using base = storage_base<scoped_storage<Type>>;
+
  protected:
   void* m_memory;
 
@@ -589,6 +646,8 @@ class scoped_storage {
   allocation_scope m_scope;
 
  public:
+  static constexpr storage_type type = Type;
+
   __device__ scoped_storage(void* memory,
                             size_t capacity,
                             memory_source source,
@@ -612,6 +671,26 @@ class scoped_storage {
     other.m_capacity = 0;
     other.m_source   = memory_source::NONE;
     other.m_scope    = allocation_scope{};
+  }
+
+  template <storage_type SrcType, CUDF_ENABLE_IF(Type != SrcType)>
+  __device__ scoped_storage(scoped_storage<SrcType>&& other)
+    : m_memory{nullptr}, m_capacity{0}, m_source{}, m_scope{}
+  {
+    // the storage needs to be transferred to the heap since an allocation_scope is not yet
+    // provided.
+    if (other.is_heap_sourced()) {
+      m_memory         = other.m_memory;
+      other.m_memory   = nullptr;
+      m_capacity       = other.m_capacity;
+      other.m_capacity = 0;
+      m_source         = other.m_source;
+      other.m_source   = memory_source::NONE;
+      other.m_scope    = allocation_scope{};
+    } else {
+      base::reserve(other.m_capacity);
+      memcpy(m_memory, other.m_memory, other.m_capacity);
+    }
   }
 
   __device__ scoped_storage(scoped_storage const&) = delete;
@@ -676,10 +755,8 @@ class scoped_storage {
 
   __device__ size_t capacity() const { return m_capacity; }
 
-  __device__ bool try_reserve(size_t capacity)
+  __device__ bool try_reallocate(size_t capacity)
   {
-    if (m_capacity >= capacity) { return true; }
-
     allocation alloc;
     if (alloc = m_scope.reallocate<Type>(allocation{m_memory, m_source}, m_capacity, capacity);
         alloc.memory == nullptr) {
@@ -693,14 +770,12 @@ class scoped_storage {
     return true;
   }
 
-  __device__ void reserve(size_t capacity) { CUDF_EXPECTS(try_reserve(capacity), ""); }
-
   __device__ bool is_heap_sourced() const { return m_source == memory_source::HEAP; }
 
-  /// @brief Take ownership of the storage if the storage types and memory sources are compatible,
-  /// otherwise copy the bytes
+  /// @brief Take ownership of the storage if the storage types and memory sources are compatible
+  /// with this storage type, otherwise copy the bytes
   template <storage_type SrcType>
-  __device__ void adopt_or_copy(scoped_storage<SrcType>&& other, size_t max_copy_size)
+  __device__ void receive(scoped_storage<SrcType> other, size_t max_copy_size = -1)
   {
     if constexpr (Type == SrcType) {
       *this = std::move(other);
@@ -709,42 +784,34 @@ class scoped_storage {
         *this = heap_storage{other.m_memory, other.m_capacity};
         other.leak();
       } else {
-        reserve(other.capacity());
-        memcpy(m_memory, other.m_memory, other.capacity());
+        // the sources are incompatible, the bytes need to be transferred here
+        auto copy_size = std::min(max_copy_size, other.capacity());
+        reserve(copy_size);
+        memcpy(m_memory, other.m_memory, copy_size);
       }
     }
   }
 
-  template <storage_type SrcType>
-  __device__ void adopt_or_copy(scoped_storage<SrcType>&& other)
+  __device__ void receive(heap_storage other, [[maybe_unused]] size_t max_copy_size = -1)
   {
-    auto max_copy_size = other.capacity();
-    return adopt_or_copy<SrcType>(std::move(other), max_copy_size);
+    *this = std::move(other);
   }
 };
 
-template <typename Storage>
-static __device__ Storage make_storage(size_t capacity, allocation_scope scope)
+template <storage_type SrcType>
+__device__ void heap_storage::receive(scoped_storage<SrcType> other, size_t max_copy_size)
 {
-  Storage s{scope};
-  s.reserve(capacity);
-  return s;
+  if (other.is_heap_sourced()) {
+    *this = heap_storage{other.m_memory, other.m_capacity, allocation_scope{}};
+    other.leak();
+  } else {
+    auto copy_size = std::min(max_copy_size, other.capacity());
+    reserve(copy_size);
+    memcpy(m_memory, other.m_memory, copy_size);
+  }
 }
 
-template <typename Storage>
-static __device__ Storage make_storage_copy(void const* data, size_t size, allocation_scope scope)
-{
-  Storage s{scope};
-  s.reserve(size);
-  memcpy(s.memory(), data, size);
-  return s;
-}
-
-// TODO: we need to assign to row_string from tmp_string
 // TODO: utility to estimate memory required across all threads for intermediates
-//
-// remove shared arena: we can thus try to allocate from arena, then from global scope
-//
 
 /**
  * @brief Device string class for use with user-defined functions
@@ -979,11 +1046,18 @@ class string : protected Storage {
   __device__ bool operator>=(cudf::string_view rhs) const noexcept;
 
   /**
-   * @brief Remove all bytes from this string
+   * @brief Remove all bytes from this string without deallocating
    *
    * All pointers, references, and iterators are invalidated.
    */
   __device__ void clear() noexcept;
+
+  /**
+   * @brief Remove all bytes from this string
+   *
+   * All pointers, references, and iterators are invalidated.
+   */
+  __device__ void reset() noexcept;
 
   /**
    * @brief Resizes string to contain `count` bytes
@@ -1030,7 +1104,8 @@ class string : protected Storage {
    * @param str String to move
    * @return This string with new contents
    */
-  __device__ string& assign(string&& str) noexcept;
+  template <typename SrcStorage>
+  __device__ string& assign(string<SrcStorage>&& str) noexcept;
 
   /**
    * @brief Replaces the contents of this string with contents of `str`
