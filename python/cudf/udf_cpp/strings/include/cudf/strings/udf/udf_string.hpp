@@ -1343,7 +1343,7 @@ class string : protected Storage {
                               cudf::size_type end_pos,
                               cudf::size_type nbytes);
 
-  cudf::size_type m_size_bytes;
+  cudf::size_type m_bytes;
 };
 
 /// @brief General-purpose strings that can outlive their parent scope

@@ -48,13 +48,13 @@ __device__ inline static cudf::size_type bytes_in_null_terminated_string(char co
 }  // namespace detail
 
 template <typename Storage>
-__device__ string<Storage>::string(allocation_scope scope) : Storage{scope}, m_size_bytes{0}
+__device__ string<Storage>::string(allocation_scope scope) : Storage{scope}, m_bytes{0}
 {
 }
 
 template <typename Storage>
 __device__ string<Storage>::string(char const* data, cudf::size_type bytes, allocation_scope scope)
-  : Storage{make_storage_copy<Storage>(data, bytes, scope)}, m_size_bytes{bytes}
+  : Storage{make_storage_copy<Storage>(data, bytes, scope)}, m_bytes{bytes}
 {
 }
 
@@ -67,7 +67,7 @@ __device__ string<Storage>::string(cudf::size_type count,
   if (count <= 0) { return; }
   auto size = cudf::strings::detail::bytes_in_char_utf8(chr) * count;
   Storage::reserve(size);
-  m_size_bytes = size;
+  m_bytes = size;
 
   auto out = data();
   for (cudf::size_type idx = 0; idx < count; ++idx) {
@@ -84,16 +84,16 @@ __device__ string<Storage>::string(char const* data, allocation_scope scope)
 template <typename Storage>
 template <typename SrcStorage>
 __device__ inline string<Storage>::string(string<SrcStorage> const& src)
-  : string{src.data(), src.m_size_bytes, src.m_scope}
+  : string{src.data(), src.m_bytes, src.m_scope}
 {
 }
 
 template <typename Storage>
 template <typename SrcStorage>
 __device__ inline string<Storage>::string(string<SrcStorage>&& src) noexcept
-  : Storage{std::move(static_cast<SrcStorage&>(src))}, m_size_bytes{src.m_size_bytes}
+  : Storage{std::move(static_cast<SrcStorage&>(src))}, m_bytes{src.m_bytes}
 {
-  src.m_size_bytes = 0;
+  src.m_bytes = 0;
 }
 
 template <typename Storage>
@@ -134,8 +134,8 @@ __device__ string<Storage>& string<Storage>::assign(string<SrcStorage>&& str) no
 {
   if (this == &str) { return *this; }
 
-  Storage::receive(std::move(static_cast<SrcStorage&&>(str)), str.m_size_bytes);
-  str.m_size_bytes = 0;
+  Storage::receive(std::move(static_cast<SrcStorage&&>(str)), str.m_bytes);
+  str.m_bytes = 0;
 
   return *this;
 }
@@ -155,7 +155,7 @@ __device__ string<Storage>& string<Storage>::assign(char const* str)
 template <typename Storage>
 __device__ string<Storage>& string<Storage>::assign(char const* str, cudf::size_type bytes)
 {
-  Storage::reserve(m_size_bytes);
+  Storage::reserve(m_bytes);
   memcpy(data(), str, bytes);
   return *this;
 }
@@ -163,13 +163,13 @@ __device__ string<Storage>& string<Storage>::assign(char const* str, cudf::size_
 template <typename Storage>
 __device__ inline cudf::size_type string<Storage>::size_bytes() const noexcept
 {
-  return m_size_bytes;
+  return m_bytes;
 }
 
 template <typename Storage>
 __device__ inline cudf::size_type string<Storage>::length() const noexcept
 {
-  return cudf::strings::detail::characters_in_string(data(), m_size_bytes);
+  return cudf::strings::detail::characters_in_string(data(), m_bytes);
 }
 
 template <typename Storage>
@@ -193,19 +193,19 @@ __device__ inline char const* string<Storage>::data() const noexcept
 template <typename Storage>
 __device__ inline bool string<Storage>::is_empty() const noexcept
 {
-  return m_size_bytes == 0;
+  return m_bytes == 0;
 }
 
 template <typename Storage>
 __device__ inline cudf::string_view::const_iterator string<Storage>::begin() const noexcept
 {
-  return cudf::string_view::const_iterator(cudf::string_view(data(), m_size_bytes), 0);
+  return cudf::string_view::const_iterator(cudf::string_view(data(), m_bytes), 0);
 }
 
 template <typename Storage>
 __device__ inline cudf::string_view::const_iterator string<Storage>::end() const noexcept
 {
-  return cudf::string_view::const_iterator(cudf::string_view(data(), m_size_bytes), length());
+  return cudf::string_view::const_iterator(cudf::string_view(data(), m_bytes), length());
 }
 
 template <typename Storage>
@@ -213,7 +213,7 @@ __device__ inline cudf::char_utf8 string<Storage>::at(cudf::size_type pos) const
 {
   auto const offset = byte_offset(pos);
   auto chr          = cudf::char_utf8{0};
-  if (offset < m_size_bytes) { cudf::strings::detail::to_char_utf8(data() + offset, chr); }
+  if (offset < m_bytes) { cudf::strings::detail::to_char_utf8(data() + offset, chr); }
   return chr;
 }
 
@@ -229,7 +229,7 @@ __device__ inline cudf::size_type string<Storage>::byte_offset(cudf::size_type p
   cudf::size_type offset = 0;
 
   auto start = data();
-  auto end   = start + m_size_bytes;
+  auto end   = start + m_bytes;
   while ((pos > 0) && (start < end)) {
     auto const byte       = static_cast<uint8_t>(*start++);
     auto const char_bytes = cudf::strings::detail::bytes_in_utf8_byte(byte);
@@ -255,7 +255,7 @@ __device__ inline int string<Storage>::compare(char const* data, cudf::size_type
 template <typename Storage>
 __device__ inline bool string<Storage>::operator==(cudf::string_view rhs) const noexcept
 {
-  return m_size_bytes == rhs.size_bytes() && compare(rhs) == 0;
+  return m_bytes == rhs.size_bytes() && compare(rhs) == 0;
 }
 
 template <typename Storage>
@@ -291,14 +291,14 @@ __device__ inline bool string<Storage>::operator>=(cudf::string_view rhs) const 
 template <typename Storage>
 __device__ inline void string<Storage>::clear() noexcept
 {
-  m_size_bytes = 0;
+  m_bytes = 0;
 }
 
 template <typename Storage>
 __device__ inline void string<Storage>::reset() noexcept
 {
   Storage::reset();
-  m_size_bytes = 0;
+  m_bytes = 0;
 }
 
 template <typename Storage>
@@ -307,9 +307,9 @@ __device__ inline void string<Storage>::resize(cudf::size_type count)
   if (count > max_size()) { return; }
   Storage::reserve(count);
 
-  if (count > m_size_bytes) { memset(data() + m_size_bytes, 0, count - m_size_bytes); }
+  if (count > m_bytes) { memset(data() + m_bytes, 0, count - m_bytes); }
 
-  m_size_bytes = count;
+  m_bytes = count;
 }
 
 template <typename Storage>
@@ -327,16 +327,16 @@ __device__ cudf::size_type string<Storage>::capacity() const noexcept
 template <typename Storage>
 __device__ void string<Storage>::shrink_to_fit()
 {
-  if (m_size_bytes < Storage::capacity()) { Storage::reallocate(m_size_bytes); }
+  if (m_bytes < Storage::capacity()) { Storage::reallocate(m_bytes); }
 }
 
 template <typename Storage>
 __device__ inline string<Storage>& string<Storage>::append(char const* str, cudf::size_type bytes)
 {
-  auto const new_size_bytes = m_size_bytes + bytes;
+  auto const new_size_bytes = m_bytes + bytes;
   Storage::grow(new_size_bytes);
-  memcpy(data() + m_size_bytes, str, bytes);
-  m_size_bytes = new_size_bytes;
+  memcpy(data() + m_bytes, str, bytes);
+  m_bytes = new_size_bytes;
   return *this;
 }
 
@@ -413,8 +413,8 @@ __device__ inline string<Storage> string<Storage>::substr(cudf::size_type pos,
 {
   if (pos < 0) { return string<Storage>{"", 0}; }
   auto const start_pos = byte_offset(pos);
-  if (start_pos >= m_size_bytes) { return string<Storage>{"", 0}; }
-  auto const end_pos = count < 0 ? m_size_bytes : std::min(byte_offset(pos + count), m_size_bytes);
+  if (start_pos >= m_bytes) { return string<Storage>{"", 0}; }
+  auto const end_pos = count < 0 ? m_bytes : std::min(byte_offset(pos + count), m_bytes);
   return string<Storage>{data() + start_pos, end_pos - start_pos};
 }
 
@@ -424,16 +424,16 @@ __device__ void string<Storage>::shift_bytes(cudf::size_type start_pos,
                                              cudf::size_type end_pos,
                                              cudf::size_type nbytes)
 {
-  if (nbytes < m_size_bytes) {
+  if (nbytes < m_bytes) {
     // shift bytes to the left [...wxyz] -> [wxyzxyz]
     auto src = end_pos;
     auto tgt = start_pos;
     while (tgt < nbytes) {
       data()[tgt++] = data()[src++];
     }
-  } else if (nbytes > m_size_bytes) {
+  } else if (nbytes > m_bytes) {
     // shift bytes to the right [abcd...] -> [abcabcd]
-    auto src = m_size_bytes;
+    auto src = m_bytes;
     auto tgt = nbytes;
     while (src > end_pos) {
       data()[--tgt] = data()[--src];
@@ -449,11 +449,11 @@ __device__ inline string<Storage>& string<Storage>::replace(cudf::size_type pos,
 {
   if (pos < 0 || in_bytes < 0) { return *this; }
   auto const start_pos = byte_offset(pos);
-  if (start_pos > m_size_bytes) { return *this; }
-  auto const end_pos = count < 0 ? m_size_bytes : std::min(byte_offset(pos + count), m_size_bytes);
+  if (start_pos > m_bytes) { return *this; }
+  auto const end_pos = count < 0 ? m_bytes : std::min(byte_offset(pos + count), m_bytes);
 
   // compute new size
-  auto const nbytes = m_size_bytes + in_bytes - (end_pos - start_pos);
+  auto const nbytes = m_bytes + in_bytes - (end_pos - start_pos);
   Storage::grow(nbytes);
 
   // move bytes -- make room for replacement
@@ -462,7 +462,7 @@ __device__ inline string<Storage>& string<Storage>::replace(cudf::size_type pos,
   // insert the replacement
   memcpy(data() + start_pos, str, in_bytes);
 
-  m_size_bytes = nbytes;
+  m_bytes = nbytes;
   return *this;
 }
 
