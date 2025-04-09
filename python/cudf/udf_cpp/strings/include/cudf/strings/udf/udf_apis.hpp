@@ -18,7 +18,6 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
-#include <cudf/strings/udf/udf_string.cuh>
 
 #include <rmm/device_buffer.hpp>
 
@@ -34,6 +33,8 @@ namespace udf {
  * @return The CUDA version as an integer, parsed as major * 1000 + minor * 10.
  */
 int get_cuda_build_version();
+
+class udf_string;
 
 /**
  * @brief Return a cudf::string_view array for the given strings column

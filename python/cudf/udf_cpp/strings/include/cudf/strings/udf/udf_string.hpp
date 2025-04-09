@@ -16,841 +16,18 @@
 #pragma once
 
 #include <cudf/strings/string_view.hpp>
-#include <cudf/utilities/traits.hpp>
 
-#include <cuda/atomic>
-#include <cuda/std/atomic>
-#include <cuda/std/variant>
 #include <cuda_runtime.h>
 
 // This header contains all class and function declarations so that it
 // can be included in a .cpp file which only has declaration requirements
 // (i.e. sizeof, conditionally-comparable, explicit conversions, etc).
-// The definitions are coded in string.cuh which is to be included
+// The definitions are coded in udf_string.cuh which is to be included
 // in .cu files that use this class in kernel calls.
 
 namespace cudf {
 namespace strings {
 namespace udf {
-
-// needs to support element-per-thread and strides-per-thread
-
-/**
- * @brief A scope-local arena, the arena is cleared at the end of a scope. The scope can be a thread
- * or loop iteration. At the end of the scope, the allocation becomes invalidated. This is ideal for
- * temporary strings.
- */
-class alignas(32) arena {
-  /// @brief Current allocation offset
-  uint8_t* m_next;
-
-  /// @brief End of the memory block
-  uint8_t* m_end;
-
-  /// @brief The beginning of the memory block
-  uint8_t* m_begin;
-
-  /// @brief The total size (in bytes) of all allocations made
-  size_t m_allocated;
-
- public:
-  CUDF_HOST_DEVICE arena(uint8_t* begin, size_t size)
-    : m_next(begin), m_end(begin + size), m_begin(begin), m_allocated(0)
-  {
-  }
-
-  CUDF_HOST_DEVICE arena() : arena{static_cast<uint8_t*>(nullptr), 0} {}
-
-  CUDF_HOST_DEVICE arena(void* begin, size_t size) : arena{static_cast<uint8_t*>(begin), size} {}
-
-  CUDF_HOST_DEVICE arena(arena const&)            = delete;
-  CUDF_HOST_DEVICE arena(arena&&)                 = delete;
-  CUDF_HOST_DEVICE arena& operator=(arena const&) = delete;
-  CUDF_HOST_DEVICE arena& operator=(arena&&)      = delete;
-  CUDF_HOST_DEVICE ~arena()                       = default;
-
-  /// @brief Allocate `size` bytes of memory
-  /// @param size Allocation size in bytes
-  /// @returns `nullptr` if allocation fails
-  CUDF_HOST_DEVICE void* allocate(size_t size)
-  {
-    if (size == 0) { return nullptr; }
-
-    if (m_next + size > m_end) { return nullptr; }
-
-    auto allocation = m_next;
-    m_next += size;
-    m_allocated += size;
-    return allocation;
-  }
-
-  /// @brief Deallocate the allocation `memory` from the arena
-  /// @param memory The allocated memory
-  /// @param size The size of the memory. must be 0 if nullptr
-  CUDF_HOST_DEVICE void deallocate(void* memory, size_t size)
-  {
-    if (memory == nullptr || size == 0) { return; }
-
-    uint8_t* mem = static_cast<uint8_t*>(memory);
-
-    if ((mem + size) == m_next) {
-      m_next -= size;
-      return;
-    }
-
-    m_allocated -= size;
-  }
-
-  /// @brief Reallocate the allocation `old_memory` from size `old_size` to size `new_size`
-  /// @param old_memory The allocated memory
-  /// @param old_size The previous size of the memory
-  /// @param new_size The new size of the memory
-  /// @returns Returns the allocated memory if successful, otherwise false
-  __device__ void* reallocate(void* old_memory, size_t old_size, size_t new_size)
-  {
-    if (old_memory == nullptr || old_size == 0) { return allocate(new_size); }
-
-    if (new_size == 0) {
-      deallocate(old_memory, old_size);
-      return nullptr;
-    }
-
-    uint8_t* old = static_cast<uint8_t*>(old_memory);
-
-    // if latest allocation, try to extend
-    if ((old + old_size) == m_next) {
-      if ((old + new_size) > m_end) { return nullptr; }
-
-      m_next      = old + new_size;
-      m_allocated = m_next - m_begin;
-      return old;
-    }
-
-    // memory is already sized enough, re-use.
-    // although this can lead to fragmentation as the actual size is now different.
-    if (old_size > new_size) { return old; }
-
-    auto allocation = allocate(new_size);
-
-    if (allocation == nullptr) { return nullptr; }
-
-    memcpy(allocation, old_memory, std::min(old_size, new_size));
-
-    deallocate(old_memory, old_size);
-
-    return allocation;
-  }
-
-  /// @brief Release all the memory owned by this arena
-  /// @warning This will invalidate all memory allocated from this arena
-  CUDF_HOST_DEVICE void release_all()
-  {
-    m_next      = m_begin;
-    m_allocated = 0;
-  }
-
-  /// @brief Check if the arena contains the specified memory region
-  /// @returns `true` if the memory is owned by this arena, otherwise `false`
-  CUDF_HOST_DEVICE bool contains(void* memory, size_t size) const
-  {
-    uint8_t* mem = static_cast<uint8_t*>(memory);
-    return mem >= m_begin && (mem + size) <= m_end;
-  }
-};
-
-/**
- * @brief A multi-threaded arena, This is ideal for allocating string outputs.
- */
-template <cuda::thread_scope Scope>
-class alignas(32) mt_arena {
-  /// @brief Current allocation offset
-  uint8_t* m_next;
-
-  /// @brief End of the memory block
-  uint8_t* m_end;
-
-  /// @brief The beginning of the memory block
-  uint8_t* m_begin;
-
- public:
-  CUDF_HOST_DEVICE mt_arena(uint8_t* begin, size_t size)
-    : m_next(begin), m_end(begin + size), m_begin(begin)
-  {
-  }
-
-  CUDF_HOST_DEVICE mt_arena() : mt_arena{static_cast<uint8_t*>(nullptr), 0} {}
-
-  CUDF_HOST_DEVICE mt_arena(void* begin, size_t size) : mt_arena{static_cast<uint8_t*>(begin), size}
-  {
-  }
-
-  CUDF_HOST_DEVICE mt_arena(mt_arena const&)            = delete;
-  CUDF_HOST_DEVICE mt_arena(mt_arena&&)                 = delete;
-  CUDF_HOST_DEVICE mt_arena& operator=(mt_arena const&) = delete;
-  CUDF_HOST_DEVICE mt_arena& operator=(mt_arena&&)      = delete;
-  CUDF_HOST_DEVICE ~mt_arena()                          = default;
-
-  __device__ void* allocate(size_t size)
-  {
-    if (size == 0) { return nullptr; }
-
-    cuda::atomic_ref<uint8_t*, Scope> next{m_next};
-
-    uint8_t* allocation = nullptr;
-    auto expected       = m_end + 1;
-    auto target         = expected;
-
-    while (!next.compare_exchange_weak(expected, target, cuda::memory_order_relaxed)) {
-      if ((expected + size) > m_end) { return nullptr; }
-
-      allocation = expected;
-      target     = expected + size;
-    }
-
-    return allocation;
-  }
-
-  __device__ void* reallocate(void* old_memory, size_t old_size, size_t new_size)
-  {
-    if (old_memory == nullptr || old_size == 0) { return allocate(new_size); }
-
-    if (new_size == 0) {
-      deallocate(old_memory, old_size);
-      return nullptr;
-    }
-
-    cuda::atomic_ref<uint8_t*, Scope> next{m_next};
-
-    uint8_t* old = static_cast<uint8_t*>(old_memory);
-
-    {
-      // try to extend allocation if is the latest
-      auto expected = old + old_size;
-      if (auto target = old + new_size; target <= m_end) {
-        if (next.compare_exchange_strong(expected, target, cuda::memory_order_relaxed)) {
-          return old;
-        }
-      }
-    }
-
-    // memory is already sized enough, re-use.
-    // although this can lead to fragmentation as the actual size is now different.
-    if (old_size > new_size) { return old; }
-
-    // allocate a new memory
-    auto allocation = allocate(new_size);
-
-    if (allocation == nullptr) { return nullptr; }
-
-    memcpy(allocation, old_memory, std::min(old_size, new_size));
-
-    deallocate(old_memory, old_size);
-
-    return allocation;
-  }
-
-  __device__ void deallocate(void* memory, size_t size)
-  {
-    if (memory == nullptr || size == 0) { return; }
-
-    cuda::atomic_ref<uint8_t*, Scope> next{m_next};
-
-    uint8_t* allocation = static_cast<uint8_t*>(memory);
-
-    // if latest allocation, attempt to adjust back
-    {
-      auto expected = allocation + size;
-      auto target   = allocation;
-
-      if (next.compare_exchange_strong(expected, target, cuda::memory_order_relaxed)) { return; }
-    }
-  }
-
-  __device__ void reset()
-  {
-    cuda::atomic_ref<uint8_t*, Scope> next{m_next};
-    next.store(m_begin, cuda::memory_order_relaxed);
-  }
-
-  CUDF_HOST_DEVICE bool contains(void* memory, size_t size) const
-  {
-    uint8_t* mem = static_cast<uint8_t*>(memory);
-    return mem >= m_begin && (mem + size) <= m_end;
-  }
-};
-
-struct heap_allocator {
-  static __device__ void* allocate(size_t size)
-  {
-    if (size == 0) { return nullptr; }
-    return malloc(size);
-  }
-
-  static __device__ void deallocate(void* memory, [[maybe_unused]] size_t size) { free(memory); }
-
-  static __device__ void* reallocate(void* old_memory, size_t old_size, size_t new_size)
-  {
-    if (old_memory == nullptr || old_size == 0) { return allocate(new_size); }
-
-    if (new_size == 0) {
-      deallocate(old_memory, old_size);
-      return nullptr;
-    }
-
-    auto* new_mem = allocate(new_size);
-    memcpy(new_mem, old_memory, std::min(old_size, new_size));
-    deallocate(old_memory, old_size);
-
-    return new_mem;
-  }
-};
-
-enum class memory_source : int32_t {
-  /// @brief there is no source (i.e. no allocation was made)
-  NONE = 0,
-
-  /// @brief the memory was sourced from the device heap
-  /// Synchronized?: Yes, via call to malloc
-  HEAP = 1,
-
-  /// @brief the memory was sourced from the provide output buffer
-  /// Synchronized?: Yes, via atomic operations
-  OUTPUT = 2,
-
-  /// @brief the memory was sourced from device's block shared memory (i.e. `__shared__ char[ ]`)
-  /// Synchronized?: No
-  SHARED = 3,
-
-  /// @brief the memory was sourced from the thread's scope (i.e. per-thread buffer or
-  /// per-thread-scope buffer).
-  /// Synchronized?: No
-  SCOPE = 4
-};
-
-struct allocation {
-  /// @brief the allocated memory. `nullptr` if allocation fails
-  void* memory;
-
-  /// @brief source of the memory
-  memory_source source;
-
-  CUDF_HOST_DEVICE constexpr allocation() : memory{nullptr}, source{memory_source::NONE} {}
-  CUDF_HOST_DEVICE constexpr allocation(void* memory, memory_source source)
-    : memory{memory}, source{source}
-  {
-  }
-  CUDF_HOST_DEVICE constexpr allocation(allocation const&)            = default;
-  CUDF_HOST_DEVICE constexpr allocation(allocation&&)                 = default;
-  CUDF_HOST_DEVICE constexpr allocation& operator=(allocation const&) = default;
-  CUDF_HOST_DEVICE constexpr allocation& operator=(allocation&&)      = default;
-  CUDF_HOST_DEVICE ~allocation()                                      = default;
-};
-
-enum class storage_type : int32_t {
-  /// @brief a temporary string. Its lifetime doesn't extend beyond its thread-local scope
-  TEMPORARY = 0,
-
-  /// @brief an output string. Its lifetime outlives the kernel.
-  OUTPUT = 1
-};
-
-class allocation_scope {
-  /// @brief the device heap
-  bool m_disable_heap;
-
-  /// @brief the pre-allocated output buffer
-  mt_arena<cuda::thread_scope_system>* m_output_arena;
-
-  /// @brief device's shared memory arena for the current thread
-  arena* m_shared_arena;
-
-  /// @brief the scope's arena
-  arena* m_scope_arena;
-
- public:
-  CUDF_HOST_DEVICE allocation_scope(mt_arena<cuda::thread_scope_system>* output_arena,
-                                    arena* shared_arena,
-                                    arena* scope_arena,
-                                    bool disable_heap = false)
-    : m_output_arena(output_arena),
-      m_shared_arena(shared_arena),
-      m_scope_arena(scope_arena),
-      m_disable_heap(disable_heap)
-  {
-  }
-
-  CUDF_HOST_DEVICE allocation_scope() : allocation_scope{nullptr, nullptr, nullptr} {}
-
-  CUDF_HOST_DEVICE allocation_scope(allocation_scope const&)            = default;
-  CUDF_HOST_DEVICE allocation_scope(allocation_scope&&)                 = default;
-  CUDF_HOST_DEVICE allocation_scope& operator=(allocation_scope const&) = default;
-  CUDF_HOST_DEVICE allocation_scope& operator=(allocation_scope&&)      = default;
-  CUDF_HOST_DEVICE ~allocation_scope()                                  = default;
-
-  template <storage_type Type>
-  __device__ allocation allocate(size_t size)
-  {
-    if constexpr (Type == storage_type::OUTPUT) {
-      if (m_output_arena != nullptr) {
-        if (auto mem = m_output_arena->allocate(size); mem != nullptr) {
-          return allocation{mem, memory_source::OUTPUT};
-        }
-      }
-
-      if (!m_disable_heap) {
-        if (auto mem = heap_allocator::allocate(size); mem != nullptr) {
-          return allocation{mem, memory_source::HEAP};
-        }
-      }
-
-      return allocation{nullptr, memory_source::NONE};
-
-    } else if constexpr (Type == storage_type::TEMPORARY) {
-      if (m_shared_arena != nullptr) {
-        if (auto mem = m_shared_arena->allocate(size); mem != nullptr) {
-          return allocation{mem, memory_source::SHARED};
-        }
-      }
-
-      if (m_scope_arena != nullptr) {
-        if (auto mem = m_scope_arena->allocate(size); mem != nullptr) {
-          return allocation{mem, memory_source::SCOPE};
-        }
-      }
-
-      if (!m_disable_heap) {
-        if (auto mem = heap_allocator::allocate(size); mem != nullptr) {
-          return allocation{mem, memory_source::HEAP};
-        }
-      }
-
-      return allocation{nullptr, memory_source::NONE};
-    } else {
-      __builtin_unreachable();
-    }
-  }
-
-  template <storage_type Type>
-  __device__ void deallocate(allocation allocation, size_t size)
-  {
-    switch (allocation.source) {
-      case memory_source::NONE: {
-        assert(allocation.memory == nullptr && size == 0);
-      } break;
-      case memory_source::HEAP: {
-        heap_allocator::deallocate(allocation.memory, size);
-      } break;
-      case memory_source::OUTPUT: {
-        m_output_arena->deallocate(allocation.memory, size);
-      } break;
-      case memory_source::SHARED: {
-        m_shared_arena->deallocate(allocation.memory, size);
-      } break;
-      case memory_source::SCOPE: {
-        m_scope_arena->deallocate(allocation.memory, size);
-      } break;
-      default: __builtin_unreachable();
-    }
-  }
-
-  template <storage_type Type>
-  __device__ allocation reallocate(allocation alloc, size_t old_size, size_t new_size)
-  {
-    // first try to re-allocate on its current source, it'd be cheaper and have less fragmentation
-    switch (alloc.source) {
-      case memory_source::NONE: {
-        assert(alloc.memory == nullptr && old_size == 0 && new_size == 0);
-      } break;
-      case memory_source::HEAP: {
-        if (auto* mem = heap_allocator::reallocate(alloc.memory, old_size, new_size);
-            mem != nullptr) {
-          return allocation{mem, memory_source::HEAP};
-        }
-      } break;
-      case memory_source::OUTPUT: {
-        if (auto* mem = m_output_arena->reallocate(alloc.memory, old_size, new_size);
-            mem != nullptr) {
-          return allocation{mem, memory_source::OUTPUT};
-        }
-      } break;
-      case memory_source::SHARED: {
-        if (auto* mem = m_shared_arena->reallocate(alloc.memory, old_size, new_size);
-            mem != nullptr) {
-          return allocation{mem, memory_source::SHARED};
-        }
-      } break;
-      case memory_source::SCOPE: {
-        if (auto* mem = m_scope_arena->reallocate(alloc.memory, old_size, new_size);
-            mem != nullptr) {
-          return allocation{mem, memory_source::SCOPE};
-        }
-      } break;
-
-      default: __builtin_unreachable();
-    }
-
-    auto new_alloc = allocate<Type>(new_size);
-
-    if (new_alloc.memory == nullptr) { return allocation{}; }
-
-    memcpy(new_alloc.memory, alloc.memory, std::min(old_size, new_size));
-
-    deallocate<Type>(alloc, old_size);
-
-    return new_alloc;
-  }
-};
-
-template <typename Buffer>
-static __device__ Buffer make_storage(size_t capacity, allocation_scope scope)
-{
-  Buffer s{scope};
-  s.reserve(capacity);
-  return s;
-}
-
-template <typename Buffer>
-static __device__ Buffer make_storage_copy(void const* data, size_t size, allocation_scope scope)
-{
-  Buffer s{scope};
-  s.reserve(size);
-  memcpy(s.memory(), data, size);
-  return s;
-}
-
-template <typename Buffer>
-class buffer_base {
- public:
-  CUDF_HOST_DEVICE Buffer& super() { return static_cast<Buffer&>(*this); }
-
-  CUDF_HOST_DEVICE Buffer const& super() const { return static_cast<Buffer const&>(*this); }
-
-  __device__ void reallocate(size_t capacity) { super().try_reallocate(capacity); }
-
-  __device__ bool try_reserve(size_t capacity)
-  {
-    if (super().capacity() >= capacity) { return true; }
-
-    return super().try_reallocate(capacity);
-  }
-
-  __device__ void reserve(size_t capacity)
-  {
-    // TODO: handle errors
-    try_reserve(capacity);
-  }
-
-  __device__ bool try_grow(size_t target_size)
-  {
-    if (super().capacity() >= target_size) { return true; }
-
-    return super().try_reallocate(target_size << 1);
-  }
-
-  __device__ void grow(size_t target_size) { try_grow(target_size); }
-};
-
-template <storage_type Type>
-class scoped_buffer;
-
-class heap_buffer : public buffer_base<heap_buffer> {
- protected:
-  void* m_memory;
-
-  size_t m_capacity;
-
- public:
-  using base = buffer_base<heap_buffer>;
-
-  __device__ heap_buffer(void* memory, size_t capacity, [[maybe_unused]] allocation_scope scope)
-    : m_memory{memory}, m_capacity{capacity}
-  {
-  }
-
-  __device__ heap_buffer([[maybe_unused]] allocation_scope scope) : m_memory{nullptr}, m_capacity{0}
-  {
-  }
-
-  __device__ heap_buffer(heap_buffer const& other) : m_memory(nullptr), m_capacity(0)
-  {
-    base::reserve(other.m_capacity);
-    memcpy(m_memory, other.m_memory, m_capacity);
-  }
-
-  __device__ heap_buffer(heap_buffer&& other)
-    : m_memory{other.m_memory}, m_capacity{other.m_capacity}
-  {
-    other.m_memory   = nullptr;
-    other.m_capacity = 0;
-  }
-
-  __device__ heap_buffer& operator=(heap_buffer const& other)
-  {
-    if (this == &other) { return *this; }
-
-    base::reserve(other.m_capacity);
-    memcpy(m_memory, other.m_memory, m_capacity);
-
-    return *this;
-  }
-
-  __device__ heap_buffer& operator=(heap_buffer&& other)
-  {
-    if (this == &other) { return *this; }
-
-    m_memory         = other.m_memory;
-    other.m_memory   = nullptr;
-    m_capacity       = other.m_capacity;
-    other.m_capacity = 0;
-
-    return *this;
-  }
-
-  __device__ ~heap_buffer() { reset(); }
-
-  __device__ void reset()
-  {
-    heap_allocator::deallocate(m_memory, m_capacity);
-    m_memory   = nullptr;
-    m_capacity = 0;
-  }
-
-  __device__ void leak()
-  {
-    m_memory   = nullptr;
-    m_capacity = 0;
-  }
-
-  __device__ void* memory() const { return m_memory; }
-
-  __device__ size_t capacity() const { return m_capacity; }
-
-  __device__ bool try_reallocate(size_t capacity)
-  {
-    void* alloc;
-    if (alloc = heap_allocator::reallocate(m_memory, m_capacity, capacity); alloc == nullptr) {
-      return false;
-    }
-
-    m_memory   = alloc;
-    m_capacity = capacity;
-
-    return true;
-  }
-
-  /// @brief Take ownership of the storage if the storage types and memory sources are compatible,
-  /// otherwise copy the bytes
-  template <storage_type SrcType>
-  __device__ void adopt(scoped_buffer<SrcType> other,
-                        size_t max_copy_size = cuda::std::numeric_limits<size_t>::max());
-
-  __device__ void adopt(
-    heap_buffer other,
-    [[maybe_unused]] size_t max_copy_size = cuda::std::numeric_limits<size_t>::max())
-  {
-    *this = std::move(other);
-  }
-
-  template <storage_type Type>
-  friend class scoped_buffer;
-};
-
-template <storage_type Type>
-class scoped_buffer : public buffer_base<scoped_buffer<Type>> {
- protected:
-  void* m_memory;
-
-  size_t m_capacity;
-
-  memory_source m_source;
-
-  allocation_scope m_scope;
-
- public:
-  using base = buffer_base<scoped_buffer<Type>>;
-
-  static constexpr storage_type type = Type;
-
-  __device__ scoped_buffer(void* memory,
-                           size_t capacity,
-                           memory_source source,
-                           allocation_scope scope)
-    : m_memory{memory}, m_capacity{capacity}, m_source{source}, m_scope{scope}
-  {
-  }
-
-  __device__ scoped_buffer(allocation_scope scope = allocation_scope{})
-    : scoped_buffer{nullptr, 0, 0, memory_source::NONE, scope}
-  {
-  }
-
-  __device__ scoped_buffer(scoped_buffer&& other)
-    : m_memory{other.m_memory},
-      m_capacity{other.m_capacity},
-      m_source{other.m_source},
-      m_scope{other.m_scope}
-  {
-    other.m_memory   = nullptr;
-    other.m_capacity = 0;
-    other.m_source   = memory_source::NONE;
-    other.m_scope    = allocation_scope{};
-  }
-
-  template <storage_type SrcType, CUDF_ENABLE_IF(Type != SrcType)>
-  __device__ scoped_buffer(scoped_buffer<SrcType>&& other)
-    : m_memory{nullptr}, m_capacity{0}, m_source{}, m_scope{}
-  {
-    // the storage needs to be transferred to the heap since an allocation_scope is not yet
-    // provided.
-    if (other.is_heap_sourced()) {
-      m_memory         = other.m_memory;
-      other.m_memory   = nullptr;
-      m_capacity       = other.m_capacity;
-      other.m_capacity = 0;
-      m_source         = other.m_source;
-      other.m_source   = memory_source::NONE;
-      other.m_scope    = allocation_scope{};
-    } else {
-      base::reserve(other.m_capacity);
-      memcpy(m_memory, other.m_memory, other.m_capacity);
-    }
-  }
-
-  __device__ scoped_buffer(scoped_buffer const& other)
-    : m_memory(nullptr), m_capacity(0), m_source(memory_source::NONE), m_scope(other.m_scope)
-  {
-    base::reserve(other.m_capacity);
-    memcpy(m_memory, other.m_memory, m_capacity);
-  }
-
-  __device__ scoped_buffer(heap_buffer&& other)
-    : m_memory{other.m_memory},
-      m_capacity{other.m_capacity},
-      m_source{memory_source::HEAP},
-      m_scope{}
-  {
-    other.m_memory   = nullptr;
-    other.m_capacity = 0;
-  }
-
-  __device__ scoped_buffer& operator=(scoped_buffer const& other)
-  {
-    if (this == &other) { return *this; }
-
-    base::reserve(other.m_capacity);
-    memcpy(m_memory, other.m_memory, m_capacity);
-
-    return *this;
-  }
-
-  __device__ scoped_buffer& operator=(scoped_buffer&& other)
-  {
-    if (this == &other) { return *this; }
-    reset();
-    m_memory         = other.m_memory;
-    other.m_memory   = nullptr;
-    m_capacity       = other.m_capacity;
-    other.m_capacity = 0;
-    m_source         = other.m_source;
-    other.m_source   = memory_source::NONE;
-    m_scope          = other.m_scope;
-    other.m_scope    = allocation_scope{};
-    return *this;
-  }
-
-  __device__ scoped_buffer& operator=(heap_buffer&& other)
-  {
-    reset();
-    m_memory         = other.m_memory;
-    other.m_memory   = nullptr;
-    m_capacity       = other.m_capacity;
-    other.m_capacity = 0;
-    m_source         = memory_source::HEAP;
-    m_scope          = allocation_scope{};
-    return *this;
-  }
-
-  __device__ ~scoped_buffer() { reset(); }
-
-  __device__ void reset()
-  {
-    m_scope.deallocate<Type>(allocation{m_memory, m_source}, m_capacity);
-    m_memory   = nullptr;
-    m_capacity = 0;
-    m_source   = memory_source::NONE;
-  }
-
-  __device__ void leak()
-  {
-    m_memory   = nullptr;
-    m_capacity = 0;
-    m_source   = memory_source::NONE;
-  }
-
-  __device__ void* memory() const { return m_memory; }
-
-  __device__ size_t capacity() const { return m_capacity; }
-
-  __device__ bool try_reallocate(size_t capacity)
-  {
-    allocation alloc;
-    if (alloc = m_scope.reallocate<Type>(allocation{m_memory, m_source}, m_capacity, capacity);
-        alloc.memory == nullptr) {
-      return false;
-    }
-
-    m_memory   = alloc.memory;
-    m_source   = alloc.source;
-    m_capacity = capacity;
-
-    return true;
-  }
-
-  __device__ bool is_heap_sourced() const { return m_source == memory_source::HEAP; }
-
-  /// @brief Take ownership of the storage if the storage types and memory sources are compatible
-  /// with this storage type, otherwise copy the bytes
-  template <storage_type SrcType>
-  __device__ void adopt(scoped_buffer<SrcType> other,
-                        size_t max_copy_size = cuda::std::numeric_limits<size_t>::max())
-  {
-    if constexpr (Type == SrcType) {
-      *this = std::move(other);
-    } else {
-      if (other.is_heap_sourced()) {
-        *this = heap_buffer{other.m_memory, other.m_capacity};
-        other.leak();
-      } else {
-        // the sources are incompatible, the bytes need to be transferred here
-        auto copy_size = std::min(max_copy_size, other.capacity());
-        reserve(copy_size);
-        memcpy(m_memory, other.m_memory, copy_size);
-      }
-    }
-  }
-
-  __device__ void adopt(
-    heap_buffer other,
-    [[maybe_unused]] size_t max_copy_size = cuda::std::numeric_limits<size_t>::max())
-  {
-    *this = std::move(other);
-  }
-};
-
-template <storage_type SrcType>
-__device__ void heap_buffer::adopt(scoped_buffer<SrcType> other, size_t max_copy_size)
-{
-  if (other.is_heap_sourced()) {
-    *this = heap_buffer{other.m_memory, other.m_capacity, allocation_scope{}};
-    other.leak();
-  } else {
-    auto copy_size = std::min(max_copy_size, other.capacity());
-    reserve(copy_size);
-    memcpy(m_memory, other.m_memory, copy_size);
-  }
-}
-
-// TODO: utility to estimate memory required across all threads for intermediates
 
 /**
  * @brief Device string class for use with user-defined functions
@@ -862,11 +39,8 @@ __device__ void heap_buffer::adopt(scoped_buffer<SrcType> other, size_t max_copy
  * with special consideration for UTF-8 encoded strings and for
  * use within a cuDF UDF.
  */
-template <typename Buffer>
-class string : protected Buffer {
+class udf_string {
  public:
-  using buffer_type = Buffer;
-
   /**
    * @brief Represents unknown character position or length
    */
@@ -875,12 +49,12 @@ class string : protected Buffer {
   /**
    * @brief Cast to cudf::string_view operator
    */
-  __device__ operator cudf::string_view() const { return cudf::string_view(data(), m_bytes); }
+  __device__ operator cudf::string_view() const { return cudf::string_view(m_data, m_bytes); }
 
   /**
    * @brief Create an empty string.
    */
-  __device__ string(allocation_scope scope = {});
+  udf_string() = default;
 
   /**
    * @brief Create a string using existing device memory
@@ -890,7 +64,7 @@ class string : protected Buffer {
    * @param data Device pointer to UTF-8 encoded string
    * @param bytes Number of bytes in `data`
    */
-  __device__ string(char const* data, cudf::size_type bytes, allocation_scope scope = {});
+  __device__ udf_string(char const* data, cudf::size_type bytes);
 
   /**
    * @brief Create a string object from a null-terminated character array
@@ -900,7 +74,7 @@ class string : protected Buffer {
    * @param data Device pointer to UTF-8 encoded null-terminated
    *             character array.
    */
-  __device__ string(char const* data, allocation_scope scope = {});
+  __device__ udf_string(char const* data);
 
   /**
    * @brief Create a string object from a cudf::string_view
@@ -909,7 +83,7 @@ class string : protected Buffer {
    *
    * @param str String to copy
    */
-  __device__ string(cudf::string_view str, allocation_scope scope = {});
+  __device__ udf_string(cudf::string_view str);
 
   /**
    * @brief Create a string object with `count` copies of character `chr`
@@ -917,7 +91,7 @@ class string : protected Buffer {
    * @param count Number of times to copy `chr`
    * @param chr Character from which to create the string
    */
-  __device__ string(cudf::size_type count, cudf::char_utf8 chr, allocation_scope scope = {});
+  __device__ udf_string(cudf::size_type count, cudf::char_utf8 chr);
 
   /**
    * @brief Create a string object from another instance
@@ -926,8 +100,7 @@ class string : protected Buffer {
    *
    * @param src String to copy
    */
-  template <typename SrcBuffer>
-  __device__ string(string<SrcBuffer> const& src);
+  __device__ udf_string(udf_string const& src);
 
   /**
    * @brief Move a string object from an rvalue reference
@@ -937,47 +110,40 @@ class string : protected Buffer {
    *
    * @param src String to copy
    */
-  template <typename SrcBuffer>
-  __device__ string(string<SrcBuffer>&& src);
+  __device__ udf_string(udf_string&& src) noexcept;
 
-  __device__ ~string() = default;
+  __device__ ~udf_string();
 
-  template <typename SrcBuffer>
-  __device__ string& operator=(string<SrcBuffer> const& src);
-
-  template <typename SrcBuffer>
-  __device__ string& operator=(string<SrcBuffer>&& src);
-
-  __device__ string& operator=(cudf::string_view const);
-
-  __device__ string& operator=(char const*);
+  __device__ udf_string& operator=(udf_string const&);
+  __device__ udf_string& operator=(udf_string&&) noexcept;
+  __device__ udf_string& operator=(cudf::string_view const);
+  __device__ udf_string& operator=(char const*);
 
   /**
    * @brief Return the number of bytes in this string
    */
-  __device__ cudf::size_type size_bytes() const;
+  __device__ cudf::size_type size_bytes() const noexcept;
 
   /**
    * @brief Return the number of characters in this string
    */
-  __device__ cudf::size_type length() const;
+  __device__ cudf::size_type length() const noexcept;
 
   /**
-   * @brief Return the maximum number of bytes a string can hold
+   * @brief Return the maximum number of bytes a udf_string can hold
    */
-  __device__ constexpr cudf::size_type max_size() const;
+  __device__ constexpr cudf::size_type max_size() const noexcept;
 
   /**
    * @brief Return the internal pointer to the character array for this object
    */
-  __device__ char* data();
-
-  __device__ char const* data() const;
+  __device__ char* data() noexcept;
+  __device__ char const* data() const noexcept;
 
   /**
    * @brief Returns true if there are no characters in this string
    */
-  __device__ bool is_empty() const;
+  __device__ bool is_empty() const noexcept;
 
   /**
    * @brief Returns an iterator that can be used to navigate through
@@ -985,9 +151,8 @@ class string : protected Buffer {
    *
    * This returns a `cudf::string_view::const_iterator` which is read-only.
    */
-  __device__ cudf::string_view::const_iterator begin() const;
-
-  __device__ cudf::string_view::const_iterator end() const;
+  __device__ cudf::string_view::const_iterator begin() const noexcept;
+  __device__ cudf::string_view::const_iterator end() const noexcept;
 
   /**
    * @brief Returns the character at the specified position
@@ -1036,7 +201,7 @@ class string : protected Buffer {
    *            not match is ordered after the corresponding character in `str`,
    *            or all compared characters match but the `str` string is longer.
    */
-  __device__ int compare(cudf::string_view str) const;
+  __device__ int compare(cudf::string_view str) const noexcept;
 
   /**
    * @brief Comparing target character array with this string
@@ -1056,46 +221,39 @@ class string : protected Buffer {
   /**
    * @brief Returns true if `rhs` matches this string exactly
    */
-  __device__ bool operator==(cudf::string_view rhs) const;
+  __device__ bool operator==(cudf::string_view rhs) const noexcept;
 
   /**
    * @brief Returns true if `rhs` does not match this string
    */
-  __device__ bool operator!=(cudf::string_view rhs) const;
+  __device__ bool operator!=(cudf::string_view rhs) const noexcept;
 
   /**
    * @brief Returns true if this string is ordered before `rhs`
    */
-  __device__ bool operator<(cudf::string_view rhs) const;
+  __device__ bool operator<(cudf::string_view rhs) const noexcept;
 
   /**
    * @brief Returns true if `rhs` is ordered before this string
    */
-  __device__ bool operator>(cudf::string_view rhs) const;
+  __device__ bool operator>(cudf::string_view rhs) const noexcept;
 
   /**
    * @brief Returns true if this string matches or is ordered before `rhs`
    */
-  __device__ bool operator<=(cudf::string_view rhs) const;
+  __device__ bool operator<=(cudf::string_view rhs) const noexcept;
 
   /**
    * @brief Returns true if `rhs` matches or is ordered before this string
    */
-  __device__ bool operator>=(cudf::string_view rhs) const;
-
-  /**
-   * @brief Remove all bytes from this string without deallocating
-   *
-   * All pointers, references, and iterators are invalidated.
-   */
-  __device__ void clear();
+  __device__ bool operator>=(cudf::string_view rhs) const noexcept;
 
   /**
    * @brief Remove all bytes from this string
    *
    * All pointers, references, and iterators are invalidated.
    */
-  __device__ void reset();
+  __device__ void clear() noexcept;
 
   /**
    * @brief Resizes string to contain `count` bytes
@@ -1125,7 +283,7 @@ class string : protected Buffer {
   /**
    * @brief Returns the number of bytes that the string has allocated
    */
-  __device__ cudf::size_type capacity() const;
+  __device__ cudf::size_type capacity() const noexcept;
 
   /**
    * @brief Reduces internal allocation to just `size_bytes()`
@@ -1142,8 +300,7 @@ class string : protected Buffer {
    * @param str String to move
    * @return This string with new contents
    */
-  template <typename SrcBuffer>
-  __device__ string& assign(string<SrcBuffer>&& str);
+  __device__ udf_string& assign(udf_string&& str) noexcept;
 
   /**
    * @brief Replaces the contents of this string with contents of `str`
@@ -1151,7 +308,7 @@ class string : protected Buffer {
    * @param str String to copy
    * @return This string with new contents
    */
-  __device__ string& assign(cudf::string_view str);
+  __device__ udf_string& assign(cudf::string_view str);
 
   /**
    * @brief Replaces the contents of this string with contents of `str`
@@ -1159,7 +316,7 @@ class string : protected Buffer {
    * @param str Null-terminated UTF-8 character array
    * @return This string with new contents
    */
-  __device__ string& assign(char const* str);
+  __device__ udf_string& assign(char const* str);
 
   /**
    * @brief Replaces the contents of this string with contents of `str`
@@ -1168,7 +325,7 @@ class string : protected Buffer {
    * @param bytes Number of bytes to copy from `str`
    * @return This string with new contents
    */
-  __device__ string& assign(char const* str, cudf::size_type bytes);
+  __device__ udf_string& assign(char const* str, cudf::size_type bytes);
 
   /**
    * @brief Append a string to the end of this string
@@ -1176,7 +333,7 @@ class string : protected Buffer {
    * @param str String to append
    * @return This string with the appended argument
    */
-  __device__ string& operator+=(cudf::string_view str);
+  __device__ udf_string& operator+=(cudf::string_view str);
 
   /**
    * @brief Append a character to the end of this string
@@ -1184,7 +341,7 @@ class string : protected Buffer {
    * @param str Character to append
    * @return This string with the appended argument
    */
-  __device__ string& operator+=(cudf::char_utf8 chr);
+  __device__ udf_string& operator+=(cudf::char_utf8 chr);
 
   /**
    * @brief Append a null-terminated device memory character array
@@ -1193,7 +350,7 @@ class string : protected Buffer {
    * @param str String to append
    * @return This string with the appended argument
    */
-  __device__ string& operator+=(char const* str);
+  __device__ udf_string& operator+=(char const* str);
 
   /**
    * @brief Append a null-terminated character array to the end of this string
@@ -1201,7 +358,7 @@ class string : protected Buffer {
    * @param str String to append
    * @return This string with the appended argument
    */
-  __device__ string& append(char const* str);
+  __device__ udf_string& append(char const* str);
 
   /**
    * @brief Append a character array to the end of this string
@@ -1210,7 +367,7 @@ class string : protected Buffer {
    * @param bytes Number of bytes from `str` to append.
    * @return This string with the appended argument
    */
-  __device__ string& append(char const* str, cudf::size_type bytes);
+  __device__ udf_string& append(char const* str, cudf::size_type bytes);
 
   /**
    * @brief Append a string to the end of this string
@@ -1218,7 +375,7 @@ class string : protected Buffer {
    * @param str String to append
    * @return This string with the appended argument
    */
-  __device__ string& append(cudf::string_view str);
+  __device__ udf_string& append(cudf::string_view str);
 
   /**
    * @brief Append a character to the end of this string
@@ -1228,7 +385,7 @@ class string : protected Buffer {
    * @param count Number of times to append `chr`
    * @return This string with the append character(s)
    */
-  __device__ string& append(cudf::char_utf8 chr, cudf::size_type count = 1);
+  __device__ udf_string& append(cudf::char_utf8 chr, cudf::size_type count = 1);
 
   /**
    * @brief Insert a string into the character position specified
@@ -1239,7 +396,7 @@ class string : protected Buffer {
    * @param str String to insert into this one
    * @return This string with the inserted argument
    */
-  __device__ string& insert(cudf::size_type pos, cudf::string_view str);
+  __device__ udf_string& insert(cudf::size_type pos, cudf::string_view str);
 
   /**
    * @brief Insert a null-terminated character array into the character position specified
@@ -1250,7 +407,7 @@ class string : protected Buffer {
    * @param data Null-terminated character array to insert
    * @return This string with the inserted argument
    */
-  __device__ string& insert(cudf::size_type pos, char const* data);
+  __device__ udf_string& insert(cudf::size_type pos, char const* data);
 
   /**
    * @brief Insert a character array into the character position specified
@@ -1262,7 +419,7 @@ class string : protected Buffer {
    * @param bytes Number of bytes from `data` to insert
    * @return This string with the inserted argument
    */
-  __device__ string& insert(cudf::size_type pos, char const* data, cudf::size_type bytes);
+  __device__ udf_string& insert(cudf::size_type pos, char const* data, cudf::size_type bytes);
 
   /**
    * @brief Insert a character one or more times into the character position specified
@@ -1274,7 +431,7 @@ class string : protected Buffer {
    * @param chr Character to insert
    * @return This string with the inserted argument
    */
-  __device__ string& insert(cudf::size_type pos, cudf::size_type count, cudf::char_utf8 chr);
+  __device__ udf_string& insert(cudf::size_type pos, cudf::size_type count, cudf::char_utf8 chr);
 
   /**
    * @brief Returns a substring of this string
@@ -1287,7 +444,7 @@ class string : protected Buffer {
    *              Default npos returns characters in range `[pos, length())`.
    * @return New string with the specified characters
    */
-  __device__ string substr(cudf::size_type pos, cudf::size_type count = npos) const;
+  __device__ udf_string substr(cudf::size_type pos, cudf::size_type count = npos) const;
 
   /**
    * @brief Replace a range of characters with a given string
@@ -1303,7 +460,7 @@ class string : protected Buffer {
    * @param str String to replace the given range
    * @return This string modified with the replacement
    */
-  __device__ string& replace(cudf::size_type pos, cudf::size_type count, cudf::string_view str);
+  __device__ udf_string& replace(cudf::size_type pos, cudf::size_type count, cudf::string_view str);
 
   /**
    * @brief Replace a range of characters with a null-terminated character array
@@ -1319,7 +476,7 @@ class string : protected Buffer {
    * @param data Null-terminated character array to replace the given range
    * @return This string modified with the replacement
    */
-  __device__ string& replace(cudf::size_type pos, cudf::size_type count, char const* data);
+  __device__ udf_string& replace(cudf::size_type pos, cudf::size_type count, char const* data);
 
   /**
    * @brief Replace a range of characters with a given character array
@@ -1336,10 +493,10 @@ class string : protected Buffer {
    * @param bytes Number of bytes from data to use for replacement
    * @return This string modified with the replacement
    */
-  __device__ string& replace(cudf::size_type pos,
-                             cudf::size_type count,
-                             char const* data,
-                             cudf::size_type bytes);
+  __device__ udf_string& replace(cudf::size_type pos,
+                                 cudf::size_type count,
+                                 char const* data,
+                                 cudf::size_type bytes);
 
   /**
    * @brief Replace a range of characters with a character one or more times
@@ -1356,10 +513,10 @@ class string : protected Buffer {
    * @param chr Character to use for replacement
    * @return This string modified with the replacement
    */
-  __device__ string& replace(cudf::size_type pos,
-                             cudf::size_type count,
-                             cudf::size_type chr_count,
-                             cudf::char_utf8 chr);
+  __device__ udf_string& replace(cudf::size_type pos,
+                                 cudf::size_type count,
+                                 cudf::size_type chr_count,
+                                 cudf::char_utf8 chr);
 
   /**
    * @brief Removes specified characters from this string
@@ -1371,28 +528,22 @@ class string : protected Buffer {
    * @param count Number of characters to remove starting at `pos`
    * @return This string with remove characters
    */
-  __device__ string& erase(cudf::size_type pos, cudf::size_type count = npos);
-
-  // TODO: add multi-append method
+  __device__ udf_string& erase(cudf::size_type pos, cudf::size_type count = npos);
 
  private:
+  char* m_data{};
+  cudf::size_type m_bytes{};
+  cudf::size_type m_capacity{};
+
+  // utilities
+  __device__ char* allocate(cudf::size_type bytes);
+  __device__ void deallocate(char* data);
+  __device__ void reallocate(cudf::size_type bytes);
   __device__ cudf::size_type char_offset(cudf::size_type byte_pos) const;
   __device__ void shift_bytes(cudf::size_type start_pos,
                               cudf::size_type end_pos,
                               cudf::size_type nbytes);
-
-  cudf::size_type m_bytes;
 };
-
-/// @brief General-purpose strings that can outlive their parent scope
-using udf_string = string<heap_buffer>;
-
-/// @brief used for strings that are only valid within a specific CUDA thread scope
-using tmp_string = string<scoped_buffer<storage_type::TEMPORARY>>;
-
-/// @brief used for strings that outlive the CUDA kernel but can be sub-allocated from an output
-/// buffer.
-using out_string = string<scoped_buffer<storage_type::OUTPUT>>;
 
 }  // namespace udf
 }  // namespace strings
