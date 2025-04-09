@@ -499,8 +499,24 @@ struct scoped_string {
 
 struct string_output {
   char* data           = nullptr;
-  cudf::size_type size = 0;
+  size_t size          = 0;
   memory_source source = memory_source::NONE;
+
+  __device__ void release()
+  {
+    switch (source) {
+      case memory_source::NONE: break;
+      case memory_source::HEAP: {
+        heap_allocator::deallocate(data, size);
+      }
+      case memory_source::ARENA: break;
+      default: __builtin_unreachable(); break;
+    }
+
+    data   = nullptr;
+    size   = 0;
+    source = memory_source::NONE;
+  }
 };
 
 struct string_accumulator {
@@ -527,7 +543,8 @@ struct string_accumulator {
 
     memcpy(mem, str.data(), str.size_bytes());
 
-    column[row] = string_output{static_cast<char*>(mem), str.size_bytes(), source};
+    column[row] =
+      string_output{static_cast<char*>(mem), static_cast<size_t>(str.size_bytes()), source};
   }
 };
 
