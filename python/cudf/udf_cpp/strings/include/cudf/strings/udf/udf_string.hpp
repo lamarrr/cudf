@@ -510,43 +510,40 @@ static __device__ Storage make_storage_copy(void const* data, size_t size, alloc
 
 template <typename Storage>
 class storage_base {
- protected:
+ public:
   Storage& super() { return static_cast<Storage&>(*this); }
 
   Storage const& super() const { return static_cast<Storage const&>(*this); }
 
-  __device__ void reallocate(size_t capacity)
-  {
-    CUDF_EXPECTS(super().try_reallocate(capacity), "");
-  }
+  __device__ void reallocate(size_t capacity) { super().try_reallocate(capacity); }
 
   __device__ bool try_reserve(size_t capacity)
   {
-    if (super().m_capacity >= capacity) { return true; }
+    if (super().capacity() >= capacity) { return true; }
 
     return super().try_reallocate(capacity);
   }
 
   __device__ void reserve(size_t capacity)
   {
-    // TODO:
-    CUDF_EXPECTS(try_reserve(capacity), "");
+    // TODO: handle errors
+    try_reserve(capacity);
   }
 
   __device__ bool try_grow(size_t target_size)
   {
-    if (super().m_capacity >= target_size) { return true; }
+    if (super().capacity() >= target_size) { return true; }
 
     return super().try_reallocate(target_size << 1);
   }
 
-  __device__ void grow(size_t target_size) { CUDF_EXPECTS(try_grow(target_size), ""); }
+  __device__ void grow(size_t target_size) { try_grow(target_size); }
 };
 
 template <storage_type Type>
 class scoped_storage;
 
-class heap_storage : protected storage_base<heap_storage> {
+class heap_storage : public storage_base<heap_storage> {
  protected:
   void* m_memory;
 
@@ -621,9 +618,12 @@ class heap_storage : protected storage_base<heap_storage> {
   /// @brief Take ownership of the storage if the storage types and memory sources are compatible,
   /// otherwise copy the bytes
   template <storage_type SrcType>
-  __device__ void receive(scoped_storage<SrcType> other, size_t max_copy_size = -1);
+  __device__ void receive(scoped_storage<SrcType> other,
+                          size_t max_copy_size = cuda::std::numeric_limits<size_t>::max());
 
-  __device__ void receive(heap_storage other, [[maybe_unused]] size_t max_copy_size = -1)
+  __device__ void receive(
+    heap_storage other,
+    [[maybe_unused]] size_t max_copy_size = cuda::std::numeric_limits<size_t>::max())
   {
     *this = std::move(other);
   }
@@ -633,7 +633,7 @@ class heap_storage : protected storage_base<heap_storage> {
 };
 
 template <storage_type Type>
-class scoped_storage : protected storage_base<scoped_storage<Type>> {
+class scoped_storage : public storage_base<scoped_storage<Type>> {
   using base = storage_base<scoped_storage<Type>>;
 
  protected:
@@ -775,7 +775,8 @@ class scoped_storage : protected storage_base<scoped_storage<Type>> {
   /// @brief Take ownership of the storage if the storage types and memory sources are compatible
   /// with this storage type, otherwise copy the bytes
   template <storage_type SrcType>
-  __device__ void receive(scoped_storage<SrcType> other, size_t max_copy_size = -1)
+  __device__ void receive(scoped_storage<SrcType> other,
+                          size_t max_copy_size = cuda::std::numeric_limits<size_t>::max())
   {
     if constexpr (Type == SrcType) {
       *this = std::move(other);
@@ -792,7 +793,9 @@ class scoped_storage : protected storage_base<scoped_storage<Type>> {
     }
   }
 
-  __device__ void receive(heap_storage other, [[maybe_unused]] size_t max_copy_size = -1)
+  __device__ void receive(
+    heap_storage other,
+    [[maybe_unused]] size_t max_copy_size = cuda::std::numeric_limits<size_t>::max())
   {
     *this = std::move(other);
   }
@@ -836,10 +839,7 @@ class string : protected Storage {
   /**
    * @brief Cast to cudf::string_view operator
    */
-  __device__ operator cudf::string_view() const
-  {
-    return cudf::string_view(Storage::m_data, Storage::m_size);
-  }
+  __device__ operator cudf::string_view() const { return cudf::string_view(data(), m_bytes); }
 
   /**
    * @brief Create an empty string.
