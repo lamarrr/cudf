@@ -22,6 +22,7 @@
 #include <cuda/std/atomic>
 
 namespace cudf {
+namespace udf {
 
 /**
  * @brief A scope-local arena. Typically a thread-scope. At the end of the scope, the allocation
@@ -327,6 +328,8 @@ struct scoped_string {
     return cudf::strings::detail::characters_in_string(m_data, m_size);
   }
 
+  __device__ void clear() { m_size = 0; }
+
   CUDF_HOST_DEVICE bool is_empty() const { return size() > 0; }
 
   CUDF_HOST_DEVICE char const* data() const { return m_data; }
@@ -371,7 +374,10 @@ struct scoped_string {
 
   __device__ scoped_string& insert(size_t pos, cudf::string_view str);
 
-  __device__ scoped_string& replace(size_t pos, cudf::string_view str);
+  __device__ scoped_string& replace(size_t pos, size_t size, cudf::string_view str);
+
+  __device__ scoped_string& erase(size_t pos,
+                                  size_t count = cuda::std::numeric_limits<size_t>::max());
 
   static __device__ scoped_string copy(cudf::string_view str, arena* arena)
   {
@@ -498,35 +504,66 @@ struct scoped_string {
 };
 
 struct string_output {
-  char* data           = nullptr;
-  size_t size          = 0;
-  memory_source source = memory_source::NONE;
+ private:
+  char* m_data           = nullptr;
+  size_t m_size          = 0;
+  memory_source m_source = memory_source::NONE;
+
+ public:
+  CUDF_HOST_DEVICE string_output(char* data, size_t size, memory_source source)
+    : m_data{data}, m_size{size}, m_source{source}
+  {
+  }
+
+  CUDF_HOST_DEVICE string_output() : string_output{nullptr, 0, memory_source::NONE} {}
+
+  CUDF_HOST_DEVICE string_output(string_output const&)            = default;
+  CUDF_HOST_DEVICE string_output(string_output&&)                 = default;
+  CUDF_HOST_DEVICE string_output& operator=(string_output const&) = default;
+  CUDF_HOST_DEVICE string_output& operator=(string_output&&)      = default;
+  CUDF_HOST_DEVICE ~string_output()                               = default;
+
+  cudf::string_view view() const
+  {
+    return cudf::string_view{m_data, static_cast<cudf::size_type>(m_size)};
+  }
 
   __device__ void release()
   {
-    switch (source) {
+    switch (m_source) {
       case memory_source::NONE: break;
       case memory_source::HEAP: {
-        heap_allocator::deallocate(data, size);
+        heap_allocator::deallocate(m_data, m_size);
       }
       case memory_source::ARENA: break;
       default: __builtin_unreachable(); break;
     }
 
-    data   = nullptr;
-    size   = 0;
-    source = memory_source::NONE;
+    m_data   = nullptr;
+    m_size   = 0;
+    m_source = memory_source::NONE;
   }
 };
 
 struct string_accumulator {
-  output_arena* arena   = nullptr;
-  string_output* column = nullptr;
+ private:
+  output_arena* m_arena   = nullptr;
+  string_output* m_column = nullptr;
+
+ public:
+  CUDF_HOST_DEVICE string_accumulator(output_arena* arena, string_output* column);
+  CUDF_HOST_DEVICE string_accumulator(string_accumulator const&)            = default;
+  CUDF_HOST_DEVICE string_accumulator(string_accumulator&&)                 = default;
+  CUDF_HOST_DEVICE string_accumulator& operator=(string_accumulator const&) = default;
+  CUDF_HOST_DEVICE string_accumulator& operator=(string_accumulator&&)      = default;
+  CUDF_HOST_DEVICE ~string_accumulator()                                    = default;
 
   __device__ cuda::std::tuple<void*, memory_source> allocate(size_t size)
   {
-    if (arena != nullptr) {
-      if (auto* mem = arena->allocate(size); mem != nullptr) { return {mem, memory_source::ARENA}; }
+    if (m_arena != nullptr) {
+      if (auto* mem = m_arena->allocate(size); mem != nullptr) {
+        return {mem, memory_source::ARENA};
+      }
     }
 
     if (auto* mem = heap_allocator::allocate(size); mem != nullptr) {
@@ -543,9 +580,12 @@ struct string_accumulator {
 
     memcpy(mem, str.data(), str.size_bytes());
 
-    column[row] =
+    m_column[row] =
       string_output{static_cast<char*>(mem), static_cast<size_t>(str.size_bytes()), source};
   }
+
+  __device__ void release(size_t row) { m_column[row].release(); }
 };
 
+}  // namespace udf
 }  // namespace cudf
