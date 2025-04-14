@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2024, NVIDIA CORPORATION.
+# Copyright (c) 2022-2025, NVIDIA CORPORATION.
 
 import operator
 
@@ -64,6 +64,7 @@ class udf_string_model(models.StructModel):
     #   char* m_data{};
     #   cudf::size_type m_bytes{};
     #   cudf::size_type m_size{};
+    #
 
     _members = (
         ("m_data", types.CPointer(types.char)),

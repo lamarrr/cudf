@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -95,7 +95,7 @@ void free_udf_string_array(cudf::strings::udf::udf_string* d_strings,
   thrust::for_each_n(rmm::exec_policy(stream),
                      thrust::make_counting_iterator(0),
                      size,
-                     [d_strings] __device__(auto idx) { d_strings[idx].clear(); });
+                     [d_strings] __device__(auto idx) { d_strings[idx].reset(); });
 }
 
 }  // namespace detail
