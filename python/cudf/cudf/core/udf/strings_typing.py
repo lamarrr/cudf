@@ -63,13 +63,16 @@ class udf_string_model(models.StructModel):
     # private:
     #   char* m_data{};
     #   cudf::size_type m_bytes{};
-    #   cudf::size_type m_size{};
-    #
+    #   cudf::size_type m_capacity{};
+    #   fallback_allocator::source m_source{};
+    #   fallback_allocator m_allocator{};
 
     _members = (
         ("m_data", types.CPointer(types.char)),
         ("m_bytes", size_type),
-        ("m_size", size_type),
+        ("m_capacity", size_type),
+        ("m_source", types.int32),
+        ("m_allocator", types.CPointer(types.void))
     )
 
     def __init__(self, dmm, fe_type):
