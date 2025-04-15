@@ -343,12 +343,7 @@ extern "C" __device__ int concat(int* nb_retval, void* udf_str, void* const* lhs
 
   auto udf_str_ptr = new (udf_str) udf_string;
 
-  //  [ ] improve these
-
-  udf_string result;
-  result.append(*lhs_ptr).append(*rhs_ptr);
-  // [ ] assign directly
-  *udf_str_ptr = result;
+  udf_str_ptr->append(*lhs_ptr).append(*rhs_ptr);
   return 0;
 }
 
