@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.
+ * Copyright (c) 2022-2023, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -51,7 +51,6 @@ __device__ inline void convert_char(chars_tables const tables,
                                     uint32_t code_point,
                                     uint8_t flag)
 {
-  // TODO:
   if (!cudf::strings::detail::IS_SPECIAL(flag)) {
     result.append(cudf::strings::detail::codepoint_to_utf8(tables.cases_table[code_point]));
     return;
@@ -82,7 +81,6 @@ __device__ inline udf_string convert_case(
   string_view d_str,
   cudf::strings::detail::character_flags_table_type case_flag)
 {
-  // TODO:
   udf_string result;
   for (auto const chr : d_str) {
     auto const code_point = cudf::strings::detail::utf8_to_codepoint(chr);
@@ -113,7 +111,6 @@ __device__ inline udf_string capitalize(chars_tables const tables,
                                         string_view d_str,
                                         CapitalizeNextFn next_fn)
 {
-  // TODO:
   udf_string result;
   bool capitalize = true;
   for (auto const chr : d_str) {

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.
+ * Copyright (c) 2022-2023, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,7 +36,6 @@ __device__ inline udf_string replace(string_view source,
                                      string_view target,
                                      string_view replacement)
 {
-  // TODO:
   udf_string result;
   auto const tgt_length   = target.length();
   auto const src_length   = source.length();
