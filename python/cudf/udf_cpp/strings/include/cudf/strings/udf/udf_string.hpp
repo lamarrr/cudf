@@ -543,6 +543,23 @@ class udf_string {
   __device__ void reset() noexcept;
 
   /**
+   * @brief Relinquishes the allocation from the string to the caller and clears itself to an empty
+   * string
+   *
+   * The caller would be responsible for deallocating the relinquished memory
+   *
+   * @return the contained allocation
+   */
+  __device__ allocation release();
+
+  /**
+   * @brief Get the data allocator
+   *
+   * @return the allocator
+   */
+  __device__ allocator_type const& get_allocator() const;
+
+  /**
    * @brief Resizes string to contain `count` bytes
    *
    * If `count > size_bytes()` then zero-padding is added.
@@ -566,11 +583,6 @@ class udf_string {
    * @param count Total number of bytes to reserve for this string
    */
   __device__ void reserve(cudf::size_type count);
-
-  /**
-   * @brief Returns the number of bytes that the string has allocated
-   */
-  __device__ cudf::size_type capacity() const noexcept;
 
   /**
    * @brief Reduces internal allocation to just `size_bytes()`
@@ -825,12 +837,10 @@ class udf_string {
   allocator_type m_allocator{};
 
   // utilities
-  __device__ allocation get_allocation() const;
-  __device__ bool try_reallocate(size_type count);
-  __device__ void reallocate(size_type count);
-  __device__ bool try_reserve(size_type count);
-  __device__ bool try_grow(size_type count);
-  __device__ void grow(size_type count);
+  __device__ allocation util_get_allocation() const;
+  __device__ void util_reallocate(size_type capacity);
+  __device__ void util_reserve(size_type capacity);
+
   __device__ cudf::size_type char_offset(cudf::size_type byte_pos) const;
   __device__ void shift_bytes(cudf::size_type start_pos,
                               cudf::size_type end_pos,

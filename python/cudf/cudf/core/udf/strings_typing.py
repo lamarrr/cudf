@@ -72,7 +72,7 @@ class udf_string_model(models.StructModel):
         ("m_bytes", size_type),
         ("m_capacity", size_type),
         ("m_source", types.int32),
-        ("m_allocator", types.CPointer(types.void))
+        ("m_allocator", types.CPointer(types.void)),
     )
 
     def __init__(self, dmm, fe_type):

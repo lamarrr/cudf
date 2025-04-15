@@ -777,7 +777,6 @@ def assert_eq(left, right, **kwargs):
             if isinstance(left, pd.DataFrame):
                 tm.assert_frame_equal(left, right, **kwargs)
             elif isinstance(left, pd.Series):
-                print("left: ", left, "\nright: ", right)
                 tm.assert_series_equal(left, right, **kwargs)
             else:
                 tm.assert_index_equal(left, right, **kwargs)
