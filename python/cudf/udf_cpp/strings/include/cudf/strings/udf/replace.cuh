@@ -16,6 +16,7 @@
 #pragma once
 
 #include <cudf/strings/string_view.cuh>
+
 #include <cudf/strings/udf/udf_string.cuh>
 
 namespace cudf {

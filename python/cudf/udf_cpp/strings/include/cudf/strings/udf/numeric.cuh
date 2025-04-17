@@ -16,8 +16,8 @@
  */
 #pragma once
 
-#include "udf_string.cuh"
 
+#include <cudf/strings/udf/udf_string.cuh>
 #include <cudf/strings/detail/convert/int_to_string.cuh>
 #include <cudf/strings/detail/convert/string_to_float.cuh>
 #include <cudf/strings/detail/convert/string_to_int.cuh>

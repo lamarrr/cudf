@@ -345,6 +345,14 @@ ConfigureNVBench(CSV_WRITER_NVBENCH io/csv/csv_writer.cpp)
 # * ast benchmark ---------------------------------------------------------------------------------
 ConfigureNVBench(AST_NVBENCH ast/polynomials.cpp ast/transform.cpp)
 
+ConfigureNVBench(UDF_STRING_NVBENCH string/udf_string.cu)
+set(UDF_BENCH_FLAGS ${CUDF_CUDA_FLAGS} -G )
+
+set_target_properties(
+  UDF_STRING_NVBENCH
+  PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:${UDF_BENCH_FLAGS}>"
+)
+
 # ##################################################################################################
 # * binaryop benchmark ----------------------------------------------------------------------------
 ConfigureNVBench(

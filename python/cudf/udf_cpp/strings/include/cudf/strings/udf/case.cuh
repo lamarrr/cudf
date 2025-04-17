@@ -15,11 +15,10 @@
  */
 #pragma once
 
-#include "udf_string.cuh"
-
 #include <cudf/strings/detail/char_tables.hpp>
 #include <cudf/strings/detail/utf8.hpp>
 #include <cudf/strings/string_view.cuh>
+#include <cudf/strings/udf/udf_string.cuh>
 
 namespace cudf {
 namespace strings {

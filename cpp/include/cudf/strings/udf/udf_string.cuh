@@ -16,10 +16,9 @@
 
 #pragma once
 
-#include "udf_string.hpp"
-
 #include <cudf/strings/detail/utf8.hpp>
 #include <cudf/strings/string_view.cuh>
+#include <cudf/strings/udf/udf_string.hpp>
 
 #include <algorithm>
 #include <limits>
@@ -62,7 +61,8 @@ __device__ inline udf_string::udf_string(char const* data,
 {
   reserve(bytes);
   memcpy(m_data, data, bytes);
-  m_bytes = bytes;
+  m_bytes         = bytes;
+  m_data[m_bytes] = '\0';
 }
 
 __device__ udf_string::udf_string(cudf::size_type count,
@@ -79,6 +79,7 @@ __device__ udf_string::udf_string(cudf::size_type count,
   for (cudf::size_type idx = 0; idx < count; ++idx) {
     out_ptr += cudf::strings::detail::from_char_utf8(chr, out_ptr);
   }
+  *out_ptr = '\0';
 }
 
 __device__ inline udf_string::udf_string(char const* data, allocator_type allocator)
@@ -96,7 +97,7 @@ __device__ inline udf_string::udf_string(udf_string const& src, allocator_type a
 {
 }
 
-__device__ inline udf_string::udf_string(udf_string&& src) noexcept
+__device__ inline udf_string::udf_string(udf_string&& src)
   : m_data(src.m_data),
     m_bytes(src.m_bytes),
     m_capacity(src.m_capacity),
@@ -110,16 +111,28 @@ __device__ inline udf_string::udf_string(udf_string&& src) noexcept
   src.m_allocator = allocator_type{};
 }
 
+__device__ inline udf_string::udf_string(udf_string&& src, fallback_allocator allocator)
+  : udf_string{allocator}
+{
+  if (src.m_source == memory_source::NONE || src.m_source == memory_source::HEAP ||
+      src.m_allocator == allocator) {
+    assign(std::move(src));
+    m_allocator = allocator;
+  } else {
+    assign(src);
+  }
+}
+
 __device__ inline udf_string::udf_string(cudf::string_view str, allocator_type allocator)
   : udf_string(str.data(), str.size_bytes(), allocator)
 {
 }
 
-__device__ inline udf_string::~udf_string() { m_allocator.deallocate(util_get_allocation()); }
+__device__ inline udf_string::~udf_string() { reset(); }
 
 __device__ inline udf_string& udf_string::operator=(udf_string const& str) { return assign(str); }
 
-__device__ inline udf_string& udf_string::operator=(udf_string&& str) noexcept
+__device__ inline udf_string& udf_string::operator=(udf_string&& str)
 {
   return assign(std::move(str));
 }
@@ -128,10 +141,12 @@ __device__ inline udf_string& udf_string::operator=(cudf::string_view str) { ret
 
 __device__ inline udf_string& udf_string::operator=(char const* str) { return assign(str); }
 
-__device__ udf_string& udf_string::assign(udf_string&& str) noexcept
+__device__ udf_string& udf_string::assign(udf_string&& str)
 {
   if (this == &str) { return *this; }
-  m_allocator.deallocate(util_get_allocation());
+
+  reset();
+
   m_data          = str.m_data;
   m_bytes         = str.m_bytes;
   m_capacity      = str.m_capacity;
@@ -142,6 +157,7 @@ __device__ udf_string& udf_string::assign(udf_string&& str) noexcept
   str.m_capacity  = 0;
   str.m_source    = memory_source::NONE;
   str.m_allocator = allocator_type{};
+
   return *this;
 }
 
@@ -164,30 +180,30 @@ __device__ udf_string& udf_string::assign(char const* str, cudf::size_type bytes
   return *this;
 }
 
-__device__ inline cudf::size_type udf_string::size_bytes() const noexcept { return m_bytes; }
+__device__ inline cudf::size_type udf_string::size_bytes() const { return m_bytes; }
 
-__device__ inline cudf::size_type udf_string::length() const noexcept
+__device__ inline cudf::size_type udf_string::length() const
 {
   return cudf::strings::detail::characters_in_string(m_data, m_bytes);
 }
 
-__device__ constexpr cudf::size_type udf_string::max_size() const noexcept
+__device__ constexpr cudf::size_type udf_string::max_size() const
 {
   return std::numeric_limits<cudf::size_type>::max() - 1;
 }
 
-__device__ inline char* udf_string::data() noexcept { return m_data; }
+__device__ inline char* udf_string::data() { return m_data; }
 
-__device__ inline char const* udf_string::data() const noexcept { return m_data; }
+__device__ inline char const* udf_string::data() const { return m_data; }
 
-__device__ inline bool udf_string::is_empty() const noexcept { return m_bytes == 0; }
+__device__ inline bool udf_string::is_empty() const { return m_bytes == 0; }
 
-__device__ inline cudf::string_view::const_iterator udf_string::begin() const noexcept
+__device__ inline cudf::string_view::const_iterator udf_string::begin() const
 {
   return cudf::string_view::const_iterator(cudf::string_view(m_data, m_bytes), 0);
 }
 
-__device__ inline cudf::string_view::const_iterator udf_string::end() const noexcept
+__device__ inline cudf::string_view::const_iterator udf_string::end() const
 {
   return cudf::string_view::const_iterator(cudf::string_view(m_data, m_bytes), length());
 }
@@ -220,7 +236,7 @@ __device__ inline cudf::size_type udf_string::byte_offset(cudf::size_type pos) c
   return offset;
 }
 
-__device__ inline int udf_string::compare(cudf::string_view in) const noexcept
+__device__ inline int udf_string::compare(cudf::string_view in) const
 {
   return compare(in.data(), in.size_bytes());
 }
@@ -231,41 +247,41 @@ __device__ inline int udf_string::compare(char const* data, cudf::size_type byte
   return view.compare(data, bytes);
 }
 
-__device__ inline bool udf_string::operator==(cudf::string_view rhs) const noexcept
+__device__ inline bool udf_string::operator==(cudf::string_view rhs) const
 {
   return m_bytes == rhs.size_bytes() && compare(rhs) == 0;
 }
 
-__device__ inline bool udf_string::operator!=(cudf::string_view rhs) const noexcept
+__device__ inline bool udf_string::operator!=(cudf::string_view rhs) const
 {
   return compare(rhs) != 0;
 }
 
-__device__ inline bool udf_string::operator<(cudf::string_view rhs) const noexcept
+__device__ inline bool udf_string::operator<(cudf::string_view rhs) const
 {
   return compare(rhs) < 0;
 }
 
-__device__ inline bool udf_string::operator>(cudf::string_view rhs) const noexcept
+__device__ inline bool udf_string::operator>(cudf::string_view rhs) const
 {
   return compare(rhs) > 0;
 }
 
-__device__ inline bool udf_string::operator<=(cudf::string_view rhs) const noexcept
+__device__ inline bool udf_string::operator<=(cudf::string_view rhs) const
 {
   return compare(rhs) <= 0;
 }
 
-__device__ inline bool udf_string::operator>=(cudf::string_view rhs) const noexcept
+__device__ inline bool udf_string::operator>=(cudf::string_view rhs) const
 {
   return compare(rhs) >= 0;
 }
 
-__device__ inline void udf_string::clear() noexcept { m_bytes = 0; }
+__device__ inline void udf_string::clear() { m_bytes = 0; }
 
-__device__ inline void udf_string::reset() noexcept
+__device__ inline void udf_string::reset()
 {
-  m_allocator.deallocate(util_get_allocation());
+  m_allocator.deallocate(m_source, m_data, m_capacity);
   m_data     = nullptr;
   m_bytes    = 0;
   m_capacity = 0;
@@ -274,12 +290,16 @@ __device__ inline void udf_string::reset() noexcept
 
 __device__ udf_string::allocation udf_string::release()
 {
-  auto allocation = util_get_allocation();
-  m_data          = nullptr;
-  m_bytes         = 0;
-  m_capacity      = 0;
-  m_source        = memory_source::NONE;
-  return allocation;
+  allocation a{
+    m_data,
+    static_cast<size_t>(m_capacity),
+    m_source,
+  };
+  m_data     = nullptr;
+  m_bytes    = 0;
+  m_capacity = 0;
+  m_source   = memory_source::NONE;
+  return a;
 }
 
 __device__ udf_string::allocator_type const& udf_string::get_allocator() const
@@ -291,7 +311,7 @@ __device__ inline void udf_string::resize(cudf::size_type count)
 {
   if (count > max_size()) { return; }
 
-  reserve(count);
+  grow(count);
 
   // add padding if necessary (null chars)
   if (count > m_bytes) { memset(m_data + m_bytes, 0, count - m_bytes); }
@@ -310,7 +330,7 @@ __device__ void udf_string::shrink_to_fit()
 __device__ inline udf_string& udf_string::append(char const* str, cudf::size_type bytes)
 {
   if (bytes <= 0) { return *this; }
-  reserve(max(m_bytes * 2, m_bytes + bytes));
+  grow(m_bytes + bytes);
   memcpy(m_data + m_bytes, str, bytes);
   m_bytes += bytes;
   m_data[m_bytes] = '\0';
@@ -406,7 +426,7 @@ __device__ inline udf_string& udf_string::replace(cudf::size_type pos,
 
   // compute new size
   auto const nbytes = m_bytes + in_bytes - (end_pos - start_pos);
-  reserve(max(m_bytes * 2, nbytes));
+  grow(nbytes);
 
   // move bytes -- make room for replacement
   shift_bytes(start_pos + in_bytes, end_pos, nbytes);
@@ -452,24 +472,16 @@ __device__ inline cudf::size_type udf_string::char_offset(cudf::size_type byte_p
   return cudf::strings::detail::characters_in_string(data(), byte_pos);
 }
 
-__device__ udf_string::allocation udf_string::util_get_allocation() const
-{
-  return allocation{m_source, m_data, static_cast<size_t>(m_capacity)};
-}
-
 __device__ void udf_string::util_reallocate(size_type capacity)
 {
+  assert(capacity > 0 && capacity < max_size() && "Invalid capacity");
   if (capacity > max_size()) { return; }
 
   // TODO: handle alloc errors
-  if (auto a = m_allocator.reallocate(util_get_allocation(), capacity)) {
-    auto [new_source, new_mem, new_capacity] = *a;
-    m_data                                   = static_cast<char*>(new_mem);
-    m_capacity                               = new_capacity;
-    m_source                                 = new_source;
-  }
+  bool success =
+    m_allocator.reallocate(m_source, reinterpret_cast<void*&>(m_data), m_capacity, capacity);
 
-  assert(false && "Memory allocation failed");
+  assert(success && "Memory allocation failed");
 }
 
 __device__ void udf_string::util_reserve(size_type capacity)
@@ -478,6 +490,8 @@ __device__ void udf_string::util_reserve(size_type capacity)
 
   util_reallocate(capacity);
 }
+
+__device__ void udf_string::grow(size_type count) { util_reserve(max(m_capacity * 2, count + 1)); }
 
 }  // namespace udf
 }  // namespace strings

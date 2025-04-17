@@ -16,7 +16,9 @@
 
 #pragma once
 
-#include "udf_string.cuh"
+
+#include <cudf/strings/udf/udf_string.cuh>
+
 
 #include <cudf/strings/detail/split_utils.cuh>
 #include <cudf/strings/string_view.cuh>

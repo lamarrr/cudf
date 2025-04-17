@@ -17,8 +17,9 @@
 
 #include <cudf/strings/string_view.hpp>
 
-#include <cuda/std/optional>
 #include <cuda_runtime.h>
+
+#include <cstring>
 
 // This header contains all class and function declarations so that it
 // can be included in a .cpp file which only has declaration requirements
@@ -48,6 +49,8 @@ class alignas(32) arena {
   size_t m_allocated;
 
  public:
+  using allocation = void*;
+
   CUDF_HOST_DEVICE arena(uint8_t* begin, size_t size)
     : m_next(begin), m_end(begin + size), m_begin(begin), m_allocated(0)
   {
@@ -57,26 +60,24 @@ class alignas(32) arena {
 
   CUDF_HOST_DEVICE arena(void* begin, size_t size) : arena{static_cast<uint8_t*>(begin), size} {}
 
-  CUDF_HOST_DEVICE arena(arena const&)            = delete;
-  CUDF_HOST_DEVICE arena(arena&&)                 = delete;
-  CUDF_HOST_DEVICE arena& operator=(arena const&) = delete;
-  CUDF_HOST_DEVICE arena& operator=(arena&&)      = delete;
+  CUDF_HOST_DEVICE arena(arena const&)            = default;
+  CUDF_HOST_DEVICE arena(arena&&)                 = default;
+  CUDF_HOST_DEVICE arena& operator=(arena const&) = default;
+  CUDF_HOST_DEVICE arena& operator=(arena&&)      = default;
   CUDF_HOST_DEVICE ~arena()                       = default;
 
   /// @brief Allocate `size` bytes of memory
   /// @param size Allocation size in bytes
   /// @returns `nullptr` if allocation fails
-  CUDF_HOST_DEVICE void* allocate(size_t size)
+  CUDF_HOST_DEVICE bool allocate(void*& memory, size_t size)
   {
-    if (size == 0) { return nullptr; }
-
-    if ((m_next + size) > m_end) { return nullptr; }
+    if ((m_next + size) > m_end) { return false; }
 
     auto allocation = m_next;
     m_next += size;
     m_allocated += size;
-
-    return allocation;
+    memory = allocation;
+    return true;
   }
 
   /// @brief Deallocate the allocation `memory` from the arena
@@ -84,8 +85,6 @@ class alignas(32) arena {
   /// @param size The size of the memory. must be 0 if nullptr
   CUDF_HOST_DEVICE void deallocate(void* memory, size_t size)
   {
-    if (memory == nullptr || size == 0) { return; }
-
     uint8_t* mem = static_cast<uint8_t*>(memory);
 
     if ((mem + size) == m_next) {
@@ -95,7 +94,7 @@ class alignas(32) arena {
 
     m_allocated -= size;
 
-    if (m_allocated == 0) { release_all(); }
+    if (m_allocated == 0) { reclaim(); }
   }
 
   /// @brief Reallocate the allocation `old_memory` from size `old_size` to size `new_size`
@@ -103,38 +102,32 @@ class alignas(32) arena {
   /// @param old_size The previous size of the memory
   /// @param new_size The new size of the memory
   /// @returns Returns the allocated memory if successful, otherwise false
-  __device__ void* reallocate(void* old_memory, size_t old_size, size_t new_size)
+  __device__ bool reallocate(void*& memory, size_t old_size, size_t new_size)
   {
-    if (old_memory == nullptr || old_size == 0) { return allocate(new_size); }
-
-    if (new_size == 0) {
-      deallocate(old_memory, old_size);
-      return nullptr;
-    }
-
-    uint8_t* old = static_cast<uint8_t*>(old_memory);
+    uint8_t* old = static_cast<uint8_t*>(memory);
 
     // if latest allocation, try to extend
     if ((old + old_size) == m_next && (old + new_size) <= m_end) {
       m_next      = old + new_size;
       m_allocated = m_next - m_begin;
-      return old;
+      return true;
     }
 
-    auto allocation = allocate(new_size);
+    void* new_memory = nullptr;
+    if (!allocate(new_memory, new_size)) { return false; }
 
-    if (allocation == nullptr) { return nullptr; }
+    memcpy(new_memory, old, std::min(old_size, new_size));
 
-    memcpy(allocation, old_memory, std::min(old_size, new_size));
+    deallocate(old, old_size);
 
-    deallocate(old_memory, old_size);
+    memory = new_memory;
 
-    return allocation;
+    return true;
   }
 
   /// @brief Release all the memory owned by this arena
   /// @warning This will invalidate all memory allocated from this arena
-  CUDF_HOST_DEVICE void release_all()
+  CUDF_HOST_DEVICE void reclaim()
   {
     m_next      = m_begin;
     m_allocated = 0;
@@ -150,28 +143,41 @@ class alignas(32) arena {
 };
 
 struct heap_allocator {
-  static __device__ void* allocate(size_t size)
+  static __device__ bool allocate(void*& memory, size_t size)
   {
-    if (size == 0) { return nullptr; }
-    return malloc(size);
-  }
-
-  static __device__ void deallocate(void* memory, [[maybe_unused]] size_t size) { free(memory); }
-
-  static __device__ void* reallocate(void* old_memory, size_t old_size, size_t new_size)
-  {
-    if (old_memory == nullptr || old_size == 0) { return allocate(new_size); }
-
-    if (new_size == 0) {
-      deallocate(old_memory, old_size);
-      return nullptr;
+    if (size == 0) {
+      memory = nullptr;
+      return true;
     }
 
-    auto* new_mem = allocate(new_size);
+    auto* alloc = malloc(size);
+    if (alloc == nullptr) { return false; }
+
+    memory = alloc;
+    return true;
+  }
+
+  static __device__ void deallocate(void* memory, [[maybe_unused]] size_t size)
+  {
+    if (memory != nullptr) {
+      printf("'%s deallocating', %p, %d \n", "heap::deallocate()", memory, (int)size);
+      free(memory);
+    }
+  }
+
+  static __device__ bool reallocate(void*& memory, size_t old_size, size_t new_size)
+  {
+    auto* old_memory = memory;
+    if (old_size == 0) { return allocate(memory, new_size); }
+
+    void* new_mem = nullptr;
+
+    if (!allocate(new_mem, new_size)) { return false; }
+
     memcpy(new_mem, old_memory, std::min(old_size, new_size));
     deallocate(old_memory, old_size);
-
-    return new_mem;
+    memory = new_mem;
+    return true;
   }
 };
 
@@ -190,12 +196,6 @@ class fallback_allocator {
     HEAP  = 2   ///< Memory was source from the device heap
   };
 
-  struct allocation {
-    source src   = source::NONE;  ///< The memory source
-    void* memory = nullptr;       ///< The offset of the memory block
-    size_t size  = 0;             ///< The size of the memory block
-  };
-
   CUDF_HOST_DEVICE constexpr fallback_allocator() = default;  ///< Default constructor with no arena
 
   ///@brief Construct a fallback allocator from an arena reference.
@@ -207,21 +207,17 @@ class fallback_allocator {
   /// to the device heap
   /// @param size the size of the memory to allocate
   /// @returns the allocation (if successful) or nullopt (if allocation failed)
-  __device__ cuda::std::optional<allocation> allocate(size_t size)
+  __device__ bool allocate(source& src, void*& memory, size_t size)
   {
-    if (m_arena != nullptr) {
-      if (auto p = m_arena->allocate(size)) {
-        return allocation{
-          source::ARENA,
-          p,
-          size,
-        };
-      }
+    if (m_arena != nullptr && m_arena->allocate(memory, size)) {
+      src = source::ARENA;
+      return true;
     }
 
-    if (auto p = heap_allocator::allocate(size)) { return allocation{source::HEAP, p, size}; }
+    if (!heap_allocator::allocate(memory, size)) { return false; }
 
-    return cuda::std::nullopt;
+    src = source::HEAP;
+    return true;
   }
 
   /// @brief Reallocate the memory block. If there's still enough memory on the source, it will
@@ -229,59 +225,65 @@ class fallback_allocator {
   /// @param a the allocation to be resized/reallocated
   /// @param new_size the new size of the allocation
   /// @returns the allocation (if reallocation was successful) or nullopt (if reallocation failed)
-  __device__ cuda::std::optional<allocation> reallocate(allocation const& a, size_t new_size)
+  __device__ bool reallocate(source& src, void*& memory, size_t old_size, size_t new_size)
   {
-    switch (a.src) {
+    switch (src) {
       case source::NONE: {
-        if (m_arena != nullptr) {
-          if (auto p = m_arena->allocate(new_size)) {
-            return allocation{source::ARENA, p, new_size};
-          }
+        if (m_arena != nullptr && m_arena->allocate(memory, new_size)) {
+          src = source::ARENA;
+          return true;
         }
 
-        if (auto p = heap_allocator::allocate(new_size)) {
-          return allocation{source::HEAP, p, new_size};
+        if (heap_allocator::allocate(memory, new_size)) {
+          src = source::HEAP;
+          return true;
         }
 
       } break;
 
       case source::ARENA: {
         // try re-allocating on the current source
-        if (auto p = m_arena->reallocate(a.memory, a.size, new_size)) {
-          return allocation{source::ARENA, p, new_size};
+        if (m_arena->reallocate(memory, old_size, new_size)) {
+          src = source::ARENA;
+          return true;
         }
 
         // arena has ran out of memory, transfer memory to heap
-        if (auto p = heap_allocator::allocate(new_size)) {
-          memcpy(p, a.memory, std::min(a.size, new_size));
-          m_arena->deallocate(a.memory, a.size);
-          return allocation{source::HEAP, p, new_size};
+        void* new_memory = nullptr;
+        if (heap_allocator::allocate(new_memory, new_size)) {
+          memcpy(new_memory, memory, std::min(old_size, new_size));
+          m_arena->deallocate(memory, old_size);
+          memory = new_memory;
+          src    = source::HEAP;
+          return true;
         }
 
       } break;
 
       case source::HEAP: {
-        // try re-allocating on the current source. never fallback to arena
-        if (auto p = heap_allocator::reallocate(a.memory, a.size, new_size)) {
-          return allocation{source::HEAP, p, new_size};
-        }
+        return heap_allocator::reallocate(memory, old_size, new_size);
       } break;
 
       default: __builtin_unreachable(); break;
     }
 
-    return cuda::std::nullopt;
+    return false;
   }
 
   /// @brief Returns the allocation back to the source
   /// @param a the allocation that was allocated from this allocator
-  __device__ void deallocate(allocation const& a)
+  __device__ void deallocate(source src, void* memory, size_t size)
   {
-    switch (a.src) {
+    switch (src) {
       case source::NONE: break;
-      case source::ARENA: m_arena->deallocate(a.memory, a.size); break;
-      case source::HEAP: heap_allocator::deallocate(a.memory, a.size); break;
+      case source::ARENA: m_arena->deallocate(memory, size); break;
+      case source::HEAP: heap_allocator::deallocate(memory, size); break;
     }
+  }
+
+  CUDF_HOST_DEVICE constexpr bool operator==(fallback_allocator const& other) const
+  {
+    return m_arena == other.m_arena;
   }
 
  private:
@@ -304,7 +306,12 @@ class udf_string {
   using view_type      = string_view;
 
   using memory_source = allocator_type::source;
-  using allocation    = allocator_type::allocation;
+
+  struct allocation {
+    void* memory         = nullptr;
+    size_t size          = 0;
+    memory_source source = memory_source::NONE;
+  };
 
   /**
    * @brief Represents unknown character position or length
@@ -390,40 +397,50 @@ class udf_string {
    *
    * @param src String to copy
    */
-  __device__ udf_string(udf_string&& src) noexcept;
+  __device__ udf_string(udf_string&& src);
+
+  /**
+   * @brief Move a string object from an rvalue reference, with the specified allocator
+   *
+   * The string data is moved from `src` into the instance returned.
+   * The `src` will have no content.
+   *
+   * @param src String to copy
+   */
+  __device__ udf_string(udf_string&& src, fallback_allocator allocator);
 
   __device__ ~udf_string();
 
   __device__ udf_string& operator=(udf_string const&);
-  __device__ udf_string& operator=(udf_string&&) noexcept;
+  __device__ udf_string& operator=(udf_string&&);
   __device__ udf_string& operator=(cudf::string_view const);
   __device__ udf_string& operator=(char const*);
 
   /**
    * @brief Return the number of bytes in this string
    */
-  __device__ cudf::size_type size_bytes() const noexcept;
+  __device__ cudf::size_type size_bytes() const;
 
   /**
    * @brief Return the number of characters in this string
    */
-  __device__ cudf::size_type length() const noexcept;
+  __device__ cudf::size_type length() const;
 
   /**
    * @brief Return the maximum number of bytes a udf_string can hold
    */
-  __device__ constexpr cudf::size_type max_size() const noexcept;
+  __device__ constexpr cudf::size_type max_size() const;
 
   /**
    * @brief Return the internal pointer to the character array for this object
    */
-  __device__ char* data() noexcept;
-  __device__ char const* data() const noexcept;
+  __device__ char* data();
+  __device__ char const* data() const;
 
   /**
    * @brief Returns true if there are no characters in this string
    */
-  __device__ bool is_empty() const noexcept;
+  __device__ bool is_empty() const;
 
   /**
    * @brief Returns an iterator that can be used to navigate through
@@ -431,8 +448,8 @@ class udf_string {
    *
    * This returns a `cudf::string_view::const_iterator` which is read-only.
    */
-  __device__ cudf::string_view::const_iterator begin() const noexcept;
-  __device__ cudf::string_view::const_iterator end() const noexcept;
+  __device__ cudf::string_view::const_iterator begin() const;
+  __device__ cudf::string_view::const_iterator end() const;
 
   /**
    * @brief Returns the character at the specified position
@@ -481,7 +498,7 @@ class udf_string {
    *            not match is ordered after the corresponding character in `str`,
    *            or all compared characters match but the `str` string is longer.
    */
-  __device__ int compare(cudf::string_view str) const noexcept;
+  __device__ int compare(cudf::string_view str) const;
 
   /**
    * @brief Comparing target character array with this string
@@ -501,46 +518,46 @@ class udf_string {
   /**
    * @brief Returns true if `rhs` matches this string exactly
    */
-  __device__ bool operator==(cudf::string_view rhs) const noexcept;
+  __device__ bool operator==(cudf::string_view rhs) const;
 
   /**
    * @brief Returns true if `rhs` does not match this string
    */
-  __device__ bool operator!=(cudf::string_view rhs) const noexcept;
+  __device__ bool operator!=(cudf::string_view rhs) const;
 
   /**
    * @brief Returns true if this string is ordered before `rhs`
    */
-  __device__ bool operator<(cudf::string_view rhs) const noexcept;
+  __device__ bool operator<(cudf::string_view rhs) const;
 
   /**
    * @brief Returns true if `rhs` is ordered before this string
    */
-  __device__ bool operator>(cudf::string_view rhs) const noexcept;
+  __device__ bool operator>(cudf::string_view rhs) const;
 
   /**
    * @brief Returns true if this string matches or is ordered before `rhs`
    */
-  __device__ bool operator<=(cudf::string_view rhs) const noexcept;
+  __device__ bool operator<=(cudf::string_view rhs) const;
 
   /**
    * @brief Returns true if `rhs` matches or is ordered before this string
    */
-  __device__ bool operator>=(cudf::string_view rhs) const noexcept;
+  __device__ bool operator>=(cudf::string_view rhs) const;
 
   /**
    * @brief Remove all bytes from this string
    *
    * All pointers, references, and iterators are invalidated.
    */
-  __device__ void clear() noexcept;
+  __device__ void clear();
 
   /**
    * @brief Releases the bytes of this string.
    *
    * All pointers, references, and iterators are invalidated.
    */
-  __device__ void reset() noexcept;
+  __device__ void reset();
 
   /**
    * @brief Relinquishes the allocation from the string to the caller and clears itself to an empty
@@ -599,7 +616,7 @@ class udf_string {
    * @param str String to move
    * @return This string with new contents
    */
-  __device__ udf_string& assign(udf_string&& str) noexcept;
+  __device__ udf_string& assign(udf_string&& str);
 
   /**
    * @brief Replaces the contents of this string with contents of `str`
@@ -837,9 +854,9 @@ class udf_string {
   allocator_type m_allocator{};
 
   // utilities
-  __device__ allocation util_get_allocation() const;
   __device__ void util_reallocate(size_type capacity);
   __device__ void util_reserve(size_type capacity);
+  __device__ void grow(size_type count);
 
   __device__ cudf::size_type char_offset(cudf::size_type byte_pos) const;
   __device__ void shift_bytes(cudf::size_type start_pos,
