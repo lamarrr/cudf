@@ -402,6 +402,7 @@ std::unique_ptr<column> transform(std::vector<column_view> const& inputs,
                                   std::string const& udf,
                                   data_type output_type,
                                   bool is_ptx,
+                                  std::string const& entry_point,
                                   std::optional<void*> user_data,
                                   rmm::cuda_stream_view stream,
                                   rmm::device_async_resource_ref mr)
@@ -416,10 +417,10 @@ std::unique_ptr<column> transform(std::vector<column_view> const& inputs,
 
   if (is_fixed_width(output_type)) {
     return transformation::jit::transform_operation(
-      *base_column, output_type, inputs, udf, is_ptx, user_data, stream, mr);
+      *base_column, output_type, inputs, udf, is_ptx, entry_point, user_data, stream, mr);
   } else if (output_type.id() == type_id::STRING) {
     return transformation::jit::string_view_operation(
-      *base_column, inputs, udf, is_ptx, user_data, stream, mr);
+      *base_column, inputs, udf, is_ptx, entry_point, user_data, stream, mr);
   } else {
     CUDF_FAIL("Unsupported output type for transform operation");
   }
@@ -431,12 +432,13 @@ std::unique_ptr<column> transform(std::vector<column_view> const& inputs,
                                   std::string const& udf,
                                   data_type output_type,
                                   bool is_ptx,
+                                  std::string const& entry_point,
                                   std::optional<void*> user_data,
                                   rmm::cuda_stream_view stream,
                                   rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::transform(inputs, udf, output_type, is_ptx, user_data, stream, mr);
+  return detail::transform(inputs, udf, output_type, is_ptx, entry_point, user_data, stream, mr);
 }
 
 }  // namespace cudf
