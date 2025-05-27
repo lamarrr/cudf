@@ -42,23 +42,23 @@ struct column_accessor {
   using type                     = T;
   static constexpr int32_t index = Index;
 
-  static __device__ decltype(auto) element(cudf::mutable_column_device_view_core const* outputs,
+  static __device__ decltype(auto) element(cudf::mutable_column_device_view_core const& output,
                                            cudf::size_type row)
   {
-    return outputs[index].element<T>(row);
+    return output.element<T>(row);
   }
 
-  static __device__ decltype(auto) element(cudf::column_device_view_core const* inputs,
+  static __device__ decltype(auto) element(cudf::column_device_view_core const& input,
                                            cudf::size_type row)
   {
-    return inputs[index].element<T>(row);
+    return input.element<T>(row);
   }
 
-  static __device__ void assign(cudf::mutable_column_device_view_core const* outputs,
+  static __device__ void assign(cudf::mutable_column_device_view_core const& output,
                                 cudf::size_type row,
                                 T value)
   {
-    outputs[index].assign<T>(row, value);
+    output.assign<T>(row, value);
   }
 };
 
@@ -85,30 +85,30 @@ struct scalar {
   using type                     = typename Accessor::type;
   static constexpr int32_t index = Accessor::index;
 
-  static __device__ decltype(auto) element(cudf::mutable_column_device_view_core const* outputs,
+  static __device__ decltype(auto) element(cudf::mutable_column_device_view_core const& output,
                                            cudf::size_type row)
   {
-    return Accessor::element(outputs, 0);
+    return Accessor::element(output, 0);
   }
 
-  static __device__ decltype(auto) element(cudf::column_device_view_core const* inputs,
+  static __device__ decltype(auto) element(cudf::column_device_view_core const& input,
                                            cudf::size_type row)
   {
-    return Accessor::element(inputs, 0);
+    return Accessor::element(input, 0);
   }
 
-  static __device__ void assign(cudf::mutable_column_device_view_core const* outputs,
+  static __device__ void assign(cudf::mutable_column_device_view_core const& output,
                                 cudf::size_type row,
                                 type value)
   {
-    return Accessor::assign(outputs, 0, value);
+    return Accessor::assign(output, 0, value);
   }
 };
 
 template <bool has_user_data, typename Out, typename... In>
-CUDF_KERNEL void kernel(cudf::mutable_column_device_view_core const* outputs,
-                        cudf::column_device_view_core const* inputs,
-                        void* user_data)
+CUDF_KERNEL void kernel(cudf::mutable_column_device_view_core const* __restrict__ outputs,
+                        cudf::column_device_view_core const* __restrict__ inputs,
+                        void* __restrict__ user_data)
 {
   // inputs to JITIFY kernels have to be either sized-integral types or pointers. Structs or
   // references can't be passed directly/correctly as they will be crossing an ABI boundary
@@ -118,13 +118,17 @@ CUDF_KERNEL void kernel(cudf::mutable_column_device_view_core const* outputs,
   auto const block_size          = static_cast<thread_index_type>(blockDim.x);
   thread_index_type const start  = threadIdx.x + blockIdx.x * block_size;
   thread_index_type const stride = block_size * gridDim.x;
-  thread_index_type const size   = outputs[0].size();
+
+  cudf::mutable_column_device_view_core output = outputs[0];
+  thread_index_type const size                 = output.size();
+  cudf::column_device_view_core input_arrays[sizeof...(In)]{inputs[In::index]...};
 
   for (auto i = start; i < size; i += stride) {
     if constexpr (has_user_data) {
-      GENERIC_TRANSFORM_OP(user_data, i, &Out::element(outputs, i), In::element(inputs, i)...);
+      GENERIC_TRANSFORM_OP(
+        user_data, i, &Out::element(output, i), In::element(input_arrays[In::index], i)...);
     } else {
-      GENERIC_TRANSFORM_OP(&Out::element(outputs, i), In::element(inputs, i)...);
+      GENERIC_TRANSFORM_OP(&Out::element(output, i), In::element(input_arrays[In::index], i)...);
     }
   }
 }
