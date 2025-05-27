@@ -126,7 +126,7 @@ class alignas(16) column_device_view_base {
    */
   template <typename T = void,
             CUDF_ENABLE_IF(cuda::std::is_same_v<T, void> or is_rep_layout_compatible<T>())>
-  [[nodiscard]] CUDF_HOST_DEVICE T const* head() const noexcept
+  [[nodiscard]] CUDF_HOST_DEVICE T const* __restrict__ head() const noexcept
   {
     return static_cast<T const*>(_data);
   }
@@ -147,7 +147,7 @@ class alignas(16) column_device_view_base {
    * @return Typed pointer to underlying data, including the offset
    */
   template <typename T, CUDF_ENABLE_IF(is_rep_layout_compatible<T>())>
-  [[nodiscard]] CUDF_HOST_DEVICE T const* data() const noexcept
+  [[nodiscard]] CUDF_HOST_DEVICE T const*__restrict__ data() const noexcept
   {
     return head<T>() + _offset;
   }
@@ -186,7 +186,7 @@ class alignas(16) column_device_view_base {
    *
    * @return Raw pointer to the underlying bitmask allocation
    */
-  [[nodiscard]] CUDF_HOST_DEVICE bitmask_type const* null_mask() const noexcept
+  [[nodiscard]] CUDF_HOST_DEVICE bitmask_type const*__restrict__ null_mask() const noexcept
   {
     return _null_mask;
   }
@@ -286,8 +286,8 @@ class alignas(16) column_device_view_base {
  protected:
   data_type _type{type_id::EMPTY};   ///< Element type
   cudf::size_type _size{};           ///< Number of elements
-  void const* _data{};               ///< Pointer to device memory containing elements
-  bitmask_type const* _null_mask{};  ///< Pointer to device memory containing
+  void const* __restrict__ _data{};               ///< Pointer to device memory containing elements
+  bitmask_type const* __restrict__ _null_mask{};  ///< Pointer to device memory containing
                                      ///< bitmask representing null elements.
   size_type _offset{};               ///< Index position of the first element.
                                      ///< Enables zero-copy slicing
@@ -512,7 +512,7 @@ class alignas(16) column_device_view_core : public detail::column_device_view_ba
   }
 
  protected:
-  column_device_view_core* d_children{};  ///< Array of `raw_column_device_view`
+  column_device_view_core* __restrict__ d_children{};  ///< Array of `raw_column_device_view`
                                           ///< objects in device memory.
                                           ///< Based on element type, children
                                           ///< may contain additional data
@@ -743,7 +743,7 @@ class alignas(16) mutable_column_device_view_core : public detail::column_device
   {
   }
 
-  mutable_column_device_view_core* d_children{};  ///< Array of `raw_mutable_column_device_view`
+  mutable_column_device_view_core* __restrict__ d_children{};  ///< Array of `raw_mutable_column_device_view`
                                                   ///< objects in device memory.
                                                   ///< Based on element type, children
                                                   ///< may contain additional data
