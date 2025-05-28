@@ -55,7 +55,7 @@ struct StreamLoad {
 struct AsyncStore {
   __device__ void operator()(double* addr, double v) const
   {
-    asm("st.async.release.gpu.global.f64 [%0], %1;\n\t" : : "l"(addr), "d"(v));
+    asm("st.async.global.f64 [%0], %1;\n\t" : : "l"(addr), "d"(v));
   }
 };
 
