@@ -358,6 +358,8 @@ ConfigureNVBench(
 # ---------------------------------------------------------------------------------
 ConfigureNVBench(TRANSFORM_NVBENCH transform/polynomials.cpp transform/transform.cpp)
 
+ConfigureNVBench(REF_TRANSFORM_NVBENCH transform/polynomials_ref.cu)
+
 # ##################################################################################################
 # * nvtext benchmark -------------------------------------------------------------------
 ConfigureNVBench(
