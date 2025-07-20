@@ -37,6 +37,7 @@ namespace ast {
 namespace detail {
 class expression_parser;
 class expression_transformer;
+struct udf_transformer;
 }  // namespace detail
 
 /**
@@ -62,6 +63,8 @@ struct expression {
    */
   virtual std::reference_wrapper<expression const> accept(
     detail::expression_transformer& visitor) const = 0;
+
+  virtual std::tuple<std::string, data_type> accept(detail::udf_transformer& visitor) const = 0;
 
   /**
    * @brief Returns true if the expression may evaluate to null.
@@ -328,6 +331,8 @@ class literal : public expression {
   std::reference_wrapper<expression const> accept(
     detail::expression_transformer& visitor) const override;
 
+  std::tuple<std::string, data_type> accept(detail::udf_transformer& visitor) const override;
+
   [[nodiscard]] bool may_evaluate_null(table_view const& left,
                                        table_view const& right,
                                        rmm::cuda_stream_view stream) const override
@@ -351,6 +356,7 @@ class literal : public expression {
   generic_scalar_device_view const value;
 };
 
+// [ ]
 /**
  * @brief A expression referring to data from a column in a table.
  */
@@ -421,6 +427,8 @@ class column_reference : public expression {
    */
   cudf::size_type accept(detail::expression_parser& visitor) const override;
 
+  std::tuple<std::string, data_type> accept(detail::udf_transformer& visitor) const override;
+
   /**
    * @copydoc expression::accept
    */
@@ -439,6 +447,10 @@ class column_reference : public expression {
   table_reference table_source;
 };
 
+// [ ] resolve names for left and right
+// [ ] switch on operator types and get the left and right variable names
+// [ ] dispatch the correct cuda type
+// [ ] push in an expression into a sink*************************************** expression sink
 /**
  * @brief An operation expression holds an operator and zero or more operands.
  */
@@ -496,6 +508,8 @@ class operation : public expression {
   std::reference_wrapper<expression const> accept(
     detail::expression_transformer& visitor) const override;
 
+  std::tuple<std::string, data_type> accept(detail::udf_transformer& visitor) const override;
+
   [[nodiscard]] bool may_evaluate_null(table_view const& left,
                                        table_view const& right,
                                        rmm::cuda_stream_view stream) const override;
@@ -536,6 +550,8 @@ class column_name_reference : public expression {
   std::reference_wrapper<expression const> accept(
     detail::expression_transformer& visitor) const override;
 
+  std::tuple<std::string, data_type> accept(detail::udf_transformer& visitor) const override;
+
   [[nodiscard]] bool may_evaluate_null(table_view const& left,
                                        table_view const& right,
                                        rmm::cuda_stream_view stream) const override
@@ -546,6 +562,17 @@ class column_name_reference : public expression {
  private:
   std::string column_name;
 };
+
+// - get the AST
+// - flatten the AST; walk from the output; sort from input to output stage
+//       - separate it into inputs (columns, literals, scalars), and, outputs
+// - dispatch on each ast expression and get an
+
+// [ ] how to add column reference and scalar reference?
+
+// [ ] needs to push onto scalars list, and get variable id and name
+// [ ] use it to generate code to reference it
+// [ ] each expression is stored as an intermediate value
 
 /**
  * @brief An AST expression tree. It owns and contains multiple dependent expressions. All the

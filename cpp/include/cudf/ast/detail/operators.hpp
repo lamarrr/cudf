@@ -19,6 +19,7 @@
 #include <cudf/types.hpp>
 
 #include <vector>
+#include <string_view>
 
 namespace CUDF_EXPORT cudf {
 namespace ast::detail {
@@ -46,6 +47,8 @@ cudf::data_type ast_operator_return_type(ast_operator op,
  * @return Arity of the operator.
  */
 cudf::size_type ast_operator_arity(ast_operator op);
+
+std::string_view ast_operator_to_string(ast_operator op);
 
 }  // namespace ast::detail
 
