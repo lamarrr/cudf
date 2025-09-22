@@ -42,6 +42,7 @@ typename std::vector<column_view>::const_iterator get_transform_base_column(
 jitify2::StringVec build_jit_template_params(
   bool has_user_data,
   null_aware is_null_aware,
+  bool has_nulls,
   std::vector<std::string> const& span_outputs,
   std::vector<std::string> const& column_outputs,
   std::vector<input_column_reflection> const& column_inputs)
@@ -50,6 +51,7 @@ jitify2::StringVec build_jit_template_params(
 
   tparams.emplace_back(jitify2::reflection::reflect(has_user_data));
   tparams.emplace_back(jitify2::reflection::reflect(is_null_aware == null_aware::YES));
+  tparams.emplace_back(jitify2::reflection::reflect(has_nulls));
 
   std::transform(thrust::counting_iterator<size_t>(0),
                  thrust::counting_iterator(span_outputs.size()),

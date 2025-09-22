@@ -239,6 +239,7 @@ jitify2::ConfiguredKernel build_kernel(std::string const& kernel_name,
                       .instantiate(cudf::jit::build_jit_template_params(
                         has_user_data,
                         is_null_aware,
+                        true,
                         span_outputs,
                         {},
                         cudf::jit::reflect_input_columns(base_column_size, input_columns))),
