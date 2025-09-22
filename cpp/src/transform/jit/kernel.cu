@@ -37,7 +37,7 @@ namespace cudf {
 namespace transformation {
 namespace jit {
 
-template <bool has_user_data, bool is_null_aware, typename Out, typename... In>
+template <bool has_user_data, bool is_null_aware, bool has_nulls, typename Out, typename... In>
 CUDF_KERNEL void kernel(cudf::mutable_column_device_view_core const* outputs,
                         cudf::column_device_view_core const* inputs,
                         void* user_data)
@@ -51,7 +51,9 @@ CUDF_KERNEL void kernel(cudf::mutable_column_device_view_core const* outputs,
 
   for (auto i = start; i < size; i += stride) {
     if constexpr (!is_null_aware) {
-      if (Out::is_null(outputs, i)) { continue; }
+      if constexpr (has_nulls) {
+        if (Out::is_null(outputs, i)) { continue; }
+      }
 
       if constexpr (has_user_data) {
         GENERIC_TRANSFORM_OP(user_data, i, &Out::element(outputs, i), In::element(inputs, i)...);
@@ -59,6 +61,7 @@ CUDF_KERNEL void kernel(cudf::mutable_column_device_view_core const* outputs,
         GENERIC_TRANSFORM_OP(&Out::element(outputs, i), In::element(inputs, i)...);
       }
     } else {
+      // [ ] if has_nulls pass non-nullable element as nullable element
       if constexpr (has_user_data) {
         GENERIC_TRANSFORM_OP(
           user_data, i, &Out::element(outputs, i), In::nullable_element(inputs, i)...);
@@ -69,7 +72,7 @@ CUDF_KERNEL void kernel(cudf::mutable_column_device_view_core const* outputs,
   }
 }
 
-template <bool has_user_data, bool is_null_aware, typename Out, typename... In>
+template <bool has_user_data, bool is_null_aware, bool has_nulls, typename Out, typename... In>
 CUDF_KERNEL void fixed_point_kernel(cudf::mutable_column_device_view_core const* outputs,
                                     cudf::column_device_view_core const* inputs,
                                     void* user_data)
@@ -83,7 +86,9 @@ CUDF_KERNEL void fixed_point_kernel(cudf::mutable_column_device_view_core const*
     typename Out::type result{numeric::scaled_integer<typename Out::type::rep>{0, output_scale}};
 
     if constexpr (!is_null_aware) {
-      if (Out::is_null(outputs, i)) { continue; }
+      if constexpr (has_nulls) {
+        if (Out::is_null(outputs, i)) { continue; }
+      }
 
       if constexpr (has_user_data) {
         GENERIC_TRANSFORM_OP(user_data, i, &result, In::element(inputs, i)...);
@@ -103,7 +108,7 @@ CUDF_KERNEL void fixed_point_kernel(cudf::mutable_column_device_view_core const*
   }
 }
 
-template <bool has_user_data, bool is_null_aware, typename Out, typename... In>
+template <bool has_user_data, bool is_null_aware, bool has_nulls, typename Out, typename... In>
 CUDF_KERNEL void span_kernel(cudf::jit::device_optional_span<typename Out::type> const* outputs,
                              cudf::column_device_view_core const* inputs,
                              void* user_data)
@@ -114,7 +119,9 @@ CUDF_KERNEL void span_kernel(cudf::jit::device_optional_span<typename Out::type>
 
   for (auto i = start; i < size; i += stride) {
     if constexpr (!is_null_aware) {
-      if (Out::is_null(outputs, i)) { continue; }
+      if constexpr (has_nulls) {
+        if (Out::is_null(outputs, i)) { continue; }
+      }
 
       if constexpr (has_user_data) {
         GENERIC_TRANSFORM_OP(user_data, i, &Out::element(outputs, i), In::element(inputs, i)...);

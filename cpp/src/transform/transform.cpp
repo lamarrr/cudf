@@ -53,6 +53,7 @@ jitify2::ConfiguredKernel build_transform_kernel(
   std::vector<column_view> const& input_columns,
   bool has_user_data,
   null_aware is_null_aware,
+  bool has_nulls,
   std::string const& udf,
   bool is_ptx,
   rmm::cuda_stream_view stream,
@@ -71,6 +72,7 @@ jitify2::ConfiguredKernel build_transform_kernel(
                       .instantiate(cudf::jit::build_jit_template_params(
                         has_user_data,
                         is_null_aware,
+                        has_nulls,
                         {},
                         cudf::jit::column_type_names(output_columns),
                         cudf::jit::reflect_input_columns(base_column_size, input_columns))),
@@ -84,6 +86,7 @@ jitify2::ConfiguredKernel build_span_kernel(std::string const& kernel_name,
                                             std::vector<column_view> const& input_columns,
                                             bool has_user_data,
                                             null_aware is_null_aware,
+                                            bool has_nulls,
                                             std::string const& udf,
                                             bool is_ptx,
                                             rmm::cuda_stream_view stream,
@@ -101,6 +104,7 @@ jitify2::ConfiguredKernel build_span_kernel(std::string const& kernel_name,
                       .instantiate(cudf::jit::build_jit_template_params(
                         has_user_data,
                         is_null_aware,
+                        has_nulls,
                         span_outputs,
                         {},
                         cudf::jit::reflect_input_columns(base_column_size, input_columns))),
@@ -206,6 +210,9 @@ std::unique_ptr<column> transform_operation(column_view base_column,
   auto output = make_fixed_width_column(
     output_type, base_column.size(), std::move(null_mask), null_count, stream, mr);
 
+  bool has_nulls =
+    std::any_of(inputs.begin(), inputs.end(), [](auto const& col) { return col.nullable(); });
+
   auto kernel = build_transform_kernel(is_fixed_point(output_type)
                                          ? "cudf::transformation::jit::fixed_point_kernel"
                                          : "cudf::transformation::jit::kernel",
@@ -214,6 +221,7 @@ std::unique_ptr<column> transform_operation(column_view base_column,
                                        inputs,
                                        user_data.has_value(),
                                        is_null_aware,
+                                       has_nulls,
                                        udf,
                                        is_ptx,
                                        stream,
@@ -241,12 +249,16 @@ std::unique_ptr<column> string_view_operation(column_view base_column,
     null_mask = create_null_mask(base_column.size(), mask_state::UNALLOCATED, stream, mr);
   }
 
+  bool has_nulls =
+    std::any_of(inputs.begin(), inputs.end(), [](auto const& col) { return col.nullable(); });
+
   auto kernel = build_span_kernel("cudf::transformation::jit::span_kernel",
                                   base_column.size(),
                                   {"cudf::string_view"},
                                   inputs,
                                   user_data.has_value(),
                                   is_null_aware,
+                                  has_nulls,
                                   udf,
                                   is_ptx,
                                   stream,

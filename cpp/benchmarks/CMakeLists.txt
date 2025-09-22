@@ -385,6 +385,9 @@ ConfigureNVBench(
   TRANSFORM_NVBENCH transform/encode.cpp transform/polynomials.cpp transform/transform.cpp
 )
 
+ConfigureNVBench(CCCL_TRANSFORM_NVBENCH transform/cccl_transform.cpp)
+ConfigureNVBench(CUDF_TRANSFORM_NVBENCH transform/cudf_transform.cpp)
+
 # ##################################################################################################
 # * nvtext benchmark -------------------------------------------------------------------
 ConfigureNVBench(
