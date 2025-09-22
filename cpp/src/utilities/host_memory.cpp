@@ -140,6 +140,26 @@ class fixed_pinned_pool_memory_resource {
                            cuda::mr::host_accessible) noexcept
   {
   }
+
+  void* allocate_sync(std::size_t bytes, std::size_t alignment)
+  {
+    return this->allocate(bytes, alignment);
+  }
+
+  void deallocate_sync(void* ptr, std::size_t bytes, std::size_t alignment)
+  {
+    return this->deallocate(ptr, bytes, alignment);
+  }
+
+  void* allocate(rmm::cuda_stream_view stream, std::size_t bytes, std::size_t alignment)
+  {
+    return this->allocate_async(bytes, alignment, stream);
+  }
+
+  void deallocate(rmm::cuda_stream_view stream, void* ptr, std::size_t bytes, std::size_t alignment)
+  {
+    return this->deallocate_async(ptr, bytes, alignment, stream);
+  }
 };
 
 static_assert(cuda::mr::resource_with<fixed_pinned_pool_memory_resource,
@@ -254,6 +274,26 @@ class new_delete_memory_resource {
   // NOLINTBEGIN
   friend void get_property(new_delete_memory_resource const&, cuda::mr::host_accessible) noexcept {}
   // NOLINTEND
+
+  void* allocate_sync(std::size_t bytes, std::size_t alignment)
+  {
+    return this->allocate(bytes, alignment);
+  }
+
+  void deallocate_sync(void* ptr, std::size_t bytes, std::size_t alignment)
+  {
+    return this->deallocate(ptr, bytes, alignment);
+  }
+
+  void* allocate(rmm::cuda_stream_view stream, std::size_t bytes, std::size_t alignment)
+  {
+    return this->allocate_async(bytes, alignment, stream);
+  }
+
+  void deallocate(rmm::cuda_stream_view stream, void* ptr, std::size_t bytes, std::size_t alignment)
+  {
+    return this->deallocate_async(ptr, bytes, alignment, stream);
+  }
 };
 
 static_assert(cuda::mr::resource_with<new_delete_memory_resource, cuda::mr::host_accessible>,
