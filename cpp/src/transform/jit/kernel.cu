@@ -49,6 +49,33 @@ CUDF_KERNEL void kernel(cudf::mutable_column_device_view_core const* outputs,
   auto const stride = cudf::detail::grid_1d::grid_stride();
   auto const size   = outputs[0].size();
 
+  if (outputs->nullable()) {
+    // compute null-mask output for grid; each block is separated by stride; so.
+    // we need to ensure that each thread only writes to the block it belongs to.
+    constexpr auto word_bits  = sizeof(bitmask_type) * 8;
+    auto num_bits             = (outputs->size() + (word_bits - 1)) & ~word_bits;
+    auto num_words            = num_bits / word_bits;
+    auto num_words_per_wave   = num_words;
+    auto num_words_per_thread = num_words;
+    auto block_offset  = 0;  // first element up to the stride; split it up across the threads
+    auto wave_offset   = 0;
+    auto thread_offset = 0;
+    auto thread_count  = 0;
+    auto null_mask     = outputs->null_mask();
+
+    blockDim.x;  //
+    gridDim.x;   // [ ] padding
+    for (auto i = thread_offset; i < thread_count; i++) {
+      null_mask[i] = (In::null_mask(inputs)[i] | ... | 0);
+    }
+
+    // [ ] at the tail end of the null-mask output, there is a chance for different blocks to write
+    // to the same location but that is not a correctness issue since the result is guaranteed to be
+    // the same value
+
+    __syncthreads();
+  }
+
   for (auto i = start; i < size; i += stride) {
     if constexpr (!is_null_aware) {
       if (Out::is_null(outputs, i)) { continue; }

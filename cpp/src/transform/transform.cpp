@@ -157,33 +157,6 @@ void launch_span_kernel(jitify2::ConfiguredKernel& kernel,
   kernel->launch_raw(args.data());
 }
 
-std::tuple<rmm::device_buffer, size_type> make_transform_null_mask(
-  column_view base_column,
-  std::vector<column_view> const& inputs,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr)
-{
-  // collect the non-scalar elements that contribute to the resulting bitmask
-  std::vector<column_view> bitmask_columns;
-
-  // to handle null masks for scalars, we just check if the scalar element is null. If it is null,
-  // then all the rows of the transform output will be null. This helps us prevent creating
-  // column-sized bitmasks for each scalar.
-  for (column_view const& col : inputs) {
-    if (cudf::jit::is_scalar(base_column.size(), col.size())) {
-      // all nulls
-      if (col.has_nulls()) {
-        return std::make_tuple(
-          create_null_mask(base_column.size(), mask_state::ALL_NULL, stream, mr),
-          base_column.size());
-      }
-    } else {
-      bitmask_columns.emplace_back(col);
-    }
-  }
-
-  return cudf::bitmask_and(table_view{bitmask_columns}, stream, mr);
-}
 
 std::unique_ptr<column> transform_operation(column_view base_column,
                                             data_type output_type,
@@ -198,7 +171,6 @@ std::unique_ptr<column> transform_operation(column_view base_column,
   rmm::device_buffer null_mask{};
   cudf::size_type null_count{0};
   if (is_null_aware == null_aware::NO) {
-    std::tie(null_mask, null_count) = make_transform_null_mask(base_column, inputs, stream, mr);
   } else {
     null_mask = create_null_mask(base_column.size(), mask_state::UNALLOCATED, stream, mr);
   }
@@ -236,7 +208,6 @@ std::unique_ptr<column> string_view_operation(column_view base_column,
   cudf::size_type null_count{0};
 
   if (is_null_aware == null_aware::NO) {
-    std::tie(null_mask, null_count) = make_transform_null_mask(base_column, inputs, stream, mr);
   } else {
     null_mask = create_null_mask(base_column.size(), mask_state::UNALLOCATED, stream, mr);
   }
