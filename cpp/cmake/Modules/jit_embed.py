@@ -97,17 +97,8 @@ def validate_yaml_schema(data: Any) -> None:
         data: The parsed YAML data to validate
 
     Raises:
-        jsonschema.ValidationError: If the data does not match the expected schema
-        ValueError: If the data is not a list or is empty
+        ValueError: If the data does not match the expected schema
     """
-    if not isinstance(data, list):
-        raise ValueError(
-            f"Expected input to be a list, got {type(data).__name__}"
-        )
-
-    if len(data) == 0:
-        raise ValueError("Input list cannot be empty")
-
     try:
         jsonschema.validate(instance=data, schema=YAML_SCHEMA)
     except jsonschema.ValidationError as e:
