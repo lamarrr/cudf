@@ -3,6 +3,7 @@
 import argparse
 from typing import Any, NamedTuple, Self
 
+import jsonschema
 import yaml
 
 BYTE_TYPE = "unsigned char"
@@ -12,27 +13,109 @@ LIST_LINE_WIDTH = 32
 NAMESPACE_PREFIX = "jit_"
 
 
-### json schema
-
-"""entries
-[
-    {
-        "id": string,
-        "type": "sources",
-        "sources": [
+# JSON Schema for the YAML input
+# The input is expected to be a list of entries, where each entry can be either:
+# - A "sources" entry with an ID and a list of source files
+# - An "options" entry with an ID and a list of compiler options
+YAML_SCHEMA = {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "array",
+    "minItems": 1,
+    "items": {
+        "oneOf": [
             {
-                "include_name": string,
-                "file_path": string
-            }
-                ]
+                "type": "object",
+                "required": ["id", "type", "sources"],
+                "additionalProperties": False,
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Unique identifier for this source entry",
+                    },
+                    "type": {
+                        "type": "string",
+                        "const": "sources",
+                        "description": "Entry type indicating this contains source files",
+                    },
+                    "sources": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "required": ["include_name", "file_path"],
+                            "additionalProperties": False,
+                            "properties": {
+                                "include_name": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "description": "The include name to use for this source file",
+                                },
+                                "file_path": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "description": "Path to the source file",
+                                },
+                            },
+                        },
+                        "description": "List of source files to embed",
+                    },
+                },
+            },
+            {
+                "type": "object",
+                "required": ["id", "type", "options"],
+                "additionalProperties": False,
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Unique identifier for this options entry",
+                    },
+                    "type": {
+                        "type": "string",
+                        "const": "options",
+                        "description": "Entry type indicating this contains compiler options",
+                    },
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of compiler options",
+                    },
+                },
+            },
+        ]
     },
-    {
-        "id": string,
-        "type": "options",
-        "options": list[string]
-    }
-]
-"""
+}
+
+
+def validate_yaml_schema(data: Any) -> None:
+    """
+    Validate the input YAML data against the expected schema.
+
+    Args:
+        data: The parsed YAML data to validate
+
+    Raises:
+        jsonschema.ValidationError: If the data does not match the expected schema
+        ValueError: If the data is not a list or is empty
+    """
+    if not isinstance(data, list):
+        raise ValueError(
+            f"Expected input to be a list, got {type(data).__name__}"
+        )
+
+    if len(data) == 0:
+        raise ValueError("Input list cannot be empty")
+
+    try:
+        jsonschema.validate(instance=data, schema=YAML_SCHEMA)
+    except jsonschema.ValidationError as e:
+        # Provide a more user-friendly error message
+        path = " -> ".join(str(p) for p in e.path) if e.path else "root"
+        raise ValueError(
+            f"Schema validation failed at {path}: {e.message}"
+        ) from e
 
 
 def list_string(strings: list[str]) -> str:
@@ -340,6 +423,10 @@ def main():
 
     with open(args.input_file, "rb") as f:
         description = yaml.safe_load(f)
+
+    # Validate the input YAML schema
+    validate_yaml_schema(description)
+
     code = generate_embed_source(description)
 
     with open(args.output, "w") as f:
