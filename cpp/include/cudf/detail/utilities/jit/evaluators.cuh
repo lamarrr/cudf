@@ -16,12 +16,12 @@ namespace cudf::detail::jit::evaluators {
 template <typename T>
 using optional = cuda::std::optional<T>;
 
-using Scope    = void* __restrict__* const __restrict__;
-using UserData = void* __restrict__;
+using Scope    = void** const;
+using UserData = void*;
 
 template <int Index, typename T, bool Nullable>
 struct column_element_getter {
-  using Arg = column_device_view_core const* __restrict__;
+  using Arg = column_device_view_core const*;
 
   __device__ static T get(Scope scope, size_type i)
     requires(!Nullable)
@@ -40,7 +40,7 @@ struct column_element_getter {
 
 template <int Index, typename T, bool Nullable>
 struct span_element_getter {
-  using Arg = jit::device_optional_span<T> const* __restrict__;
+  using Arg = jit::device_optional_span<T> const*;
 
   __device__ static T get(Scope scope, size_type i)
     requires(!Nullable)
@@ -68,7 +68,7 @@ template <int Index,
           bool OutputBoolMask,
           int BoolMaskIndex>
 struct column_element_setter {
-  using Arg = mutable_column_device_view_core const* __restrict__;
+  using Arg = mutable_column_device_view_core const*;
 
   __device__ static T output_arg(Scope scope)
     requires(!IsFixedPoint && !Nullable)
@@ -122,7 +122,7 @@ struct column_element_setter {
 
 template <int Index, typename T, bool Nullable, bool OutputBoolMask, int BoolMaskIndex>
 struct span_element_setter {
-  using Arg = jit::device_optional_span<T> const* __restrict__;
+  using Arg = jit::device_optional_span<T> const*;
 
   __device__ static T output_arg(Scope scope)
     requires(!Nullable)
@@ -156,7 +156,8 @@ struct span_element_setter {
   }
 };
 
-// TODO: how will expression evaluation work to handle multiple outputs? we might need to use manual string concatenation of c++ source code for this
+// TODO: how will expression evaluation work to handle multiple outputs? we might need to use manual
+// string concatenation of c++ source code for this
 /// sub-expression handling
 template <bool IsNullAware, int UserDataIndex, typename InputGetters, typename OutputSetters>
 struct element_transform_operation {
@@ -187,25 +188,25 @@ struct and_null_mask_evaluator {
   {
     auto get_column_bitmask = __device__[&]<int Column>()
     {
-      auto p = static_cast<column_device_view_core const* __restrict__>(scope[Column]);
+      auto p = static_cast<column_device_view_core const*>(scope[Column]);
       return p->null_mask();
     };
 
     auto get_column_offset = __device__[&]<int Column>()
     {
-      auto p = static_cast<column_device_view_core const* __restrict__>(scope[Column]);
+      auto p = static_cast<column_device_view_core const*>(scope[Column]);
       return p->offset();
     };
 
-    bitmask_type const* __restrict__ srcs[sizeof...(InputColumnIndices)] = {
+    bitmask_type const* srcs[sizeof...(InputColumnIndices)] = {
       get_column_bitmask<InputColumnIndices>()...};
     size_type offsets[sizeof...(InputColumnIndices)] = {get_column_offset<InputColumnIndices>()...};
 
     nullmask_and_subkernel(srcs,
                            offsets,
                            size,
-                           static_cast<bitmask_type* __restrict__>(scope[OutputIndex]),
-                           static_cast<size_type* __restrict__>(scope[OutputValidCountIndex]));
+                           static_cast<bitmask_type*>(scope[OutputIndex]),
+                           static_cast<size_type*>(scope[OutputValidCountIndex]));
   }
 };
 
@@ -213,7 +214,7 @@ template <int OutputIndex, bool AllValid>
 struct fill_null_mask_evaluator {
   __device__ static void evaluate(Scope scope, size_type size)
   {
-    auto dst = static_cast<bitmask_type* __restrict__>(scope[OutputIndex]);
+    auto dst = static_cast<bitmask_type*>(scope[OutputIndex]);
     detail::jit::bit_utilities::fill_subkernel(size, dst, AllValid);
   }
 };
@@ -222,8 +223,8 @@ template <int SrcIndex, int DstIndex>
 struct copy_null_mask_evaluator {
   __device__ static void evaluate(Scope scope, size_type size)
   {
-    auto src = static_cast<bitmask_type const* __restrict__>(scope[SrcIndex]);
-    auto dst = static_cast<bitmask_type* __restrict__>(scope[DstIndex]);
+    auto src = static_cast<bitmask_type const*>(scope[SrcIndex]);
+    auto dst = static_cast<bitmask_type*>(scope[DstIndex]);
     detail::jit::bit_utilities::copy_subkernel(src, size, dst);
   }
 };
@@ -232,8 +233,8 @@ template <int OutputIndex, int BoolsNullMaskIndex>
 struct bools_to_null_mask_evaluator {
   __device__ static void evaluate(Scope scope, size_type size)
   {
-    auto src = static_cast<bool const* __restrict__>(scope[BoolsNullMaskIndex]);
-    auto dst = static_cast<bitmask_type* __restrict__>(scope[OutputIndex]);
+    auto src = static_cast<bool const*>(scope[BoolsNullMaskIndex]);
+    auto dst = static_cast<bitmask_type*>(scope[OutputIndex]);
     detail::jit::bit_utilities::boolean_mask_to_nullmask_subkernel(src, size, dst, nullptr);
   }
 };
