@@ -63,6 +63,7 @@ __device__ size_type evaluate_nullmask_word(size_type chunk,
 __device__ void sum_counts_subkernel(size_type* total, size_type thread_total)
 {
   //  TODO: __syncthreads();
+  // TODO: participation mask
 
   size_type warp_total = thread_total;
 
