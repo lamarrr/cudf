@@ -272,11 +272,9 @@ std::tuple<rtcx::library, rtcx::blob> compile_library_uncached(char const* name,
                                                                bool log_pch)
 {
   CUDF_FUNC_RANGE();
-  CHECKPT;
-  auto& bundle = cudf::get_context().jit_bundle();
-  auto begin   = std::chrono::steady_clock::now();
-  auto sm      = get_current_device_physical_model();
-  CHECKPT;
+  auto& bundle      = cudf::get_context().jit_bundle();
+  auto begin        = std::chrono::steady_clock::now();
+  auto sm           = get_current_device_physical_model();
   auto include_dirs = bundle.get_include_directories();
   auto pch_dir      = cudf::get_context().get_jit_pch_dir();
 
@@ -285,7 +283,6 @@ std::tuple<rtcx::library, rtcx::blob> compile_library_uncached(char const* name,
   for (auto const& include_dir : include_dirs) {
     options.emplace_back(std::format("-I{}", include_dir));
   }
-  CHECKPT;
   // TODO: experiment with:
   // --fdevice-time-trace=jit_comp_trace.json
   // --time=compile_trace.json
@@ -299,30 +296,29 @@ std::tuple<rtcx::library, rtcx::blob> compile_library_uncached(char const* name,
 
   auto pch_file = std::format("/home/coder/cudf/jit.pch");
 
-  static int can_use = 0;
-  CHECKPT;
+  // static int can_use = 0;
   if (use_pch) {
-    // options.emplace_back("--pch");
-    options.emplace_back(std::format("--pch-dir={}", pch_dir));
-    if (can_use) {
-      options.emplace_back(std::format("--use-pch={}", pch_file));
-    } else {
-      options.emplace_back(std::format("--create-pch={}", pch_file));
-    }
+    options.emplace_back("--pch");
+    // options.emplace_back(std::format("--pch-dir={}", pch_dir));
+    // if (can_use) {
+    // options.emplace_back(std::format("--use-pch={}", pch_file));
+    // } else {
+    // options.emplace_back(std::format("--create-pch={}", pch_file));
+    // }
 
-    can_use = 1;
+    // can_use = 1;
 
     if (log_pch) {
       options.emplace_back("--pch-verbose=true");
       options.emplace_back("--pch-messages=true");
     }
   }
-  CHECKPT;
+
   std::vector<char const*> options_cstr;
   for (auto const& option : options) {
     options_cstr.emplace_back(option.c_str());
   }
-  CHECKPT;
+
   auto params = rtcx::compile_params{.name        = name,
                                      .source      = cuda_code,
                                      .headers     = {},
@@ -330,20 +326,21 @@ std::tuple<rtcx::library, rtcx::blob> compile_library_uncached(char const* name,
                                      .target_type = rtcx::binary_type::CUBIN};
 
   auto cubin = rtcx::compile(params);
-  CHECKPT;
+
   auto end = std::chrono::steady_clock::now();
 
   auto duration = end - begin;
 
-  CUDF_LOG_INFO(
-    "Compiled fragment `%s` in %f ms",
+  std::printf(
+    "Compiled fragment `%s` in %f ms\n",
     name,
     std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(duration).count());
+  fflush(stdout);
 
   auto library = rtcx::load_library(cubin, rtcx::binary_type::CUBIN);
-  CHECKPT;
+
   auto blob = rtcx::blob_t::from_vector(std::move(cubin));
-  CHECKPT;
+
   return std::make_tuple(library, std::make_shared<rtcx::blob_t>(std::move(blob)));
 }
 

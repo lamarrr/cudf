@@ -666,7 +666,7 @@ struct column_buffer {
   //   __device__ void write(size_type offset, column_accessor<>);
 };
 
-#if !CUDF_JIT_LITE_EXCLUDE_OPERATORS
+#if !defined(CUDF_JIT_LITE_EXCLUDE_OPERATORS)
 
 namespace operators {
 
@@ -706,9 +706,9 @@ __device__ inline void add(optional<T>* out, optional<T> const* a, optional<T> c
   }
 }
 
-__device__ inline void arccos(float32_t* out, float32_t const* a) { *out = __builtin_acosf(*a); }
+__device__ inline void arccos(float32_t* out, float32_t const* a) { *out = ::acosf(*a); }
 
-__device__ inline void arccos(float64_t* out, float64_t const* a) { *out = __builtin_acos(*a); }
+__device__ inline void arccos(float64_t* out, float64_t const* a) { *out = ::acos(*a); }
 
 template <typename T>
 __device__ inline void arccos(optional<T>* out, optional<T> const* a)
@@ -722,9 +722,9 @@ __device__ inline void arccos(optional<T>* out, optional<T> const* a)
   }
 }
 
-__device__ inline void arccosh(float32_t* out, float32_t const* a) { *out = __builtin_acoshf(*a); }
+__device__ inline void arccosh(float32_t* out, float32_t const* a) { *out = ::acoshf(*a); }
 
-__device__ inline void arccosh(float64_t* out, float64_t const* a) { *out = __builtin_acosh(*a); }
+__device__ inline void arccosh(float64_t* out, float64_t const* a) { *out = ::acosh(*a); }
 
 template <typename T>
 __device__ inline void arccosh(optional<T>* out, optional<T> const* a)
@@ -738,9 +738,9 @@ __device__ inline void arccosh(optional<T>* out, optional<T> const* a)
   }
 }
 
-__device__ inline void arcsin(float32_t* out, float32_t const* a) { *out = __builtin_asinf(*a); }
+__device__ inline void arcsin(float32_t* out, float32_t const* a) { *out = ::asinf(*a); }
 
-__device__ inline void arcsin(float64_t* out, float64_t const* a) { *out = __builtin_asin(*a); }
+__device__ inline void arcsin(float64_t* out, float64_t const* a) { *out = ::asin(*a); }
 
 template <typename T>
 __device__ inline void arcsin(optional<T>* out, optional<T> const* a)
@@ -754,9 +754,9 @@ __device__ inline void arcsin(optional<T>* out, optional<T> const* a)
   }
 }
 
-__device__ inline void arcsinh(float32_t* out, float32_t const* a) { *out = __builtin_asinhf(*a); }
+__device__ inline void arcsinh(float32_t* out, float32_t const* a) { *out = ::asinhf(*a); }
 
-__device__ inline void arcsinh(float64_t* out, float64_t const* a) { *out = __builtin_asinh(*a); }
+__device__ inline void arcsinh(float64_t* out, float64_t const* a) { *out = ::asinh(*a); }
 
 template <typename T>
 __device__ inline void arcsinh(optional<T>* out, optional<T> const* a)
@@ -770,9 +770,9 @@ __device__ inline void arcsinh(optional<T>* out, optional<T> const* a)
   }
 }
 
-__device__ inline void arctan(float32_t* out, float32_t const* a) { *out = __builtin_atanf(*a); }
+__device__ inline void arctan(float32_t* out, float32_t const* a) { *out = ::atanf(*a); }
 
-__device__ inline void arctan(float64_t* out, float64_t const* a) { *out = __builtin_atan(*a); }
+__device__ inline void arctan(float64_t* out, float64_t const* a) { *out = ::atan(*a); }
 
 template <typename T>
 __device__ inline void arctan(optional<T>* out, optional<T> const* a)
@@ -786,9 +786,9 @@ __device__ inline void arctan(optional<T>* out, optional<T> const* a)
   }
 }
 
-__device__ inline void arctanh(float32_t* out, float32_t const* a) { *out = __builtin_atanhf(*a); }
+__device__ inline void arctanh(float32_t* out, float32_t const* a) { *out = ::atanhf(*a); }
 
-__device__ inline void arctanh(float64_t* out, float64_t const* a) { *out = __builtin_atanh(*a); }
+__device__ inline void arctanh(float64_t* out, float64_t const* a) { *out = ::atanh(*a); }
 
 template <typename T>
 __device__ inline void arctanh(optional<T>* out, optional<T> const* a)
@@ -928,9 +928,9 @@ __device__ inline void cast_to_uint64(optional<uint64_t>* out, optional<T> const
   }
 }
 
-__device__ inline void cbrt(float32_t* out, float32_t const* a) { *out = __builtin_cbrtf(*a); }
+__device__ inline void cbrt(float32_t* out, float32_t const* a) { *out = ::cbrtf(*a); }
 
-__device__ inline void cbrt(float64_t* out, float64_t const* a) { *out = __builtin_cbrt(*a); }
+__device__ inline void cbrt(float64_t* out, float64_t const* a) { *out = ::cbrt(*a); }
 
 template <typename T>
 __device__ inline void cbrt(optional<T>* out, optional<T> const* a)
@@ -944,9 +944,9 @@ __device__ inline void cbrt(optional<T>* out, optional<T> const* a)
   }
 }
 
-__device__ inline void ceil(float32_t* out, float32_t const* a) { *out = __builtin_ceilf(*a); }
+__device__ inline void ceil(float32_t* out, float32_t const* a) { *out = ::ceilf(*a); }
 
-__device__ inline void ceil(float64_t* out, float64_t const* a) { *out = __builtin_ceil(*a); }
+__device__ inline void ceil(float64_t* out, float64_t const* a) { *out = ::ceil(*a); }
 
 template <typename T>
 __device__ inline void ceil(optional<T>* out, optional<T> const* a)
@@ -960,9 +960,9 @@ __device__ inline void ceil(optional<T>* out, optional<T> const* a)
   }
 }
 
-__device__ inline void cos(float32_t* out, float32_t const* a) { *out = __builtin_cosf(*a); }
+__device__ inline void cos(float32_t* out, float32_t const* a) { *out = ::cosf(*a); }
 
-__device__ inline void cos(float64_t* out, float64_t const* a) { *out = __builtin_cos(*a); }
+__device__ inline void cos(float64_t* out, float64_t const* a) { *out = ::cos(*a); }
 
 template <typename T>
 __device__ inline void cos(optional<T>* out, optional<T> const* a)
@@ -976,9 +976,9 @@ __device__ inline void cos(optional<T>* out, optional<T> const* a)
   }
 }
 
-__device__ inline void cosh(float32_t* out, float32_t const* a) { *out = __builtin_coshf(*a); }
+__device__ inline void cosh(float32_t* out, float32_t const* a) { *out = ::coshf(*a); }
 
-__device__ inline void cosh(float64_t* out, float64_t const* a) { *out = __builtin_cosh(*a); }
+__device__ inline void cosh(float64_t* out, float64_t const* a) { *out = ::cosh(*a); }
 
 template <typename T>
 __device__ inline void cosh(optional<T>* out, optional<T> const* a)
@@ -1028,9 +1028,9 @@ __device__ inline void equal(optional<bool>* out, optional<T> const* a, optional
   }
 }
 
-__device__ inline void exp(float32_t* out, float32_t const* a) { *out = __builtin_expf(*a); }
+__device__ inline void exp(float32_t* out, float32_t const* a) { *out = ::expf(*a); }
 
-__device__ inline void exp(float64_t* out, float64_t const* a) { *out = __builtin_exp(*a); }
+__device__ inline void exp(float64_t* out, float64_t const* a) { *out = ::exp(*a); }
 
 template <typename T>
 __device__ inline void exp(optional<T>* out, optional<T> const* a)
@@ -1044,9 +1044,9 @@ __device__ inline void exp(optional<T>* out, optional<T> const* a)
   }
 }
 
-__device__ inline void floor(float32_t* out, float32_t const* a) { *out = __builtin_floorf(*a); }
+__device__ inline void floor(float32_t* out, float32_t const* a) { *out = ::floorf(*a); }
 
-__device__ inline void floor(float64_t* out, float64_t const* a) { *out = __builtin_floor(*a); }
+__device__ inline void floor(float64_t* out, float64_t const* a) { *out = ::floor(*a); }
 
 template <typename T>
 __device__ inline void floor(optional<T>* out, optional<T> const* a)
@@ -1150,9 +1150,9 @@ __device__ inline void less_equal(optional<bool>* out, optional<T> const* a, opt
   }
 }
 
-__device__ inline void log(float32_t* out, float32_t const* a) { *out = __builtin_logf(*a); }
+__device__ inline void log(float32_t* out, float32_t const* a) { *out = ::logf(*a); }
 
-__device__ inline void log(float64_t* out, float64_t const* a) { *out = __builtin_log(*a); }
+__device__ inline void log(float64_t* out, float64_t const* a) { *out = ::log(*a); }
 
 template <typename T>
 __device__ inline void log(optional<T>* out, optional<T> const* a)
@@ -1210,12 +1210,12 @@ __device__ inline void mod(T* out, T const* a, T const* b)
 
 __device__ inline void mod(float32_t* out, float32_t const* a, float32_t const* b)
 {
-  *out = __builtin_fmodf(*a, *b);
+  *out = ::fmodf(*a, *b);
 }
 
 __device__ inline void mod(float64_t* out, float64_t const* a, float64_t const* b)
 {
-  *out = __builtin_fmod(*a, *b);
+  *out = ::fmod(*a, *b);
 }
 
 template <typename T>
@@ -1312,12 +1312,12 @@ __device__ inline void null_logical_or(optional<bool>* out,
 
 __device__ inline void pow(float32_t* out, float32_t const* a, float32_t const* b)
 {
-  *out = __builtin_powf(*a, *b);
+  *out = ::powf(*a, *b);
 }
 
 __device__ inline void pow(float64_t* out, float64_t const* a, float64_t const* b)
 {
-  *out = __builtin_pow(*a, *b);
+  *out = ::pow(*a, *b);
 }
 
 template <typename T>
@@ -1340,12 +1340,12 @@ __device__ inline void pymod(T* out, T const* a, T const* b)
 
 __device__ inline void pymod(float32_t* out, float32_t const* a, float32_t const* b)
 {
-  *out = __builtin_fmodf(__builtin_fmodf(*a, *b) + *b, *b);
+  *out = ::fmodf(::fmodf(*a, *b) + *b, *b);
 }
 
 __device__ inline void pymod(float64_t* out, float64_t const* a, float64_t const* b)
 {
-  *out = __builtin_fmod(__builtin_fmod(*a, *b) + *b, *b);
+  *out = ::fmod(::fmod(*a, *b) + *b, *b);
 }
 
 template <typename T>
@@ -1360,9 +1360,9 @@ __device__ inline void pymod(optional<T>* out, optional<T> const* a, optional<T>
   }
 }
 
-__device__ inline void rint(float32_t* out, float32_t const* a) { *out = __builtin_rintf(*a); }
+__device__ inline void rint(float32_t* out, float32_t const* a) { *out = ::rintf(*a); }
 
-__device__ inline void rint(float64_t* out, float64_t const* a) { *out = __builtin_rint(*a); }
+__device__ inline void rint(float64_t* out, float64_t const* a) { *out = ::rint(*a); }
 
 template <typename T>
 __device__ inline void rint(optional<T>* out, optional<T> const* a)
@@ -1376,9 +1376,9 @@ __device__ inline void rint(optional<T>* out, optional<T> const* a)
   }
 }
 
-__device__ inline void sin(float32_t* out, float32_t const* a) { *out = __builtin_sinf(*a); }
+__device__ inline void sin(float32_t* out, float32_t const* a) { *out = ::sinf(*a); }
 
-__device__ inline void sin(float64_t* out, float64_t const* a) { *out = __builtin_sin(*a); }
+__device__ inline void sin(float64_t* out, float64_t const* a) { *out = ::sin(*a); }
 
 template <typename T>
 __device__ inline void sin(optional<T>* out, optional<T> const* a)
@@ -1392,9 +1392,9 @@ __device__ inline void sin(optional<T>* out, optional<T> const* a)
   }
 }
 
-__device__ inline void sinh(float32_t* out, float32_t const* a) { *out = __builtin_sinhf(*a); }
+__device__ inline void sinh(float32_t* out, float32_t const* a) { *out = ::sinhf(*a); }
 
-__device__ inline void sinh(float64_t* out, float64_t const* a) { *out = __builtin_sinh(*a); }
+__device__ inline void sinh(float64_t* out, float64_t const* a) { *out = ::sinh(*a); }
 
 template <typename T>
 __device__ inline void sinh(optional<T>* out, optional<T> const* a)
@@ -1426,9 +1426,9 @@ __device__ inline void sub(optional<T>* out, optional<T> const* a, optional<T> c
   }
 }
 
-__device__ inline void tanh(float32_t* out, float32_t const* a) { *out = __builtin_tanhf(*a); }
+__device__ inline void tanh(float32_t* out, float32_t const* a) { *out = ::tanhf(*a); }
 
-__device__ inline void tanh(float64_t* out, float64_t const* a) { *out = __builtin_tanh(*a); }
+__device__ inline void tanh(float64_t* out, float64_t const* a) { *out = ::tanh(*a); }
 
 template <typename T>
 __device__ inline void tanh(optional<T>* out, optional<T> const* a)
