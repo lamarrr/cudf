@@ -1065,6 +1065,7 @@ target_link_libraries(
           zstd
           CUDA::nvJitLink
           CUDA::nvrtc
+          CUDA::nvrtc_builtins
           CUDA::cuda_driver
           lz4_objects
 )

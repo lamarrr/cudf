@@ -581,6 +581,7 @@ blob_t blob_t::from_static_data(std::span<u8 const> data)
 
 std::vector<unsigned char> compile(compile_params const& params)
 {
+  initialize();
   RTCX_EXPECTS(params.name != nullptr, "Fragment name must not be null", std::logic_error);
   RTCX_EXPECTS(params.source != nullptr, "Fragment source must not be null", std::logic_error);
 

@@ -5,7 +5,6 @@
 #pragma once
 
 namespace cudf {
-namespace jit {
 namespace lite {
 
 using int8_t   = signed char;
@@ -32,14 +31,7 @@ using size_type = int32_t;
 
 using char_utf8 = uint32_t;
 
-using bitmask_t = uint32_t;
-
-template <typename T>
-__device__ constexpr bool bit_is_set(T const* bitmask, size_t bit_index)
-{
-  constexpr auto bits_per_word = sizeof(T) * 8;
-  return bitmask[bit_index / bits_per_word] & (T{1} << (bit_index % bits_per_word));
-}
+using bitmask_type = uint32_t;
 
 enum class type_id : int32_t {
   EMPTY                  = 0,
@@ -121,33 +113,33 @@ __device__ constexpr T ipow10(T exponent)
 }
 
 template <typename T>
-__device__ constexpr T dec_lshift(T v, int32_t scale)
+__device__ constexpr T decimal_lshift(T v, int32_t scale)
 {
   return v * ipow10(-scale);
 }
 
 template <typename T>
-__device__ constexpr T dec_rshift(T v, int32_t scale)
+__device__ constexpr T decimal_rshift(T v, int32_t scale)
 {
   return v / ipow10(scale);
 }
 
 template <typename T>
-__device__ constexpr T dec_shift(T v, int32_t scale)
+__device__ constexpr T decimal_shift(T v, int32_t scale)
 {
   if (scale == 0) {
     return v;
   } else if (scale < 0) {
-    return dec_lshift(v, scale);
+    return decimal_lshift(v, scale);
   } else {
-    return dec_rshift(v, scale);
+    return decimal_rshift(v, scale);
   }
 }
 
 template <typename T>
-__device__ constexpr T dec_rescale(T v, int32_t from_scale, int32_t to_scale)
+__device__ constexpr T decimal_rescale(T v, int32_t from_scale, int32_t to_scale)
 {
-  return dec_shift(v, to_scale - from_scale);
+  return decimal_shift(v, to_scale - from_scale);
 }
 
 struct scaled_t {};
@@ -155,70 +147,70 @@ struct scaled_t {};
 inline constexpr scaled_t scaled;
 
 template <typename R>
-struct dec {
+struct decimal {
   using Rep = R;
 
   R _value = 0;
 
   int32_t _scale = 0;
 
-  __device__ constexpr dec(scaled_t, R value, int32_t scale) : _value{value}, _scale{scale} {}
+  __device__ constexpr decimal(scaled_t, R value, int32_t scale) : _value{value}, _scale{scale} {}
 
-  constexpr dec() = default;
+  constexpr decimal() = default;
 
   __device__ constexpr R value() const { return _value; }
 
   __device__ constexpr int32_t scale() const { return _scale; }
 };
 
-using dec32  = dec<int32_t>;
-using dec64  = dec<int64_t>;
-using dec128 = dec<int128_t>;
+using decimal32  = decimal<int32_t>;
+using decimal64  = decimal<int64_t>;
+using decimal128 = decimal<int128_t>;
 
 template <typename R>
-__device__ constexpr auto rescale(dec<R> a, int32_t scale)
+__device__ constexpr auto rescale(decimal<R> a, int32_t scale)
 {
-  return dec<R>{scaled, dec_rescale(a._value, a._scale, scale), scale};
+  return decimal<R>{scaled, decimal_rescale(a._value, a._scale, scale), scale};
 }
 
 template <typename R>
-__device__ constexpr auto operator+(dec<R> a, dec<R> b)
+__device__ constexpr auto operator+(decimal<R> a, decimal<R> b)
 {
   auto scale = min(a._scale, b._scale);
   auto r     = rescale(a, scale)._value + rescale(b, scale)._value;
-  return dec<R>{scaled, r, scale};
+  return decimal<R>{scaled, r, scale};
 }
 
 template <typename R>
-__device__ constexpr auto operator-(dec<R> a, dec<R> b)
+__device__ constexpr auto operator-(decimal<R> a, decimal<R> b)
 {
   auto scale = min(a._scale, b._scale);
   auto r     = rescale(a, scale)._value - rescale(b, scale)._value;
-  return dec<R>{scaled, r, scale};
+  return decimal<R>{scaled, r, scale};
 }
 
 template <typename R>
-__device__ constexpr auto operator*(dec<R> a, dec<R> b)
+__device__ constexpr auto operator*(decimal<R> a, decimal<R> b)
 {
-  return dec<R>{scaled, a._value * b._value, a._scale + b._scale};
+  return decimal<R>{scaled, a._value * b._value, a._scale + b._scale};
 }
 
 template <typename R>
-__device__ constexpr auto operator/(dec<R> a, dec<R> b)
+__device__ constexpr auto operator/(decimal<R> a, decimal<R> b)
 {
-  return dec<R>{scaled, a._value / b._value, a._scale - b._scale};
+  return decimal<R>{scaled, a._value / b._value, a._scale - b._scale};
 }
 
 template <typename R>
-__device__ constexpr auto operator%(dec<R> a, dec<R> b)
+__device__ constexpr auto operator%(decimal<R> a, decimal<R> b)
 {
   auto scale = min(a._scale, b._scale);
   auto r     = rescale(a, scale)._value % rescale(b, scale)._value;
-  return dec<R>{scaled, r, scale};
+  return decimal<R>{scaled, r, scale};
 }
 
 template <typename R>
-__device__ constexpr int operator<=>(dec<R> a, dec<R> b)
+__device__ constexpr int operator<=>(decimal<R> a, decimal<R> b)
 {
   auto scale = min(a._scale, b._scale);
   return rescale(a, scale)._value - rescale(b, scale)._value;
@@ -284,53 +276,6 @@ __device__ constexpr int operator<=>(duration<R, Unit> a, duration<R, Unit> b)
   return a._rep - b._rep;
 }
 
-struct string_view {
-  static constexpr size_type const UNKNOWN_STRING_LENGTH{-1};
-  static constexpr size_type const npos{-1};
-
-  char const* _data = nullptr;
-
-  size_type _bytes = 0;
-
-  mutable size_type _length = UNKNOWN_STRING_LENGTH;
-
-  __device__ constexpr size_type size_bytes() const { return _bytes; }
-
-  __device__ constexpr char const* data() const { return _data; }
-
-  __device__ constexpr bool empty() const { return _bytes == 0; }
-
-  __device__ constexpr size_type compare(string_view const& other) const
-  {
-    auto* s0 = _data;
-    auto n0  = _bytes;
-    auto* s1 = other._data;
-    auto n1  = other._bytes;
-    auto max = n0 < n1 ? n0 : n1;
-
-    if (s0 == s1 && n0 == n1) return 0;
-
-    size_type idx = 0;
-
-    while (idx < max) {
-      if (*s0 != *s1) return static_cast<int32_t>(*s0) - static_cast<int32_t>(*s1);
-      s0++;
-      s1++;
-      idx++;
-    }
-
-    if (idx < n0) { return 1; }
-    if (idx < n1) { return -1; }
-
-    return 0;
-  }
-};
-
-__device__ constexpr int operator<=>(string_view const& a, string_view const& b)
-{
-  return a.compare(b);
-}
-
 struct inplace_t {};
 
 inline constexpr inplace_t inplace;
@@ -343,7 +288,7 @@ template <typename T>
 struct optional {
   T _val = {};
 
-  bool _engaged = false;
+  bool _is_valid = false;
 
   constexpr optional() = default;
 
@@ -351,19 +296,17 @@ struct optional {
 
   template <typename... Args>
   __device__ constexpr optional(inplace_t, Args&&... args)
-    : _val{static_cast<Args&&>(args)...}, _engaged{true}
+    : _val{static_cast<Args&&>(args)...}, _is_valid{true}
   {
   }
 
-  __device__ constexpr optional(T val) : _val{val}, _engaged{true} {}
+  __device__ constexpr optional(T val) : _val{val}, _is_valid{true} {}
 
-  __device__ constexpr bool has_value() const { return _engaged; }
+  __device__ constexpr bool is_valid() const { return _is_valid; }
 
-  __device__ constexpr bool is_valid() const { return _engaged; }
+  __device__ constexpr bool is_null() const { return !_is_valid; }
 
-  __device__ constexpr bool is_null() const { return !_engaged; }
-
-  __device__ constexpr void reset() { _engaged = false; }
+  __device__ constexpr void reset() { _is_valid = false; }
 
   __device__ constexpr T const& get() const { return _val; }
 
@@ -381,9 +324,9 @@ struct optional {
 
   __device__ constexpr T& value() { return _val; }
 
-  __device__ constexpr explicit operator bool() const { return _engaged; }
+  __device__ constexpr explicit operator bool() const { return _is_valid; }
 
-  __device__ constexpr T value_or(T __v) const { return _engaged ? _val : __v; }
+  __device__ constexpr T value_or(T v) const { return _is_valid ? _val : v; }
 };
 
 template <typename T>
@@ -394,6 +337,10 @@ struct span {
   T* _data = nullptr;
 
   size_t _size = 0;
+
+  constexpr span() = default;
+
+  __device__ constexpr span(T* data, size_t size) : _data{data}, _size{size} {}
 
   __device__ constexpr T* data() const { return _data; }
 
@@ -407,17 +354,72 @@ struct span {
 
   __device__ constexpr T* end() const { return _data + _size; }
 
+  __device__ constexpr T const* cbegin() const { return _data; }
+
+  __device__ constexpr T const* cend() const { return _data + _size; }
+
   __device__ constexpr span<T const> as_const() const { return span<T const>{_data, _size}; }
 
-  template <typename U = T>
-  __device__ constexpr T& element(size_t idx) const
-  {
-    return _data[idx];
-  }
+  __device__ constexpr T& element(size_t i) const { return _data[i]; }
 };
 
 template <typename T>
 span(T*, size_t) -> span<T>;
+
+struct string_view {
+  static constexpr size_type const UNKNOWN_STRING_LENGTH{-1};
+  static constexpr size_type const npos{-1};
+
+  char const* _data = "";
+
+  size_type _bytes = 0;
+
+  mutable size_type _length = UNKNOWN_STRING_LENGTH;
+
+  constexpr string_view() = default;
+
+  __device__ constexpr string_view(char const* data, size_type bytes) : _data{data}, _bytes{bytes}
+  {
+  }
+
+  __device__ constexpr size_type size_bytes() const { return _bytes; }
+
+  __device__ constexpr char const* data() const { return _data; }
+
+  __device__ constexpr bool empty() const { return _bytes == 0; }
+
+  __device__ constexpr size_type compare(string_view const& other) const
+  {
+    auto* s0 = _data;
+    auto n0  = _bytes;
+    auto* s1 = other._data;
+    auto n1  = other._bytes;
+    auto max = n0 < n1 ? n0 : n1;
+
+    if (s0 == s1 && n0 == n1) return 0;
+
+    size_type i = 0;
+
+    while (i < max) {
+      if (*s0 != *s1) return static_cast<int32_t>(*s0) - static_cast<int32_t>(*s1);
+      s0++;
+      s1++;
+      i++;
+    }
+
+    if (i < n0) { return 1; }
+    if (i < n1) { return -1; }
+
+    return 0;
+  }
+};
+
+__device__ constexpr int operator<=>(string_view const& a, string_view const& b)
+{
+  return a.compare(b);
+}
+
+using mutable_string_view = span<char>;
 
 template <typename IndexType, typename KeyType>
 struct dictionary_element {
@@ -445,7 +447,7 @@ concept ReprCompatible =
   Same<T, duration_s> || Same<T, duration_ms> || Same<T, duration_us> || Same<T, duration_ns>;
 
 template <typename T>
-concept Decimal = Same<T, dec32> || Same<T, dec64> || Same<T, dec128>;
+concept Decimal = Same<T, decimal32> || Same<T, decimal64> || Same<T, decimal128>;
 
 template <typename T>
 constexpr bool IsDictionaryElement = false;
@@ -458,9 +460,21 @@ concept DictionaryElement = IsDictionaryElement<T>;
 
 }  // namespace traits
 
-// TODO: scope variables should be aligned to avoid uncoalesced reads/writes
-template <bool Mutable = false, bool AsScalar = false, bool AllValid = false>
+template <typename T>
+__device__ constexpr bool bit_is_set(T* bitmask, size_t bit_index)
+{
+  constexpr auto bits_per_word = sizeof(T) * 8;
+  return bitmask[bit_index / bits_per_word] & (T{1} << (bit_index % bits_per_word));
+}
+
+template <bool Mutable, bool AsScalar, bool MayBeNullable>
 struct alignas(16) column_accessor {
+  static constexpr int32_t STRING_OFFSETS_CHILD_INDEX = 0;
+
+  static constexpr bool is_mutable      = Mutable;
+  static constexpr bool as_scalar       = AsScalar;
+  static constexpr bool may_be_nullable = MayBeNullable;
+
  private:
   data_type _type = {};
 
@@ -468,48 +482,45 @@ struct alignas(16) column_accessor {
 
   void* __restrict__ _data = nullptr;
 
-  bitmask_t* __restrict__ _null_mask = nullptr;
+  bitmask_type* __restrict__ _null_mask = nullptr;
 
   size_type _offset = 0;
 
-  column_accessor* __restrict__ _d_children = nullptr;
+  void* __restrict__ _children = nullptr;
 
   size_type _num_children = 0;
 
-  // TODO: has_nulls
-
-  __device__ pair<int64_t, int64_t> get_string_offsets(size_type idx) const __restrict__
+  __device__ pair<int64_t, int64_t> get_string_offsets(size_type i) const __restrict__
   {
-    static constexpr int32_t OFFSETS_CHILD = 0;
-    auto i                                 = _offset + idx;
-    auto* __restrict__ offsets             = _d_children + OFFSETS_CHILD;
-    auto* __restrict__ i32_runs            = static_cast<int32_t const*>(offsets->_data);
-    auto* __restrict__ i64_runs            = static_cast<int64_t const*>(offsets->_data);
+    using offsets_accessor = column_accessor<false, AsScalar, true>;
+
+    auto* __restrict__ offsets =
+      static_cast<offsets_accessor*>(_children) + STRING_OFFSETS_CHILD_INDEX;
+    auto* __restrict__ i32_run = static_cast<int32_t const*>(offsets->_data) + _offset + i;
+    auto* __restrict__ i64_run = static_cast<int64_t const*>(offsets->_data) + _offset + i;
 
     int64_t run_begin = 0;
     int64_t run_end   = 0;
 
     switch (offsets->type().id()) {
       case type_id::INT32:
-        run_begin = i32_runs[i];
-        run_end   = i32_runs[i + 1];
+        run_begin = i32_run[0];
+        run_end   = i32_run[1];
         break;
       case type_id::INT64:
-        run_begin = i64_runs[i];
-        run_end   = i64_runs[i + 1];
+        run_begin = i64_run[0];
+        run_end   = i64_run[1];
         break;
       default: __builtin_unreachable();
     }
 
-    int64_t run_size = run_end - run_begin;
-
-    return {run_begin, run_size};
+    return {run_begin, run_end - run_begin};
   }
 
-  __device__ static constexpr size_type map_index(size_type idx)
+  __device__ static constexpr size_type map_index(size_type i)
   {
     if constexpr (AsScalar) { return 0; }
-    return idx;
+    return i;
   }
 
  public:
@@ -519,10 +530,10 @@ struct alignas(16) column_accessor {
 
   __device__ constexpr bool nullable() const __restrict__ { return _null_mask != nullptr; }
 
-  __device__ constexpr bitmask_t* __restrict__ null_mask() const
+  __device__ constexpr bitmask_type* __restrict__ null_mask() const
     __restrict__ requires(Mutable) { return _null_mask; }
 
-  __device__ constexpr bitmask_t const* __restrict__ null_mask() const
+  __device__ constexpr bitmask_type const* __restrict__ null_mask() const
     __restrict__ requires(!Mutable) { return _null_mask; }
 
   __device__ constexpr size_type offset() const __restrict__
@@ -530,67 +541,129 @@ struct alignas(16) column_accessor {
     return _offset;
   }
 
-  __device__ constexpr bool is_valid(size_type idx) const __restrict__
+  __device__ constexpr bool is_valid(size_type i) const __restrict__
   {
-    if constexpr (AllValid) { return true; }
-    return !nullable() || bit_is_set(_null_mask, _offset + map_index(idx));
+    if constexpr (MayBeNullable) { return true; }
+    return !nullable() || bit_is_set(_null_mask, _offset + map_index(i));
   }
 
-  __device__ constexpr bool is_null(size_type idx) const __restrict__ { return !is_valid(idx); }
+  __device__ constexpr bool is_null(size_type i) const __restrict__ { return !is_valid(i); }
 
   __device__ constexpr size_type num_child_columns() const __restrict__ { return _num_children; }
 
-  template <traits::ReprCompatible B>
-  __device__ auto& element(size_type idx) const __restrict__
+  template <traits::ReprCompatible T>
+  __device__ auto& element(size_type i) const __restrict__
   {
     if constexpr (Mutable) {
-      auto* __restrict__ p = static_cast<B*>(_data) + _offset + map_index(idx);
+      auto* __restrict__ p = static_cast<T*>(_data) + _offset + map_index(i);
       return *p;
     } else {
-      auto* __restrict__ p = static_cast<B const*>(_data) + _offset + map_index(idx);
+      auto* __restrict__ p = static_cast<T const*>(_data) + _offset + map_index(i);
       return *p;
     }
   }
 
-  template <traits::Decimal D>
-  __device__ auto element(size_type idx) const __restrict__
+  template <traits::Decimal T>
+  __device__ auto element(size_type i) const __restrict__
   {
-    auto* __restrict__ p = static_cast<typename D::Rep const*>(_data) + _offset + map_index(idx);
-    return D{scaled, *p, _type.scale()};
+    auto* __restrict__ p = static_cast<typename T::Rep const*>(_data) + _offset + map_index(i);
+    return T{scaled, *p, _type.scale()};
   }
 
   template <traits::Same<string_view> T>
-  __device__ string_view element(size_type idx) const __restrict__
+  __device__ string_view element(size_type i) const __restrict__
   {
     auto* __restrict__ chars   = static_cast<char const*>(_data);
-    auto [run_begin, run_size] = get_string_offsets(map_index(idx));
+    auto [run_begin, run_size] = get_string_offsets(map_index(i));
     return string_view{chars + run_begin, static_cast<size_type>(run_size)};
   }
 
   template <traits::Same<span<char>> T>
-  __device__ span<char> element(size_type idx) const __restrict__ requires(Mutable) {
+  __device__ mutable_string_view element(size_type i) const __restrict__ requires(Mutable) {
     auto* __restrict__ chars   = static_cast<char*>(_data);
-    auto [run_begin, run_size] = get_string_offsets(map_index(idx));
+    auto [run_begin, run_size] = get_string_offsets(map_index(i));
     auto* __restrict__ str     = chars + run_begin;
-    return span{str, static_cast<size_t>(run_size)};
+    return mutable_string_view{str, static_cast<size_t>(run_size)};
   }
 
   template <typename T>
-  __device__ optional<T> nullable_element(size_type idx) const __restrict__
+  __device__ optional<T> nullable_element(size_type i) const __restrict__
   {
-    if (!is_valid(idx)) return nullopt;
-    return element<T>(idx);
+    if (!is_valid(i)) return nullopt;
+    return element<T>(i);
   }
 
-  /* __device__ void assign(args scope, size_type i, T value)
-    {
-      auto p     = static_cast<Arg>(scope[ScopeIndex]);
-      auto index = IsScalar ? 0 : i;
+  template <traits::ReprCompatible T>
+  __device__ void assign(size_type i, T value) const __restrict__ requires(Mutable && !AsScalar) {
+    auto* __restrict__ p = static_cast<T*>(_data) + _offset + i;
+    *p                   = value;
+  }
 
-      p->template assign<T>(index, value);
-    }*/
+  template <traits::Decimal T>
+  __device__ void assign(size_type i, T value) const __restrict__ requires(Mutable && !AsScalar) {
+    auto* __restrict__ p = static_cast<typename T::Rep*>(_data) + _offset + i;
+    *p                   = value.value();
+  }
 
-  // TODO: assign_null_word()
+  template <traits::Same<mutable_string_view> T>
+  __device__ void assign(size_type i, T value) const __restrict__ requires(Mutable && !AsScalar) {
+    // no-op
+    return;
+  }
+
+  __device__ void assign_null_word(size_type word_index, bitmask_type value) const
+    __restrict__ requires(Mutable && !AsScalar && !MayBeNullable) {
+      _null_mask[word_index] = value;
+    }
+};
+
+// TODO: typed column_accessor
+
+// TODO: better name, this should work for
+// fixed-width columns, including decimals
+//
+// TODO: vector_inplace_column
+// TODO: asumptions: offset is a multiple of vector size
+// TODO: alignment assumptions for the data, null-masks, offsets; they need to be vectorized
+// TODO: maybe add type-specific prefetch types, i.e. string_prefetch
+// TODO: aligned load/stores: __builtin_assume_aligned(ptr, alignment)
+// how to load?
+// template<typename T, size_t alignment/multiple> : register memory columns
+// void vector_load(column_accessor<...>);
+//
+// void vector_store(size_type offset, column_accessor);
+//
+//
+// TODO: dictionary
+// TODO: struct?
+// will not support list, string, map, they will not benefit from vectorized reads/writes due to
+// their variable-length and pointer-chasing nature
+//
+
+template <size_t alignment, size_t size>
+struct buffer {
+  alignas(alignment) char _data[size];
+};
+
+template <size_t alignment>
+struct buffer<alignment, 0> {
+  static inline constexpr char* _data = nullptr;
+};
+
+template <size_t data_alignment,
+          size_t data_size,
+          size_t null_mask_alignment,
+          size_t null_mask_size,
+          size_t offsets_alignment,
+          size_t offsets_size>
+struct column_buffer {
+  buffer<data_alignment, data_size> _data;
+  buffer<null_mask_alignment, null_mask_size> _null_mask;
+  buffer<offsets_alignment, offsets_size> _offsets;
+
+  //   __device__ column_accessor<> as_column();
+  //   __device__ void read();  // TODO: element size, multiple, must be aligned, etc.
+  //   __device__ void write(size_type offset, column_accessor<>);
 };
 
 #if !CUDF_JIT_LITE_EXCLUDE_OPERATORS
@@ -1396,5 +1469,4 @@ __device__ inline void if_else(optional<T>* out,
 #endif
 
 }  // namespace lite
-}  // namespace jit
 }  // namespace cudf

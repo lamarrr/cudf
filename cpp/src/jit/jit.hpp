@@ -27,6 +27,11 @@ struct [[nodiscard]] jit_bundle_t {
   [[nodiscard]] std::vector<std::string> get_include_directories() const;
 };
 
+std::tuple<rtcx::library, rtcx::blob> compile_library_uncached(char const* name,
+                                                               char const* cuda_code,
+                                                               bool use_pch,
+                                                               bool log_pch);
+
 [[nodiscard]] rtcx::library get_library(std::string const& name,
                                         std::string const& key,
                                         std::string const& cuda_udf,

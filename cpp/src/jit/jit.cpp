@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <format>
 #include <future>
+#include <iostream>
 
 #define CUDFRTC_CHECK_CUDART(msg, ...)                                              \
   do {                                                                              \
@@ -36,6 +37,11 @@
                                     ::cudaGetErrorString(__result));                \
       CUDF_FAIL(+std::format("{}. {}", msg, __errstr), ::std::runtime_error);       \
     }                                                                               \
+  } while (0)
+
+#define CHECKPT                                                              \
+  do {                                                                       \
+    std::cout << "Checkpoint: " << __FILE__ << ":" << __LINE__ << std::endl; \
   } while (0)
 
 namespace CUDF_EXPORT cudf {
@@ -156,7 +162,7 @@ void install_cudf_jit_files(char const* target_dir)
       "mkdtemp");
   }
 
-  install_file_set(target_dir,
+  install_file_set(tmp_dir,
                    rtcx_embed::cudf_jit_embed_files,
                    rtcx_embed::cudf_jit_embed_files_uncompressed_size,
                    rtcx_embed::cudf_jit_embed_file_ranges,
@@ -258,17 +264,19 @@ int32_t get_current_device_physical_model()
   return props.major * 10 + props.minor;
 }
 
+}  // namespace
+
 std::tuple<rtcx::library, rtcx::blob> compile_library_uncached(char const* name,
                                                                char const* cuda_code,
                                                                bool use_pch,
                                                                bool log_pch)
 {
   CUDF_FUNC_RANGE();
-
+  CHECKPT;
   auto& bundle = cudf::get_context().jit_bundle();
   auto begin   = std::chrono::steady_clock::now();
   auto sm      = get_current_device_physical_model();
-
+  CHECKPT;
   auto include_dirs = bundle.get_include_directories();
   auto pch_dir      = cudf::get_context().get_jit_pch_dir();
 
@@ -277,7 +285,7 @@ std::tuple<rtcx::library, rtcx::blob> compile_library_uncached(char const* name,
   for (auto const& include_dir : include_dirs) {
     options.emplace_back(std::format("-I{}", include_dir));
   }
-
+  CHECKPT;
   // TODO: experiment with:
   // --fdevice-time-trace=jit_comp_trace.json
   // --time=compile_trace.json
@@ -286,11 +294,13 @@ std::tuple<rtcx::library, rtcx::blob> compile_library_uncached(char const* name,
 
   options.emplace_back(std::format("--gpu-architecture=sm_{}", sm));
   options.emplace_back("--minimal");
+  options.emplace_back("-std=c++20");
+  options.emplace_back("--device-as-default-execution-space");
 
   auto pch_file = std::format("/home/coder/cudf/jit.pch");
 
   static int can_use = 0;
-
+  CHECKPT;
   if (use_pch) {
     // options.emplace_back("--pch");
     options.emplace_back(std::format("--pch-dir={}", pch_dir));
@@ -299,6 +309,7 @@ std::tuple<rtcx::library, rtcx::blob> compile_library_uncached(char const* name,
     } else {
       options.emplace_back(std::format("--create-pch={}", pch_file));
     }
+
     can_use = 1;
 
     if (log_pch) {
@@ -306,12 +317,12 @@ std::tuple<rtcx::library, rtcx::blob> compile_library_uncached(char const* name,
       options.emplace_back("--pch-messages=true");
     }
   }
-
+  CHECKPT;
   std::vector<char const*> options_cstr;
   for (auto const& option : options) {
     options_cstr.emplace_back(option.c_str());
   }
-
+  CHECKPT;
   auto params = rtcx::compile_params{.name        = name,
                                      .source      = cuda_code,
                                      .headers     = {},
@@ -319,7 +330,7 @@ std::tuple<rtcx::library, rtcx::blob> compile_library_uncached(char const* name,
                                      .target_type = rtcx::binary_type::CUBIN};
 
   auto cubin = rtcx::compile(params);
-
+  CHECKPT;
   auto end = std::chrono::steady_clock::now();
 
   auto duration = end - begin;
@@ -330,13 +341,11 @@ std::tuple<rtcx::library, rtcx::blob> compile_library_uncached(char const* name,
     std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(duration).count());
 
   auto library = rtcx::load_library(cubin, rtcx::binary_type::CUBIN);
-
+  CHECKPT;
   auto blob = rtcx::blob_t::from_vector(std::move(cubin));
-
+  CHECKPT;
   return std::make_tuple(library, std::make_shared<rtcx::blob_t>(std::move(blob)));
 }
-
-}  // namespace
 
 [[nodiscard]] rtcx::library get_library(std::string const& name,
                                         std::string const& key,
