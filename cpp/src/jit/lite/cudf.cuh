@@ -12,10 +12,11 @@ using int16_t  = signed short;
 using int32_t  = signed int;
 using int64_t  = signed long long;
 using int128_t = __int128_t;
-using uint8_t  = unsigned char;
-using uint16_t = unsigned short;
-using uint32_t = unsigned int;
-using uint64_t = unsigned long long;
+
+using uint8_t   = unsigned char;
+using uint16_t  = unsigned short;
+using uint32_t  = unsigned int;
+using uint64_t  = unsigned long long;
 using uint128_t = __uint128_t;
 
 using size_t    = unsigned long long;
@@ -287,7 +288,7 @@ inline constexpr nullopt_t nullopt;
 
 template <typename T>
 struct optional {
-  T _val = {};
+  T _value = {};
 
   bool _is_valid = false;
 
@@ -297,11 +298,11 @@ struct optional {
 
   template <typename... Args>
   __device__ constexpr optional(inplace_t, Args&&... args)
-    : _val{static_cast<Args&&>(args)...}, _is_valid{true}
+    : _value{static_cast<Args&&>(args)...}, _is_valid{true}
   {
   }
 
-  __device__ constexpr optional(T val) : _val{val}, _is_valid{true} {}
+  __device__ constexpr optional(T value) : _value{value}, _is_valid{true} {}
 
   __device__ constexpr bool is_valid() const { return _is_valid; }
 
@@ -309,25 +310,25 @@ struct optional {
 
   __device__ constexpr void reset() { _is_valid = false; }
 
-  __device__ constexpr T const& get() const { return _val; }
+  __device__ constexpr T const& get() const { return _value; }
 
-  __device__ constexpr T& get() { return _val; }
+  __device__ constexpr T& get() { return _value; }
 
-  __device__ constexpr T const* operator->() const { return &_val; }
+  __device__ constexpr T const* operator->() const { return &_value; }
 
-  __device__ constexpr T* operator->() { return &_val; }
+  __device__ constexpr T* operator->() { return &_value; }
 
-  __device__ constexpr T const& operator*() const { return _val; }
+  __device__ constexpr T const& operator*() const { return _value; }
 
-  __device__ constexpr T& operator*() { return _val; }
+  __device__ constexpr T& operator*() { return _value; }
 
-  __device__ constexpr T const& value() const { return _val; }
+  __device__ constexpr T const& value() const { return _value; }
 
-  __device__ constexpr T& value() { return _val; }
+  __device__ constexpr T& value() { return _value; }
 
   __device__ constexpr explicit operator bool() const { return _is_valid; }
 
-  __device__ constexpr T value_or(T v) const { return _is_valid ? _val : v; }
+  __device__ constexpr T value_or(T v) const { return _is_valid ? _value : v; }
 };
 
 template <typename T>
@@ -476,7 +477,6 @@ struct alignas(16) column_accessor {
   static constexpr bool as_scalar       = AsScalar;
   static constexpr bool may_be_nullable = MayBeNullable;
 
- private:
   data_type _type = {};
 
   size_type _size = 0;
@@ -553,19 +553,14 @@ struct alignas(16) column_accessor {
   __device__ constexpr size_type num_child_columns() const __restrict__ { return _num_children; }
 
   template <traits::ReprCompatible T>
-  __device__ auto& element(size_type i) const __restrict__
+  __device__ T element(size_type i) const __restrict__
   {
-    if constexpr (Mutable) {
-      auto* __restrict__ p = static_cast<T*>(_data) + _offset + map_index(i);
-      return *p;
-    } else {
-      auto* __restrict__ p = static_cast<T const*>(_data) + _offset + map_index(i);
-      return *p;
-    }
+    auto* __restrict__ p = static_cast<T const*>(_data) + _offset + map_index(i);
+    return *p;
   }
 
   template <traits::Decimal T>
-  __device__ auto element(size_type i) const __restrict__
+  __device__ T element(size_type i) const __restrict__
   {
     auto* __restrict__ p = static_cast<typename T::Rep const*>(_data) + _offset + map_index(i);
     return T{scaled, *p, _type.scale()};
@@ -579,7 +574,7 @@ struct alignas(16) column_accessor {
     return string_view{chars + run_begin, static_cast<size_type>(run_size)};
   }
 
-  template <traits::Same<span<char>> T>
+  template <traits::Same<mutable_string_view> T>
   __device__ mutable_string_view element(size_type i) const __restrict__ requires(Mutable) {
     auto* __restrict__ chars   = static_cast<char*>(_data);
     auto [run_begin, run_size] = get_string_offsets(map_index(i));
@@ -617,57 +612,6 @@ struct alignas(16) column_accessor {
       _null_mask[word_index] = value;
     }
 };
-
-// TODO: typed column_accessor
-
-// TODO: better name, this should work for
-// fixed-width columns, including decimals
-//
-// TODO: vector_inplace_column
-// TODO: asumptions: offset is a multiple of vector size
-// TODO: alignment assumptions for the data, null-masks, offsets; they need to be vectorized
-// TODO: maybe add type-specific prefetch types, i.e. string_prefetch
-// TODO: aligned load/stores: __builtin_assume_aligned(ptr, alignment)
-// how to load?
-// template<typename T, size_t alignment/multiple> : register memory columns
-// void vector_load(column_accessor<...>);
-//
-// void vector_store(size_type offset, column_accessor);
-//
-//
-// TODO: dictionary
-// TODO: struct?
-// will not support list, string, map, they will not benefit from vectorized reads/writes due to
-// their variable-length and pointer-chasing nature
-//
-
-template <size_t alignment, size_t size>
-struct buffer {
-  alignas(alignment) char _data[size];
-};
-
-template <size_t alignment>
-struct buffer<alignment, 0> {
-  static inline constexpr char* _data = nullptr;
-};
-
-template <size_t data_alignment,
-          size_t data_size,
-          size_t null_mask_alignment,
-          size_t null_mask_size,
-          size_t offsets_alignment,
-          size_t offsets_size>
-struct column_buffer {
-  buffer<data_alignment, data_size> _data;
-  buffer<null_mask_alignment, null_mask_size> _null_mask;
-  buffer<offsets_alignment, offsets_size> _offsets;
-
-  //   __device__ column_accessor<> as_column();
-  //   __device__ void read();  // TODO: element size, multiple, must be aligned, etc.
-  //   __device__ void write(size_type offset, column_accessor<>);
-};
-
-#if !defined(CUDF_JIT_LITE_EXCLUDE_OPERATORS)
 
 namespace operators {
 
@@ -1466,8 +1410,6 @@ __device__ inline void if_else(optional<T>* out,
 }
 
 }  // namespace operators
-
-#endif
 
 }  // namespace lite
 }  // namespace cudf

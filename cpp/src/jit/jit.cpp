@@ -293,6 +293,7 @@ std::tuple<rtcx::library, rtcx::blob> compile_library_uncached(char const* name,
   options.emplace_back("--minimal");
   options.emplace_back("-std=c++20");
   options.emplace_back("--device-as-default-execution-space");
+  options.emplace_back("--time='-'");
 
   auto pch_file = std::format("/home/coder/cudf/jit.pch");
 
