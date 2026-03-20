@@ -114,36 +114,6 @@ __device__ constexpr T ipow10(T exponent)
   return square * extra;
 }
 
-template <typename T>
-__device__ constexpr T decimal_lshift(T v, int32_t scale)
-{
-  return v * ipow10(-scale);
-}
-
-template <typename T>
-__device__ constexpr T decimal_rshift(T v, int32_t scale)
-{
-  return v / ipow10(scale);
-}
-
-template <typename T>
-__device__ constexpr T decimal_shift(T v, int32_t scale)
-{
-  if (scale == 0) {
-    return v;
-  } else if (scale < 0) {
-    return decimal_lshift(v, scale);
-  } else {
-    return decimal_rshift(v, scale);
-  }
-}
-
-template <typename T>
-__device__ constexpr T decimal_rescale(T v, int32_t from_scale, int32_t to_scale)
-{
-  return decimal_shift(v, to_scale - from_scale);
-}
-
 struct scaled_t {};
 
 inline constexpr scaled_t scaled;
@@ -156,67 +126,82 @@ struct decimal {
 
   int32_t _scale = 0;
 
-  __device__ constexpr decimal(scaled_t, R value, int32_t scale) : _value{value}, _scale{scale} {}
-
   constexpr decimal() = default;
+
+  __device__ constexpr decimal(scaled_t, R value, int32_t scale) : _value{value}, _scale{scale} {}
 
   __device__ constexpr R value() const { return _value; }
 
   __device__ constexpr int32_t scale() const { return _scale; }
+
+ private:
+  __device__ static constexpr R _lshift(R v, int32_t scale) { return v * ipow10(-scale); }
+
+  __device__ static constexpr R _rshift(R v, int32_t scale) { return v / ipow10(scale); }
+
+  __device__ static constexpr R _shift(R v, int32_t scale)
+  {
+    if (scale == 0) {
+      return v;
+    } else if (scale < 0) {
+      return _lshift(v, scale);
+    } else {
+      return _rshift(v, scale);
+    }
+  }
+
+  __device__ static constexpr R _rescale(R v, int32_t from_scale, int32_t to_scale)
+  {
+    return _shift(v, to_scale - from_scale);
+  }
+
+ public:
+  __device__ constexpr auto rescale(int32_t scale) const
+  {
+    return decimal{scaled, _rescale(_value, _scale, scale), scale};
+  }
+
+  __device__ constexpr auto operator+(decimal rhs) const
+  {
+    auto scale = min(_scale, rhs._scale);
+    auto r     = rescale(scale)._value + rhs.rescale(scale)._value;
+    return decimal{scaled, r, scale};
+  }
+
+  __device__ constexpr auto operator-(decimal rhs) const
+  {
+    auto scale = min(_scale, rhs._scale);
+    auto r     = rescale(scale)._value - rhs.rescale(scale)._value;
+    return decimal{scaled, r, scale};
+  }
+
+  __device__ constexpr auto operator*(decimal rhs) const
+  {
+    return decimal{scaled, _value * rhs._value, _scale + rhs._scale};
+  }
+
+  __device__ constexpr auto operator/(decimal rhs) const
+  {
+    return decimal{scaled, _value / rhs._value, _scale - rhs._scale};
+  }
+
+  __device__ constexpr auto operator%(decimal rhs) const
+  {
+    auto scale = min(_scale, rhs._scale);
+    auto r     = rescale(scale)._value % rhs.rescale(scale)._value;
+    return decimal{scaled, r, scale};
+  }
+
+  __device__ constexpr int operator<=>(decimal rhs) const
+  {
+    auto scale = min(_scale, rhs._scale);
+    return rescale(scale)._value - rhs.rescale(scale)._value;
+  }
 };
 
 using decimal32  = decimal<int32_t>;
 using decimal64  = decimal<int64_t>;
 using decimal128 = decimal<int128_t>;
-
-template <typename R>
-__device__ constexpr auto rescale(decimal<R> a, int32_t scale)
-{
-  return decimal<R>{scaled, decimal_rescale(a._value, a._scale, scale), scale};
-}
-
-template <typename R>
-__device__ constexpr auto operator+(decimal<R> a, decimal<R> b)
-{
-  auto scale = min(a._scale, b._scale);
-  auto r     = rescale(a, scale)._value + rescale(b, scale)._value;
-  return decimal<R>{scaled, r, scale};
-}
-
-template <typename R>
-__device__ constexpr auto operator-(decimal<R> a, decimal<R> b)
-{
-  auto scale = min(a._scale, b._scale);
-  auto r     = rescale(a, scale)._value - rescale(b, scale)._value;
-  return decimal<R>{scaled, r, scale};
-}
-
-template <typename R>
-__device__ constexpr auto operator*(decimal<R> a, decimal<R> b)
-{
-  return decimal<R>{scaled, a._value * b._value, a._scale + b._scale};
-}
-
-template <typename R>
-__device__ constexpr auto operator/(decimal<R> a, decimal<R> b)
-{
-  return decimal<R>{scaled, a._value / b._value, a._scale - b._scale};
-}
-
-template <typename R>
-__device__ constexpr auto operator%(decimal<R> a, decimal<R> b)
-{
-  auto scale = min(a._scale, b._scale);
-  auto r     = rescale(a, scale)._value % rescale(b, scale)._value;
-  return decimal<R>{scaled, r, scale};
-}
-
-template <typename R>
-__device__ constexpr int operator<=>(decimal<R> a, decimal<R> b)
-{
-  auto scale = min(a._scale, b._scale);
-  return rescale(a, scale)._value - rescale(b, scale)._value;
-}
 
 enum class timestamp_unit : int32_t { D, h, m, s, ms, us, ns };
 
@@ -227,6 +212,8 @@ struct timestamp {
   R _rep = 0;
 
   __device__ constexpr R count() const { return _rep; }
+
+  __device__ constexpr int operator<=>(timestamp rhs) const { return _rep - rhs._rep; }
 };
 
 using timestamp_D  = timestamp<int32_t, timestamp_unit::D>;
@@ -238,18 +225,18 @@ using timestamp_us = timestamp<int64_t, timestamp_unit::us>;
 using timestamp_ns = timestamp<int64_t, timestamp_unit::ns>;
 
 template <typename R, timestamp_unit Unit>
-__device__ constexpr int operator<=>(timestamp<R, Unit> a, timestamp<R, Unit> b)
-{
-  return a._rep - b._rep;
-}
-
-template <typename R, timestamp_unit Unit>
 struct duration {
   using Rep = R;
 
   R _rep = 0;
 
   __device__ constexpr R count() const { return _rep; }
+
+  __device__ constexpr duration operator+(duration rhs) const { return duration{_rep + rhs._rep}; }
+
+  __device__ constexpr duration operator-(duration rhs) const { return duration{_rep - rhs._rep}; }
+
+  __device__ constexpr int operator<=>(duration rhs) const { return _rep - rhs._rep; }
 };
 
 using duration_D  = duration<int32_t, timestamp_unit::D>;
@@ -259,24 +246,6 @@ using duration_s  = duration<int64_t, timestamp_unit::s>;
 using duration_ms = duration<int64_t, timestamp_unit::ms>;
 using duration_us = duration<int64_t, timestamp_unit::us>;
 using duration_ns = duration<int64_t, timestamp_unit::ns>;
-
-template <typename R, timestamp_unit Unit>
-__device__ constexpr duration<R, Unit> operator+(duration<R, Unit> a, duration<R, Unit> b)
-{
-  return duration<R, Unit>{a._rep + b._rep};
-}
-
-template <typename R, timestamp_unit Unit>
-__device__ constexpr duration<R, Unit> operator-(duration<R, Unit> a, duration<R, Unit> b)
-{
-  return duration<R, Unit>{a._rep - b._rep};
-}
-
-template <typename R, timestamp_unit Unit>
-__device__ constexpr int operator<=>(duration<R, Unit> a, duration<R, Unit> b)
-{
-  return a._rep - b._rep;
-}
 
 struct inplace_t {};
 
@@ -384,9 +353,22 @@ struct string_view {
   {
   }
 
+  __device__ constexpr string_view(char const* data, size_type bytes, size_type length)
+    : _data{data}, _bytes{bytes}, _length{length}
+  {
+  }
+
   __device__ constexpr size_type size_bytes() const { return _bytes; }
 
-  __device__ constexpr char const* data() const { return _data; }
+  __device__ constexpr auto* data() const { return _data; }
+
+  __device__ constexpr auto* begin() const { return _data; }
+
+  __device__ constexpr auto* end() const { return _data + _bytes; }
+
+  __device__ constexpr auto const* cbegin() const { return _data; }
+
+  __device__ constexpr auto const* cend() const { return _data + _bytes; }
 
   __device__ constexpr bool empty() const { return _bytes == 0; }
 
@@ -414,14 +396,42 @@ struct string_view {
 
     return 0;
   }
+
+  __device__ constexpr int operator<=>(string_view const& rhs) const { return compare(rhs); }
 };
 
-__device__ constexpr int operator<=>(string_view const& a, string_view const& b)
-{
-  return a.compare(b);
-}
+struct mutable_string_view {
+  static constexpr size_type const UNKNOWN_STRING_LENGTH{-1};
+  static constexpr size_type const npos{-1};
 
-using mutable_string_view = span<char>;
+  char* _data = nullptr;
+
+  size_type _bytes = 0;
+
+  mutable size_type _length = UNKNOWN_STRING_LENGTH;
+
+  constexpr mutable_string_view() = default;
+
+  __device__ constexpr mutable_string_view(char* data, size_type bytes) : _data{data}, _bytes{bytes}
+  {
+  }
+
+  __device__ constexpr size_type size_bytes() const { return _bytes; }
+
+  __device__ constexpr auto* data() const { return _data; }
+
+  __device__ constexpr auto* begin() const { return _data; }
+
+  __device__ constexpr auto* end() const { return _data + _bytes; }
+
+  __device__ constexpr auto const* cbegin() const { return _data; }
+
+  __device__ constexpr auto const* cend() const { return _data + _bytes; }
+
+  __device__ constexpr bool empty() const { return _bytes == 0; }
+
+  __device__ explicit operator string_view() const { return string_view{_data, _bytes, _length}; }
+};
 
 template <typename IndexType, typename KeyType>
 struct dictionary_element {
@@ -491,26 +501,25 @@ struct alignas(16) column_accessor {
 
   size_type _num_children = 0;
 
-  __device__ pair<int64_t, int64_t> get_string_offsets(size_type i) const __restrict__
+  __device__ pair<int64_t, int64_t> get_string_offsets(size_type i) const
   {
-    using offsets_accessor = column_accessor<false, AsScalar, true>;
+    using accessor = column_accessor<false, AsScalar, true>;
 
-    auto* __restrict__ offsets =
-      static_cast<offsets_accessor*>(_children) + STRING_OFFSETS_CHILD_INDEX;
-    auto* __restrict__ i32_run = static_cast<int32_t const*>(offsets->_data) + _offset + i;
-    auto* __restrict__ i64_run = static_cast<int64_t const*>(offsets->_data) + _offset + i;
+    auto* __restrict__ offsets = static_cast<accessor*>(_children) + STRING_OFFSETS_CHILD_INDEX;
+    auto* __restrict__ run32   = static_cast<int32_t const*>(offsets->_data) + _offset + i;
+    auto* __restrict__ run64   = static_cast<int64_t const*>(offsets->_data) + _offset + i;
 
     int64_t run_begin = 0;
     int64_t run_end   = 0;
 
     switch (offsets->type().id()) {
       case type_id::INT32:
-        run_begin = i32_run[0];
-        run_end   = i32_run[1];
+        run_begin = run32[0];
+        run_end   = run32[1];
         break;
       case type_id::INT64:
-        run_begin = i64_run[0];
-        run_end   = i64_run[1];
+        run_begin = run64[0];
+        run_end   = run64[1];
         break;
       default: __builtin_unreachable();
     }
@@ -525,49 +534,52 @@ struct alignas(16) column_accessor {
   }
 
  public:
-  __device__ constexpr data_type type() const __restrict__ { return _type; }
+  __device__ constexpr data_type type() const { return _type; }
 
-  __device__ constexpr size_type size() const __restrict__ { return _size; }
+  __device__ constexpr size_type size() const { return _size; }
 
-  __device__ constexpr bool nullable() const __restrict__ { return _null_mask != nullptr; }
+  __device__ constexpr bool has_null_mask() const { return _null_mask != nullptr; }
 
   __device__ constexpr bitmask_type* __restrict__ null_mask() const
-    __restrict__ requires(Mutable) { return _null_mask; }
+    requires(Mutable)
+  {
+    return _null_mask;
+  }
 
   __device__ constexpr bitmask_type const* __restrict__ null_mask() const
-    __restrict__ requires(!Mutable) { return _null_mask; }
-
-  __device__ constexpr size_type offset() const __restrict__
+    requires(!Mutable)
   {
-    return _offset;
+    return _null_mask;
   }
 
-  __device__ constexpr bool is_valid(size_type i) const __restrict__
+  __device__ constexpr size_type offset() const { return _offset; }
+
+  __device__ constexpr bool is_valid(size_type i) const
   {
     if constexpr (MayBeNullable) { return true; }
-    return !nullable() || bit_is_set(_null_mask, _offset + map_index(i));
+    return !has_null_mask() || bit_is_set(_null_mask, _offset + map_index(i));
   }
 
-  __device__ constexpr bool is_null(size_type i) const __restrict__ { return !is_valid(i); }
+  __device__ constexpr bool is_null(size_type i) const { return !is_valid(i); }
 
-  __device__ constexpr size_type num_child_columns() const __restrict__ { return _num_children; }
+  __device__ constexpr size_type num_child_columns() const { return _num_children; }
 
   template <traits::ReprCompatible T>
-  __device__ T element(size_type i) const __restrict__
+  __device__ T element(size_type i) const
   {
     auto* __restrict__ p = static_cast<T const*>(_data) + _offset + map_index(i);
     return *p;
   }
 
   template <traits::Decimal T>
-  __device__ T element(size_type i) const __restrict__
+  __device__ T element(size_type i) const
   {
     auto* __restrict__ p = static_cast<typename T::Rep const*>(_data) + _offset + map_index(i);
     return T{scaled, *p, _type.scale()};
   }
 
   template <traits::Same<string_view> T>
-  __device__ string_view element(size_type i) const __restrict__
+  __device__ string_view element(size_type i) const
   {
     auto* __restrict__ chars   = static_cast<char const*>(_data);
     auto [run_begin, run_size] = get_string_offsets(map_index(i));
@@ -575,42 +587,51 @@ struct alignas(16) column_accessor {
   }
 
   template <traits::Same<mutable_string_view> T>
-  __device__ mutable_string_view element(size_type i) const __restrict__ requires(Mutable) {
+  __device__ mutable_string_view element(size_type i) const
+    requires(Mutable)
+  {
     auto* __restrict__ chars   = static_cast<char*>(_data);
     auto [run_begin, run_size] = get_string_offsets(map_index(i));
     auto* __restrict__ str     = chars + run_begin;
-    return mutable_string_view{str, static_cast<size_t>(run_size)};
+    return mutable_string_view{str, static_cast<size_type>(run_size)};
   }
 
   template <typename T>
-  __device__ optional<T> nullable_element(size_type i) const __restrict__
+  __device__ optional<T> nullable_element(size_type i) const
   {
     if (!is_valid(i)) return nullopt;
     return element<T>(i);
   }
 
   template <traits::ReprCompatible T>
-  __device__ void assign(size_type i, T value) const __restrict__ requires(Mutable && !AsScalar) {
+  __device__ void assign(size_type i, T value) const
+    requires(Mutable && !AsScalar)
+  {
     auto* __restrict__ p = static_cast<T*>(_data) + _offset + i;
     *p                   = value;
   }
 
   template <traits::Decimal T>
-  __device__ void assign(size_type i, T value) const __restrict__ requires(Mutable && !AsScalar) {
+  __device__ void assign(size_type i, T value) const
+    requires(Mutable && !AsScalar)
+  {
     auto* __restrict__ p = static_cast<typename T::Rep*>(_data) + _offset + i;
     *p                   = value.value();
   }
 
   template <traits::Same<mutable_string_view> T>
-  __device__ void assign(size_type i, T value) const __restrict__ requires(Mutable && !AsScalar) {
+  __device__ void assign(size_type i, T value) const
+    requires(Mutable && !AsScalar)
+  {
     // no-op
     return;
   }
 
   __device__ void assign_null_word(size_type word_index, bitmask_type value) const
-    __restrict__ requires(Mutable && !AsScalar && !MayBeNullable) {
-      _null_mask[word_index] = value;
-    }
+    requires(Mutable && !AsScalar && !MayBeNullable)
+  {
+    _null_mask[word_index] = value;
+  }
 };
 
 namespace operators {
