@@ -28,7 +28,7 @@ TEST_F(RTCTest, CompileKernelBasic)
 
     using namespace cudf::lite;
 
-    extern "C" __device__ void binary_operator(void * out_ptr, void const * a_ptr, void const * b_ptr){
+    extern "C" __device__ void binary_operator(void * user_data, size_type index, void * out_ptr, void const * a_ptr, void const * b_ptr){
       auto a = *static_cast<int32_t const*>(a_ptr);
       auto b = *static_cast<int32_t const*>(b_ptr);
       auto & out = *static_cast<int32_t*>(out_ptr);
@@ -52,7 +52,7 @@ TEST_F(RTCTest, CompileKernelBasic)
         auto a = a_col->element<int32_t>(i);
         auto b = b_col->element<int32_t>(i);
         int32_t out;
-        binary_operator(&out, &a, &b);
+        binary_operator(user_data, i, &out, &a, &b);
         out_col->assign(i, out);
       }
     }
