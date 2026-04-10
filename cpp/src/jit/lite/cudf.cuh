@@ -503,7 +503,7 @@ struct alignas(16) column_accessor {
 
   __device__ pair<int64_t, int64_t> get_string_offsets(size_type i) const
   {
-    using accessor = column_accessor<false, AsScalar, true>;
+    using accessor = column_accessor<false, AsScalar, false>;
 
     auto* __restrict__ offsets = static_cast<accessor*>(_children) + STRING_OFFSETS_CHILD_INDEX;
     auto* __restrict__ run32   = static_cast<int32_t const*>(offsets->_data) + _offset + i;
@@ -630,7 +630,8 @@ struct alignas(16) column_accessor {
   __device__ void assign_null_word(size_type word_index, bitmask_type value) const
     requires(Mutable && !AsScalar && !MayBeNullable)
   {
-    _null_mask[word_index] = value;
+    auto* __restrict__ p = _null_mask + word_index;
+    *p                   = value;
   }
 };
 
