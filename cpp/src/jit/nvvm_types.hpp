@@ -19,11 +19,9 @@ std::string nvvm_type_impl()
 }
 
 template <typename T>
-  requires(cuda::std::is_floating_point_v<T>)
+  requires(cuda::std::is_floating_point_v<T> && sizeof(T) <= 8)
 std::string nvvm_type_impl()
 {
-  static_assert(sizeof(T) == 2 || sizeof(T) == 4 || sizeof(T) == 8,
-                "Unsupported floating-point type for NVVM IR");
   if constexpr (sizeof(T) == 2) {
     return "half";
   } else if constexpr (sizeof(T) == 4) {

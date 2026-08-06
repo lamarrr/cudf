@@ -404,11 +404,11 @@ using handle = std::variant<
   std::unique_ptr<column_device_view, std::function<void(column_device_view*)>>,
   std::unique_ptr<mutable_column_device_view, std::function<void(mutable_column_device_view*)>>>;
 
-auto reflect(bool use_physical_types,
-             bool has_user_data,
+auto reflect(bool has_user_data,
              bool is_null_aware,
              std::span<transform_input const> inputs,
-             std::span<std::optional<int32_t>> table_sources)
+             std::span<std::optional<int32_t>> table_sources,
+             bool use_physical_types)
 {
   std::vector<std::string> in_types;
 
@@ -419,12 +419,15 @@ auto reflect(bool use_physical_types,
     auto element =
       std::visit([&](auto& c) { return reflect_input_element(c, use_physical_types); }, in);
     bool as_scalar = std::holds_alternative<scalar_column_view>(in);
-    auto accessor  = rtcx::reflect_template("cudf::jit::column_accessor",
+    // Scalar accessors always map to element zero, so they do not have a meaningful table source.
+    // Use the left-table slot as a valid placeholder for the filter kernel's index lookup.
+    auto table_index = as_scalar ? 0 : table_source.value();
+    auto accessor    = rtcx::reflect_template("cudf::jit::column_accessor",
                                            rtcx::reflect(i),
                                            column,
                                            element,
                                            rtcx::reflect(as_scalar),
-                                           rtcx::reflect(table_source.value()));
+                                           rtcx::reflect(table_index));
     in_types.push_back(accessor);
   }
 
@@ -510,7 +513,7 @@ kernel build(bool is_null_aware,
 {
   CUDF_FUNC_RANGE();
 
-  auto kernel_instance = reflect(false, is_null_aware, has_user_data, inputs, table_sources);
+  auto kernel_instance = reflect(is_null_aware, has_user_data, inputs, table_sources, false);
   return jit::get_udf_kernel(KERNEL_SOURCE_FILE,
                              kernel_instance,
                              udf.source,
@@ -527,7 +530,7 @@ kernel build(bool is_null_aware,
 {
   CUDF_FUNC_RANGE();
 
-  auto kernel_instance = reflect(true, is_null_aware, has_user_data, inputs, table_sources);
+  auto kernel_instance = reflect(is_null_aware, has_user_data, inputs, table_sources, true);
   auto signature       = reflect_udf_signature(is_null_aware, has_user_data, inputs, true);
 
   auto kernel_fragment =
@@ -858,8 +861,8 @@ filter_join_indices_jit(cudf::table_view const& left,
                         cudf::device_span<size_type const> left_indices,
                         cudf::device_span<size_type const> right_indices,
                         std::optional<void*> user_data,
-                        null_aware is_null_aware,
                         udf const& predicate_udf,
+                        null_aware is_null_aware,
                         cudf::join_kind join_kind,
                         std::optional<std::size_t> output_size,
                         rmm::cuda_stream_view stream,

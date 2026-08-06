@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "cudf/utilities/error.hpp"
+
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_wrapper.hpp>
 #include <cudf_test/debug_utilities.hpp>
@@ -452,8 +454,8 @@ struct MixedInnerJoinTest : public MixedJoinPairReturnTest<T> {
           cudf::device_span<cudf::size_type const>(*hash_join_result.first),
           cudf::device_span<cudf::size_type const>(*hash_join_result.second),
           std::nullopt,
-          cudf::null_aware::NO,
           cudf::cuda_udf{jit_predicate.c_str(), "predicate"},
+          cudf::null_aware::NO,
           cudf::join_kind::INNER_JOIN,
           std::nullopt);
         this->compare_join_results(mixed_result, jit_filter_result);
@@ -932,8 +934,8 @@ TEST_F(MixedInnerJoinTest2, InvalidJoinKind)
                                              left_span,
                                              right_span,
                                              std::nullopt,
-                                             cudf::null_aware::NO,
                                              cudf::cuda_udf{predicate_code.c_str(), "predicate"},
+                                             cudf::null_aware::NO,
                                              cudf::join_kind::LEFT_SEMI_JOIN,
                                              std::nullopt),
                std::invalid_argument);
@@ -968,8 +970,8 @@ TEST_F(MixedInnerJoinTest2, UnsupportedColumnType)
                                              span,
                                              span,
                                              std::nullopt,
-                                             cudf::null_aware::NO,
                                              cudf::cuda_udf{jit_pred.c_str(), "predicate"},
+                                             cudf::null_aware::NO,
                                              cudf::join_kind::INNER_JOIN,
                                              std::nullopt),
                std::invalid_argument);
@@ -980,8 +982,8 @@ TEST_F(MixedInnerJoinTest2, UnsupportedColumnType)
                                              span,
                                              span,
                                              std::nullopt,
-                                             cudf::null_aware::NO,
                                              cudf::cuda_udf{jit_pred.c_str(), "predicate"},
+                                             cudf::null_aware::NO,
                                              cudf::join_kind::INNER_JOIN,
                                              std::nullopt),
                std::invalid_argument);
@@ -1028,8 +1030,8 @@ TEST_F(MixedInnerJoinTest2, JitOnlyPredicate)
                                   cudf::device_span<cudf::size_type const>(*hash_result.first),
                                   cudf::device_span<cudf::size_type const>(*hash_result.second),
                                   std::nullopt,
-                                  cudf::null_aware::NO,
                                   cudf::cuda_udf{jit_pred.c_str(), "predicate"},
+                                  cudf::null_aware::NO,
                                   cudf::join_kind::INNER_JOIN,
                                   std::nullopt);
 
@@ -1145,8 +1147,8 @@ struct MixedLeftJoinTest : public MixedJoinPairReturnTest<T> {
           cudf::device_span<cudf::size_type const>(*hash_join_result.first),
           cudf::device_span<cudf::size_type const>(*hash_join_result.second),
           std::nullopt,
-          cudf::null_aware::NO,
           cudf::cuda_udf{jit_predicate.c_str(), "predicate"},
+          cudf::null_aware::NO,
           cudf::join_kind::LEFT_JOIN,
           std::nullopt);
         this->compare_join_results(mixed_result, jit_filter_result);

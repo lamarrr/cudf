@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -18,8 +18,8 @@ enum class init_flags : std::uint32_t {
   NONE = 0,
   /// @brief Load the nvCOMP library during initialization
   LOAD_NVCOMP = 1 << 0,
-  DEFAULT = NONE,
-  ALL = LOAD_NVCOMP
+  DEFAULT     = NONE,
+  ALL         = LOAD_NVCOMP
 };
 
 /// @brief Bitwise OR operator for init_flags

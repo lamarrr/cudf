@@ -123,8 +123,8 @@ rtcx::blob get_nvvm_fragment(std::string const& name, std::span<char const> ir);
  * @param argument_types NVVM UDF argument types
  */
 rtcx::blob get_udf_dispatcher_fragment(std::string const& symbol,
-                                  std::string const& return_type,
-                                  std::span<std::string const> argument_types);
+                                       std::string const& return_type,
+                                       std::span<std::string const> argument_types);
 
 /**
  * @brief Gets a kernel by linking together embedded binary fragments

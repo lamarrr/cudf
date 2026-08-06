@@ -524,14 +524,12 @@ bundle={}
 };
 
 rtcx::blob get_udf_dispatcher_fragment(std::string const& symbol,
-                                  std::string const& return_type,
-                                  std::span<std::string const> argument_types)
+                                       std::string const& return_type,
+                                       std::span<std::string const> argument_types)
 {
   CUDF_FUNC_RANGE();
 
-  int ir_major = 2;
-  int ir_minor = 0;
-  auto join    = [](auto const& values) {
+  auto join = [](auto const& values) {
     std::string result;
     for (auto const& value : values) {
       if (!result.empty()) { result += ", "; }
@@ -546,6 +544,8 @@ rtcx::blob get_udf_dispatcher_fragment(std::string const& symbol,
     arguments.push_back(std::format("{} %arg{}", argument_types[i], i));
   }
 
+  int const ir_major = 2;
+  int const ir_minor = 0;
   // This NVVM IR defines `cudf_udf_entry` as a typed forwarding function to the UDF symbol.
   auto ir = std::format(
     R"***(target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i128:128:128-f32:32:32-f64:64:64-v16:16:16-v32:32:32-v64:64:64-v128:128:128-n16:32:64"

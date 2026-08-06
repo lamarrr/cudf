@@ -1275,8 +1275,16 @@ find_library(
         "${CUDAToolkit_LIBRARY_ROOT}/nvvm/lib/x64" REQUIRED
 )
 cmake_path(GET libnvvm PARENT_PATH libnvvm_dir)
-set_property(TARGET cudf APPEND PROPERTY BUILD_RPATH "${libnvvm_dir}")
-set_property(TARGET cudf APPEND PROPERTY INSTALL_RPATH "\$ORIGIN/../nvvm/lib64")
+set_property(
+  TARGET cudf
+  APPEND
+  PROPERTY BUILD_RPATH "${libnvvm_dir}"
+)
+set_property(
+  TARGET cudf
+  APPEND
+  PROPERTY INSTALL_RPATH "\$ORIGIN/../nvvm/lib64"
+)
 target_include_directories(cudf PRIVATE "${CUDAToolkit_LIBRARY_ROOT}/nvvm/include")
 target_compile_definitions(cudf PRIVATE CUDF_STATIC_LINK_LIBNVVM=$<BOOL:${CUDF_STATIC_LINK_NVVM}>)
 

@@ -94,7 +94,7 @@ __device__ inline void    fdsf   (
 )***";
 
   auto data_init = [](cudf::size_type row) { return row % 3; };
-  test_udf<float>(data_init, 500, cudf::cuda_udf{cuda, "fsdf"});
+  test_udf<float>(data_init, 500, cudf::cuda_udf{cuda, "fdsf"});
   test_udf<float>(data_init, 500, cudf::lto_udf::ptx(ptx, "_ZN8__main__7add$241Ef"));
 }
 

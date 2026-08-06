@@ -190,7 +190,8 @@ struct element_type_name_fn {
     requires(!is_fixed_width<T>() && !std::same_as<T, cudf::string_view> &&
              !std::same_as<T, cudf::dictionary32>)
   {
-    CUDF_FAIL("Unsupported type for JIT compilation: " + type_to_name(view.type()));
+    CUDF_FAIL("Unsupported type for JIT compilation: " + type_to_name(view.type()),
+              std::invalid_argument);
   }
 };
 
@@ -279,7 +280,7 @@ struct nvvm_abi_type_name_fn {
     if constexpr (is_fixed_width<T>() || std::same_as<T, cudf::string_view>) {
       return reflect_nvvm_value_type<T>(use_optional);
     } else {
-      CUDF_FAIL("Unsupported type for JIT NVVM ABI reflection");
+      CUDF_FAIL("Unsupported type for JIT NVVM ABI reflection", std::invalid_argument);
     }
   }
 };

@@ -50,11 +50,11 @@ using handle        = std::variant<
 
 namespace kernels::transform {
 
-auto reflect(bool use_physical_types,
-             bool is_null_aware,
+auto reflect(bool is_null_aware,
              bool has_user_data,
              std::span<input_column_view const> inputs,
-             std::span<output_column const> outputs)
+             std::span<output_column const> outputs,
+             bool use_physical_types)
 {
   std::vector<std::string> in_types;
 
@@ -214,7 +214,7 @@ kernel build(bool is_null_aware,
              std::span<output_column const> outputs,
              cuda_udf const& udf)
 {
-  auto kernel_instance = reflect(false, is_null_aware, has_user_data, inputs, outputs);
+  auto kernel_instance = reflect(is_null_aware, has_user_data, inputs, outputs, false);
   return jit::get_udf_kernel(KERNEL_SOURCE_FILE,
                              kernel_instance,
                              udf.source,
@@ -258,7 +258,7 @@ dispatch_lto_kernel_fragment(bool is_null_aware,
   // the contract here is that CMake and this dispatch function agree on symbol mangling of the
   // reflected kernel name.
   auto target = strip_whitespace(
-    kernels::transform::reflect(true, is_null_aware, has_user_data, inputs, outputs));
+    kernels::transform::reflect(is_null_aware, has_user_data, inputs, outputs, true));
 
   for (size_t i = 0; i < std::size(cudf_fragments::transform_kernel_FILE_INDEX); i++) {
     auto file_index      = cudf_fragments::transform_kernel_FILE_INDEX[i];
@@ -284,7 +284,7 @@ kernel build(bool is_null_aware,
 
   auto precompiled_kernel_fragment =
     dispatch_lto_kernel_fragment(is_null_aware, has_user_data, inputs, outputs);
-  auto kernel_instance = reflect(true, is_null_aware, has_user_data, inputs, outputs);
+  auto kernel_instance = reflect(is_null_aware, has_user_data, inputs, outputs, true);
 
   std::span<uint8_t const> kernel_fragment;
   fragment_type kernel_fragment_binary_type = fragment_type::FATBIN;

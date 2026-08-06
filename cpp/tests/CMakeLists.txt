@@ -693,13 +693,7 @@ ConfigureTest(AST_TEST ast/transform_tests.cpp ast/ast_tree_tests.cpp ast/jit_ex
 # -------------------------------------------------------------------------------------
 rtcx_add_embed(cudf_test_fragments)
 
-add_fragment(
-  cudf_test_fragments
-  FRAGMENT
-  operators
-  SOURCES
-  transform/operator_fragment.cu
-)
+add_fragment(cudf_test_fragments FRAGMENT operators SOURCES transform/operator_fragment.cu)
 
 rtcx_embed(
   cudf_test_fragments COMPRESSION none OUTPUT_DIRECTORY "${CUDF_GENERATED_INCLUDE_DIR}/rtcx_embed"

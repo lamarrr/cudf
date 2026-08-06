@@ -36,9 +36,7 @@
                     // it. Each UDF will have a different operation_udf.cuh generated for it, so we
                     // need to put this pragma before including it to avoid PCH mismatch.
 
-// clang-format off
-#include <cudf/detail/dispatch.cuh>
-// clang-format on
+#include <cudf/detail/kernel_dispatch.cuh>
 
 namespace cudf {
 namespace binops {
