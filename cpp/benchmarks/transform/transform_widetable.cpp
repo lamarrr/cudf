@@ -18,10 +18,12 @@
 
 #include <nvbench/nvbench.cuh>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -72,9 +74,11 @@ void BM_ast_jit_wide_table(nvbench::state& state)
     return;
   }
 
-  auto input       = create_sequence_table(cycle_dtypes({cudf::type_id::INT32}, table_width),
+  auto input = create_sequence_table(cycle_dtypes({cudf::type_id::INT32}, table_width),
                                      row_count{rows_per_batch});
-  auto input_view  = input->view();
+
+  auto input_view = input->view();
+
   auto num_batches = total_rows / rows_per_batch;
 
   std::vector<cudf::numeric_scalar<int32_t>> scalars;
