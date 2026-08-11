@@ -287,8 +287,6 @@ std::unique_ptr<column> compute_column(
  * transform.
  *
  * @throws cudf::logic_error if passed an expression operating on table_reference::RIGHT.
- * @throws cudf::data_type_error if the expression applies a non-comparison binary operator to
- * decimal128 operands.
  * @throws cudf::evaluation_error if the evaluation of the expression results in an error during
  * execution.
  *
@@ -317,8 +315,6 @@ std::unique_ptr<column> compute_column_jit(
  *
  * @throws cudf::logic_error if passed an empty collection of expressions.
  * @throws cudf::logic_error if passed an expression operating on table_reference::RIGHT.
- * @throws cudf::data_type_error if the expression applies a non-comparison binary operator to
- * decimal128 operands.
  * @throws cudf::evaluation_error if the evaluation of the expression results in an error during
  * execution.
  *
