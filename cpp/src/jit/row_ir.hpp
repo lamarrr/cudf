@@ -116,8 +116,7 @@ struct [[nodiscard]] instance_context {
   std::vector<input> inputs_;                  ///< The inputs for the IR
   std::vector<var_info> input_vars_;           ///< The input variables for the IR
   std::vector<untyped_var_info> output_vars_;  ///< The output variables for the IR
-  std::unordered_multimap<size_t, node const*>
-    cse_nodes_;  ///< Nodes from completed outputs, indexed by structural hash
+  std::unordered_multimap<size_t, node const*> cse_nodes_;  ///< multimap of IR nodes
   rmm::cuda_stream_view
     stream_;  ///< The CUDA stream for any device operations during IR generation
   rmm::device_async_resource_ref
