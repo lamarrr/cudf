@@ -54,30 +54,30 @@ constexpr char parse_url_udf[] = R"***(
     range32 fragment;
   };
   // Parses the first URL candidate and records byte ranges for all six components.
-  auto const parse_url = [&](url_ranges* out) {
+  auto parse_url = [&](url_ranges* out) {
     *out = {};
-    auto const n = input.size_bytes();
-    auto const is_alpha = [](char c) {
+    auto n = input.size_bytes();
+    auto is_alpha = [](char c) {
       return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
     };
-    auto const is_digit = [](char c) { return c >= '0' && c <= '9'; };
-    auto const is_scheme_char = [&](char c) {
+    auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
+    auto is_scheme_char = [&](char c) {
       return is_alpha(c) || is_digit(c) || c == '+' || c == '-' || c == '.';
     };
-    auto const is_hex = [&](char c) {
+    auto is_hex = [&](char c) {
       return is_digit(c) || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f');
     };
-    auto const is_unreserved = [&](char c) {
+    auto is_unreserved = [&](char c) {
       return is_alpha(c) || is_digit(c) || c == '-' || c == '.' || c == '_' || c == '~';
     };
-    auto const is_sub_delim = [](char c) {
+    auto is_sub_delim = [](char c) {
       return c == '!' || c == '$' || c == '&' || c == '\'' || c == '(' || c == ')' || c == '*' ||
              c == '+' || c == ',' || c == ';' || c == '=';
     };
-    auto const is_gen_delim = [](char c) {
+    auto is_gen_delim = [](char c) {
       return c == ':' || c == '/' || c == '?' || c == '#' || c == '[' || c == ']' || c == '@';
     };
-    auto const is_context_delimiter = [](char c) {
+    auto is_context_delimiter = [](char c) {
       return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '"' || c == '<' ||
              c == '>';
     };
@@ -103,7 +103,7 @@ constexpr char parse_url_udf[] = R"***(
       }
     }
     for (auto i = url_begin; i < url_end; ++i) {
-      auto const c = input.data()[i];
+      auto c = input.data()[i];
       if (c == '%') {
         if (i + 2 >= url_end || !is_hex(input.data()[i + 1]) || !is_hex(input.data()[i + 2])) {
           return false;
@@ -128,12 +128,12 @@ constexpr char parse_url_udf[] = R"***(
         break;
       }
     }
-    auto const base_end = question < hash ? question : hash;
+    auto base_end = question < hash ? question : hash;
     out->protocol       = {url_begin, scheme_end};
     if (question < hash) { out->query = {question + 1, hash}; }
     if (hash < url_end) { out->fragment = {hash + 1, url_end}; }
 
-    auto const authority_begin = scheme_end + 3;
+    auto authority_begin = scheme_end + 3;
     auto authority_end         = base_end;
     for (auto i = authority_begin; i < base_end; ++i) {
       if (input.data()[i] == '/') {
@@ -218,8 +218,8 @@ __device__ int write_url_components(cuda::std::span<char>* protocol,
   range32 components[]     = {
     ranges.protocol, ranges.host, ranges.port, ranges.path, ranges.query, ranges.fragment};
   for (auto component = 0; component < 6; ++component) {
-    auto const range = components[component];
-    auto const size  = range.end - range.begin;
+    auto range = components[component];
+    auto size  = range.end - range.begin;
     if (size > 0) { memcpy(outputs[component]->data(), input.data() + range.begin, size); }
   }
   return 0;
@@ -227,16 +227,47 @@ __device__ int write_url_components(cuda::std::span<char>* protocol,
 )***";
 
 constexpr std::string_view usage =
-  "usage: url_log_transforms INPUT.csv OUTPUT.csv <regex|precompiled|jit|lto> ROWS ITERATIONS\n"
+  "usage: url_log_transforms INPUT.csv OUTPUT.csv <regex|precompiled> ROWS\n"
+  "       url_log_transforms INPUT.csv OUTPUT.csv <cuda-jit|lto-jit> ROWS "
+  "<--warm|--cold|--cold-warm-pch>\n"
   "       url_log_transforms <usage|--help>\n";
+
+// warmup the PCH cache
+void warmup_pch(cudf::column_view input,
+                rmm::cuda_stream_view stream,
+                rmm::device_async_resource_ref mr)
+{
+  constexpr char udf[]           = R"***(
+__device__ int transform(int32_t* output, cudf::string_view input) {
+  *output = input.size_bytes();
+  return 0;
+}
+)***";
+  cudf::transform_input inputs[] = {input};
+  cudf::transform_output const output{cudf::data_type{cudf::type_id::INT32},
+                                      cudf::output_nullability::ALL_VALID};
+  std::vector<cudf::transform_output> const outputs{output};
+  auto result = cudf::transform(udf,
+                                cudf::udf_source_type::CUDA,
+                                cudf::null_aware::NO,
+                                std::nullopt,
+                                inputs,
+                                outputs,
+                                {},
+                                std::nullopt,
+                                stream,
+                                mr);
+  stream.synchronize();
+}
 
 // Extracts RFC 3986-style hierarchical URI components from unstructured log lines.
 [[nodiscard]] std::unique_ptr<cudf::table> run_regex(cudf::column_view input,
                                                      rmm::cuda_stream_view stream,
                                                      rmm::device_async_resource_ref mr)
 {
-  // Derived from RFC 3986 Appendix B. The authority capture is expanded into optional
-  // userinfo plus host and port, and Appendix C delimiters bound the URI within a log line.
+  // Derived from RFC 3986 Appendix B (https://www.rfc-editor.org/info/rfc3986/#page-50). The
+  // authority capture is expanded into optional userinfo plus host and port, and Appendix C
+  // delimiters bound the URI within a log line.
   static auto program = cudf::strings::regex_program::create(
     R"((?:^|[^A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]*):\/\/(?:[^@\/?# \t\n\r"<>]*@)?(\[[^\]\/?# \t\n\r"<>]*\]|[^\/:?# \t\n\r"<>]*)(?::([0-9]*))?([^?# \t\n\r"<>]*)(?:\?([^# \t\n\r"<>]*))?(?:#([^ \t\n\r"<>]*))?(?:$|[ \t\n\r"<>]))");
   auto extracted = cudf::strings::extract(cudf::strings_column_view{input}, *program, stream, mr);
@@ -401,16 +432,16 @@ constexpr std::string_view usage =
                                 stream,
                                 mr);
   } else {
-    sizes = cudf::multi_transform(url_component_sizes_udf,
-                                  cudf::udf_source_type::CUDA,
-                                  cudf::null_aware::NO,
-                                  std::nullopt,
-                                  inputs,
-                                  size_outputs,
-                                  {},
-                                  std::nullopt,
-                                  stream,
-                                  mr);
+    sizes = cudf::transform(url_component_sizes_udf,
+                            cudf::udf_source_type::CUDA,
+                            cudf::null_aware::NO,
+                            std::nullopt,
+                            inputs,
+                            size_outputs,
+                            {},
+                            std::nullopt,
+                            stream,
+                            mr);
   }
 
   std::vector<std::unique_ptr<cudf::column>> offsets;
@@ -445,122 +476,177 @@ constexpr std::string_view usage =
                                stream,
                                mr);
   }
-  return cudf::multi_transform(url_component_output_udf,
-                               cudf::udf_source_type::CUDA,
-                               cudf::null_aware::NO,
-                               std::nullopt,
-                               inputs,
-                               outputs,
-                               std::move(offsets),
-                               std::nullopt,
-                               stream,
-                               mr);
+  return cudf::transform(url_component_output_udf,
+                         cudf::udf_source_type::CUDA,
+                         cudf::null_aware::NO,
+                         std::nullopt,
+                         inputs,
+                         outputs,
+                         std::move(offsets),
+                         std::nullopt,
+                         stream,
+                         mr);
 }
 
 }  // namespace
 
 int main(int argc, char const** argv)
-{
-  try {
-    if (argc == 2 &&
-        (std::string_view{argv[1]} == "--help" || std::string_view{argv[1]} == "usage")) {
-      std::cout << usage;
-      return EXIT_SUCCESS;
-    }
-    if (argc != 6) {
-      throw std::invalid_argument("invalid arguments; run url_log_transforms --help for usage");
-    }
-
-    auto input_path     = std::string{argv[1]};
-    auto output_path    = std::string{argv[2]};
-    auto implementation = std::string_view{argv[3]};
-    if (implementation != "regex" && implementation != "precompiled" && implementation != "jit" &&
-        implementation != "lto") {
-      throw std::invalid_argument("variant must be regex, precompiled, jit, or lto");
-    }
-    auto requested_rows = std::stoll(argv[4]);
-    auto iterations     = std::stoi(argv[5]);
-    if (requested_rows < 0 || requested_rows > std::numeric_limits<cudf::size_type>::max()) {
-      throw std::invalid_argument("ROWS is outside the cudf::size_type range");
-    }
-    if (iterations < 1) { throw std::invalid_argument("ITERATIONS must be positive"); }
-
-    auto rows         = static_cast<cudf::size_type>(requested_rows);
-    auto use_lto      = implementation == "lto";
-    auto stream       = cudf::get_default_stream();
-    auto mr           = cudf::get_current_device_resource_ref();
-    auto read_options = cudf::io::csv_reader_options::builder(cudf::io::source_info{input_path})
-                          .header(0)
-                          .use_cols_names({"LogLine"})
-                          .build();
-    auto input = cudf::io::read_csv(read_options).tbl;
-    if (rows != input->num_rows()) {
-      input = cudf::sample(input->view(), rows, cudf::sample_with_replacement::TRUE);
-    }
-
-    auto input_bytes = input->get_column(0).alloc_size();
-    auto input_view  = input->get_column(0).view();
-    rmm::mr::statistics_resource_adaptor stats{mr};
-    auto stats_mr      = rmm::device_async_resource_ref{stats};
-    auto run_transform = [&]() {
-      if (implementation == "regex") { return run_regex(input_view, stream, stats_mr); }
-      if (implementation == "precompiled") { return run_precompiled(input_view, stream, stats_mr); }
-      return run_jit(input_view, use_lto, stream, stats_mr);
-    };
-
-    stream.synchronize();
-    auto cold_start = std::chrono::steady_clock::now();
-    nvtxRangePush("url_log_cold");
-    auto cold_result = run_transform();
-    stream.synchronize();
-    nvtxRangePop();
-    auto cold_seconds =
-      std::chrono::duration<double>{std::chrono::steady_clock::now() - cold_start}.count();
-    cold_result.reset();
-
-    std::unique_ptr<cudf::table> result;
-    auto warm_start = std::chrono::steady_clock::now();
-    nvtxRangePush("url_log_warm");
-    for (auto i = 0; i < iterations; ++i) {
-      result.reset();
-      result = run_transform();
-    }
-    stream.synchronize();
-    nvtxRangePop();
-    auto warm_seconds =
-      std::chrono::duration<double>{std::chrono::steady_clock::now() - warm_start}.count() /
-      iterations;
-
-    if (output_path != "-") {
-      auto write_options =
-        cudf::io::csv_writer_options::builder(cudf::io::sink_info{output_path}, result->view())
-          .include_header(true)
-          .names({"protocol", "host", "port", "path", "query", "fragment"})
-          .build();
-      cudf::io::write_csv(write_options);
-    }
-
-    auto bytes        = stats.get_bytes_counter();
-    auto output_bytes = result->alloc_size();
-    auto gib          = static_cast<double>(input_bytes + output_bytes) / (1ULL << 30);
-    std::cout << std::format(
-      "variant={}\nrows={}\ncold_seconds={}\nwarm_seconds={}\nrows_per_second={}\neffective_gib_"
-      "per_second={}\ninput_bytes={}\noutput_bytes={}\npeak_memory_bytes={}\ntotal_allocated_bytes="
-      "{}\nallocated_bytes_per_call={}\n",
-      implementation,
-      rows,
-      cold_seconds,
-      warm_seconds,
-      static_cast<double>(rows) / warm_seconds,
-      gib / warm_seconds,
-      input_bytes,
-      output_bytes,
-      bytes.peak,
-      bytes.total,
-      bytes.total / static_cast<std::size_t>(iterations + 1));
+try {
+  if (argc == 2 &&
+      (std::string_view{argv[1]} == "--help" || std::string_view{argv[1]} == "usage")) {
+    std::cout << usage;
     return EXIT_SUCCESS;
-  } catch (std::exception const& error) {
-    std::cerr << error.what() << '\n';
-    return EXIT_FAILURE;
   }
+  if (argc != 5 && argc != 6) {
+    throw std::invalid_argument("invalid arguments; run url_log_transforms --help for usage");
+  }
+
+  auto input_path  = std::string{argv[1]};
+  auto output_path = std::string{argv[2]};
+  auto impl        = std::string_view{argv[3]};
+  if (impl != "regex" && impl != "precompiled" && impl != "cuda-jit" && impl != "lto-jit") {
+    throw std::invalid_argument("executor must be regex, precompiled, cuda-jit, or lto-jit");
+  }
+  auto requested_rows = std::stoll(argv[4]);
+  auto is_jit         = impl == "cuda-jit" || impl == "lto-jit";
+  if (is_jit && argc != 6) {
+    throw std::invalid_argument("cuda-jit and lto-jit require a warm-up control");
+  }
+  if (!is_jit && argc != 5) {
+    throw std::invalid_argument("regex and precompiled do not accept a warm-up control");
+  }
+  auto warmup_control = argc == 6 ? std::string_view{argv[5]} : std::string_view{"none"};
+  if (is_jit && warmup_control != "--warm" && warmup_control != "--cold" &&
+      warmup_control != "--cold-warm-pch") {
+    throw std::invalid_argument("warm-up control must be --warm, --cold, or --cold-warm-pch");
+  }
+  if (requested_rows < 0 || requested_rows > std::numeric_limits<cudf::size_type>::max()) {
+    throw std::invalid_argument("ROWS is outside the cudf::size_type range");
+  }
+  nvtxRangePush("url_log_process");
+  auto process_start = std::chrono::steady_clock::now();
+  auto rows          = static_cast<cudf::size_type>(requested_rows);
+  auto use_lto       = impl == "lto-jit";
+  auto stream        = cudf::get_default_stream();
+  auto upstream_mr   = cudf::get_current_device_resource_ref();
+  // Tracks setup, measured work, and output
+  rmm::mr::statistics_resource_adaptor whole_stats{upstream_mr};
+  auto whole_mr = rmm::device_async_resource_ref{whole_stats};
+  cudf::set_current_device_resource(whole_mr);
+
+  nvtxRangePush("url_log_setup");
+  auto read_options = cudf::io::csv_reader_options::builder(cudf::io::source_info{input_path})
+                        .header(0)
+                        .use_cols_names({"LogLine"})
+                        .build();
+  auto input = cudf::io::read_csv(read_options).tbl;
+  if (rows != input->num_rows()) {
+    input =
+      cudf::sample(input->view(), rows, cudf::sample_with_replacement::TRUE, 0, stream, whole_mr);
+  }
+  stream.synchronize();
+  auto input_view          = input->get_column(0).view();
+  auto logical_input_bytes = cudf::strings_column_view{input_view}.chars_size(stream);
+  nvtxRangePop();
+
+  // Tracks measured work; nested allocations also update whole_stats.
+  rmm::mr::statistics_resource_adaptor measured_stats{whole_mr};
+  auto measured_mr   = rmm::device_async_resource_ref{measured_stats};
+  auto run_transform = [&](rmm::device_async_resource_ref mr) {
+    if (impl == "regex") {
+      return run_regex(input_view, stream, mr);
+    } else if (impl == "precompiled") {
+      return run_precompiled(input_view, stream, mr);
+    } else {
+      return run_jit(input_view, use_lto, stream, mr);
+    }
+  };
+
+  std::unique_ptr<cudf::table> result;
+  auto warmup_duration = std::chrono::steady_clock::duration::zero();
+
+  if (warmup_control == "--cold-warm-pch") {
+    // Do not track warm-up allocations.
+    cudf::set_current_device_resource(upstream_mr);
+    nvtxRangePush("url_log_warmup");
+    warmup_pch(input_view, stream, upstream_mr);
+    nvtxRangePop();
+    cudf::set_current_device_resource(whole_mr);
+  } else if (warmup_control == "--warm") {
+    // Do not track warm-up allocations.
+    cudf::set_current_device_resource(upstream_mr);
+    stream.synchronize();
+    auto warmup_start = std::chrono::steady_clock::now();
+    nvtxRangePush("url_log_warmup");
+    result = run_transform(upstream_mr);
+    stream.synchronize();
+    nvtxRangePop();
+    warmup_duration = std::chrono::steady_clock::now() - warmup_start;
+    result.reset();
+    cudf::set_current_device_resource(whole_mr);
+  }
+
+  // Measured allocations update both statistics scopes.
+  cudf::set_current_device_resource(measured_mr);
+  stream.synchronize();
+  auto measured_start = std::chrono::steady_clock::now();
+  nvtxRangePush("url_log_measured");
+  result = run_transform(measured_mr);
+  stream.synchronize();
+  nvtxRangePop();
+  auto measured_duration = std::chrono::steady_clock::now() - measured_start;
+
+  if (output_path != "-") {
+    // Exclude output serialization from measured statistics.
+    cudf::set_current_device_resource(whole_mr);
+    auto write_options =
+      cudf::io::csv_writer_options::builder(cudf::io::sink_info{output_path}, result->view())
+        .include_header(true)
+        .names({"protocol", "host", "port", "path", "query", "fragment"})
+        .build();
+    cudf::io::write_csv(write_options);
+  }
+
+  // Read measured and broader workload scopes separately.
+  auto measured_bytes         = measured_stats.get_bytes_counter();
+  auto whole_bytes            = whole_stats.get_bytes_counter();
+  auto output_allocated_bytes = result->alloc_size();
+  auto input_gib      = static_cast<double>(logical_input_bytes) / static_cast<double>(1ULL << 30);
+  auto whole_duration = std::chrono::steady_clock::now() - process_start;
+  auto warmup_seconds = std::chrono::duration<double>{warmup_duration}.count();
+  auto measured_seconds = std::chrono::duration<double>{measured_duration}.count();
+  auto whole_seconds    = std::chrono::duration<double>{whole_duration}.count();
+  std::cout << std::format(
+    "executor={}\nwarmup_control={}\nrows={}\nwarmup_seconds={}\n"
+    "measured_cpu_wall_seconds={}\nrows_per_second={}\n"
+    "input_gib_per_second={}\nlogical_input_bytes={}\noutput_allocated_bytes={}\n"
+    "peak_memory_bytes={}\n"
+    "total_allocated_bytes={}\nallocated_bytes_per_call={}\nmeasured_gpu_peak_bytes={}\n"
+    "measured_gpu_allocation_volume_bytes={}\nwhole_workload_seconds={}\n"
+    "whole_gpu_peak_bytes={}\nwhole_gpu_allocation_volume_bytes={}\n",
+    impl,
+    warmup_control,
+    rows,
+    warmup_seconds,
+    measured_seconds,
+    static_cast<double>(rows) / measured_seconds,
+    input_gib / measured_seconds,
+    logical_input_bytes,
+    output_allocated_bytes,
+    measured_bytes.peak,
+    measured_bytes.total,
+    measured_bytes.total,
+    measured_bytes.peak,
+    measured_bytes.total,
+    whole_seconds,
+    whole_bytes.peak,
+    whole_bytes.total);
+  result.reset();
+  input.reset();
+  cudf::set_current_device_resource(upstream_mr);
+  nvtxRangePop();
+  return EXIT_SUCCESS;
+} catch (std::exception const& error) {
+  std::cerr << error.what() << '\n';
+  return EXIT_FAILURE;
 }
