@@ -16,6 +16,7 @@
 #include <array>
 #include <format>
 #include <iostream>
+#include <iterator>
 #include <numeric>
 #include <span>
 #include <stdexcept>
@@ -440,12 +441,13 @@ int32_t instance_context::add_input(input in)
 {
   if (auto* column = std::get_if<column_input>(&in);
       column != nullptr && column->table_source.has_value() && column->column_index.has_value()) {
-    for (size_t i = 0; i < inputs_.size(); ++i) {
-      auto* existing = std::get_if<column_input>(&inputs_[i]);
-      if (existing != nullptr && existing->table_source == column->table_source &&
-          existing->column_index == column->column_index) {
-        return static_cast<int32_t>(i);
-      }
+    auto existing = std::find_if(inputs_.cbegin(), inputs_.cend(), [&](auto const& input) {
+      auto* in = std::get_if<column_input>(&input);
+      return in != nullptr && in->table_source == column->table_source &&
+             in->column_index == column->column_index;
+    });
+    if (existing != inputs_.cend()) {
+      return static_cast<int32_t>(std::distance(inputs_.cbegin(), existing));
     }
   }
 
@@ -499,14 +501,18 @@ std::span<untyped_var_info const> instance_context::get_output_vars() const { re
 
 size_t node::compute_hash() const
 {
-  auto h = std::hash<int>{}(static_cast<int>(op_));
-  h = cudf::hashing::detail::hash_combine(h, std::hash<int>{}(static_cast<int>(error_policy_)));
+  auto h =
+    std::hash<std::underlying_type_t<opcode>>{}(static_cast<std::underlying_type_t<opcode>>(op_));
+  h = cudf::hashing::detail::hash_combine(
+    h,
+    std::hash<std::underlying_type_t<error_policy>>{}(
+      static_cast<std::underlying_type_t<error_policy>>(error_policy_)));
   h = cudf::hashing::detail::hash_combine(h, std::hash<size_t>{}(reference_.index()));
   std::visit(
     [&](auto& r) {
       using reference_type = std::decay_t<decltype(r)>;
       if constexpr (!std::is_same_v<reference_type, std::monostate>) {
-        h = cudf::hashing::detail::hash_combine(h, std::hash<int32_t>{}(r.index));
+        h = cudf::hashing::detail::hash_combine(h, std::hash<size_t>{}(r.index));
       }
     },
     reference_);
