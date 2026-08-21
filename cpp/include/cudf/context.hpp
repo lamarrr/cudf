@@ -66,9 +66,11 @@ constexpr bool has_flag(init_flags flags, init_flags flag) noexcept
 
 namespace detail {
 
-/// @brief Ensure the cudf global context is initialized. Only the first call to this function will have an effect, subsequent calls are no-ops.
-/// This function is thread-safe and can be called from multiple threads concurrently.
-/// It is intended for library advanced users who need to explicitly control the initialization order of the cuDF context. Most users should not need to call this function directly, as the context is automatically initialized when needed.
+/// @brief Ensure the cudf global context is initialized. Only the first call to this function will
+/// have an effect, subsequent calls are no-ops. This function is thread-safe and can be called from
+/// multiple threads concurrently. It is intended for library advanced users who need to explicitly
+/// control the initialization order of the cuDF context. Most users should not need to call this
+/// function directly, as the context is automatically initialized when needed.
 /// @param flags Optional flags controlling which components to initialize
 void initialize(init_flags flags = init_flags::DEFAULT);
 
