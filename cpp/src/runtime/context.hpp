@@ -62,9 +62,11 @@ class context {
   std::optional<int32_t> _nvjitlink_version;
 
  private:
-  void ensure_nvcomp_loaded();
+  void preload_nvcomp();
 
-  void ensure_jit_cache_initialized();
+  void initialize_jit();
+
+  void initialize_components(init_flags flags);
 
  public:
   context(context_config cfg = {}, init_flags flags = init_flags::DEFAULT);
@@ -91,13 +93,9 @@ class context {
   [[nodiscard]] std::optional<int32_t> nvrtc_version() const;
 
   [[nodiscard]] std::optional<int32_t> nvjitlink_version() const;
-
-  /// @brief Initialize additional components based on the provided flags
-  /// @param flags The initialization flags to process
-  void initialize_components(init_flags flags);
 };
 
 /// @brief Get the cuDF global context
-context& get_context();
+context& get_context(init_flags flags = init_flags::DEFAULT);
 
 }  // namespace cudf
