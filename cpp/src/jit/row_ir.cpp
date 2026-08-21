@@ -1027,7 +1027,6 @@ transform_args ast_converter::compute_table(
     auto view = std::visit([](auto& in) { return get_column_view(in); }, input);
     inputs.emplace_back(view);
 
-  
     if (auto* scalar = std::get_if<scalar_input>(&input)) {
       if (auto* c = std::get_if<std::unique_ptr<column>>(scalar)) {
         scalar_columns.emplace_back(std::move(*c));
