@@ -65,7 +65,7 @@ TEST_F(ContextTest, MultipleInitializeCallsMultiThreaded)
   auto init_task = [](size_t thread_id) {
     auto role = thread_id % 3;
     if (role == 0) {
-      EXPECT_NO_THROW(cudf::detail::initialize(cudf::init_flags::DEFAULT));
+      EXPECT_NO_THROW(cudf::detail::initialize(cudf::init_flags::NONE));
     } else if (role == 1) {
       EXPECT_NO_THROW(cudf::detail::initialize(cudf::init_flags::LOAD_NVCOMP));
     } else {

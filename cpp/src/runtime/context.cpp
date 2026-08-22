@@ -52,7 +52,6 @@ int32_t get_current_device_compute_capability()
 
 context::context(context_config cfg, init_flags flags)
   : _config{std::move(cfg)},
-    _jit_cache_init_flag{},
     _device_properties{
       get_driver_version(), get_runtime_version(), get_current_device_compute_capability()},
     _nvrtc_version{0},
@@ -132,7 +131,7 @@ std::optional<int32_t> context::nvjitlink_version() const { return _nvjitlink_ve
 void context::initialize_components(init_flags flags)
 {
   CUDF_FUNC_RANGE();
-  if (has_flag(flags, init_flags::LOAD_NVCOMP)) { io::detail::nvcomp::load_nvcomp_library(); }
+  if (has_flag(flags, init_flags::LOAD_NVCOMP)) { preload_nvcomp(); }
 }
 
 namespace {

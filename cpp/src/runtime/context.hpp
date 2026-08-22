@@ -9,7 +9,6 @@
 #include <cudf/utilities/export.hpp>
 
 #include <memory>
-#include <mutex>
 #include <optional>
 
 namespace rtcx {
@@ -54,7 +53,6 @@ class context {
 
  private:
   context_config _config;
-  std::once_flag _jit_cache_init_flag;
   std::unique_ptr<rtcx::cache_t> _rtcx_cache;
   std::unique_ptr<jit_bundle_t> _jit_bundle;
   device_properties _device_properties;
