@@ -11,8 +11,10 @@
 #include <cudf/utilities/export.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
+#include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <variant>
 #include <vector>
 
@@ -74,7 +76,7 @@ struct transform_output {
   null_aware is_null_aware          = null_aware::NO,
   std::optional<size_type> row_size = std::nullopt,
   output_nullability null_policy    = output_nullability::PRESERVE,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
@@ -289,7 +291,7 @@ std::unique_ptr<table> transform(
   std::span<transform_output const> outputs,
   std::vector<std::unique_ptr<column>>&& string_offsets,
   std::optional<size_type> row_size,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
@@ -319,7 +321,7 @@ std::unique_ptr<table> transform(
   std::span<transform_output const> outputs,
   std::vector<std::unique_ptr<column>>&& string_offsets,
   std::optional<size_type> row_size,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
@@ -377,7 +379,7 @@ std::unique_ptr<table> transform_lto(
   std::span<transform_output const> outputs,
   std::vector<std::unique_ptr<column>>&& string_offsets,
   std::optional<size_type> row_size,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
@@ -396,7 +398,7 @@ std::unique_ptr<table> transform_lto(
  */
 [[deprecated]] std::pair<std::unique_ptr<rmm::device_buffer>, size_type> nans_to_nulls(
   column_view const& input,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
@@ -412,7 +414,7 @@ std::unique_ptr<table> transform_lto(
  */
 std::unique_ptr<column> column_nans_to_nulls(
   column_view const& input,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
@@ -436,7 +438,7 @@ std::unique_ptr<column> column_nans_to_nulls(
 std::unique_ptr<column> compute_column(
   table_view const& table,
   ast::expression const& expr,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
@@ -447,8 +449,6 @@ std::unique_ptr<column> compute_column(
  * transform.
  *
  * @throws cudf::logic_error if passed an expression operating on table_reference::RIGHT.
- * @throws cudf::data_type_error if the expression applies a non-comparison binary operator to
- * decimal128 operands.
  * @throws cudf::evaluation_error if the evaluation of the expression results in an error during
  * execution.
  *
@@ -461,6 +461,34 @@ std::unique_ptr<column> compute_column(
 std::unique_ptr<column> compute_column_jit(
   table_view const& table,
   ast::expression const& expr,
+  cuda::stream_ref stream           = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+/**
+ * @brief Compute a new table by evaluating expression trees on a table using a JIT-compiled
+ * kernel.
+ *
+ * This evaluates expressions over a table to produce a new table. Also called an n-ary
+ * transform. Expressions are evaluated in the order supplied, and output column `i` contains the
+ * result of `expressions[i]`. Common subexpressions shared by multiple outputs are evaluated once
+ * by the generated function.
+ *
+ * @pre `expressions` must not be empty.
+ *
+ * @throws cudf::logic_error if passed an empty collection of expressions.
+ * @throws cudf::logic_error if passed an expression operating on table_reference::RIGHT.
+ * @throws cudf::evaluation_error if the evaluation of the expression results in an error during
+ * execution.
+ *
+ * @param table The table used for expression evaluation
+ * @param expressions Non-empty collection of expression-tree roots, one per output column
+ * @param stream CUDA stream used for device memory operations and kernel launches
+ * @param mr Device memory resource
+ * @return Table containing one output column per expression, in the same order as `expressions`
+ */
+std::unique_ptr<table> compute_table_jit(
+  table_view const& table,
+  std::span<std::reference_wrapper<ast::expression const> const> expressions,
   rmm::cuda_stream_view stream      = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
@@ -482,7 +510,7 @@ std::unique_ptr<column> compute_column_jit(
  */
 std::pair<std::unique_ptr<rmm::device_buffer>, cudf::size_type> bools_to_mask(
   column_view const& input,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
@@ -512,7 +540,7 @@ std::pair<std::unique_ptr<rmm::device_buffer>, cudf::size_type> bools_to_mask(
  */
 std::pair<std::unique_ptr<cudf::table>, std::unique_ptr<cudf::column>> encode(
   cudf::table_view const& input,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
@@ -546,7 +574,7 @@ std::pair<std::unique_ptr<cudf::table>, std::unique_ptr<cudf::column>> encode(
 std::pair<std::unique_ptr<column>, table_view> one_hot_encode(
   column_view const& input,
   column_view const& categories,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
@@ -575,7 +603,7 @@ std::unique_ptr<column> mask_to_bools(
   bitmask_type const* bitmask,
   size_type begin_bit,
   size_type end_bit,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
@@ -606,7 +634,7 @@ std::unique_ptr<column> mask_to_bools(
  */
 std::unique_ptr<column> row_bit_count(
   table_view const& t,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
@@ -631,7 +659,7 @@ std::unique_ptr<column> row_bit_count(
 std::unique_ptr<column> segmented_row_bit_count(
   table_view const& t,
   size_type segment_length,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /** @} */  // end of group
