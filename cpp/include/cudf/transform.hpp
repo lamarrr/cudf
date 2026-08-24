@@ -88,8 +88,10 @@ struct transform_output {
  * distinguished.
  */
 struct transform_input_spec {
-  type_id type   = type_id::EMPTY;  ///< Logical type of the input
-  bool is_scalar = false;           ///< Whether the input is presented to the UDF as a scalar
+  type_id type = type_id::EMPTY;  ///< Logical type of the input
+
+  bool is_scalar = false;  ///< Whether the input is presented to the UDF as a scalar
+
   std::vector<transform_input_spec> children =
     {};  ///< Specifications of dictionary children or string offsets
 };
@@ -103,8 +105,10 @@ struct transform_input_spec {
  */
 struct transform_output_spec {
   type_id type = type_id::EMPTY;  ///< Logical type of the output
+
   output_nullability nullability =
-    output_nullability::PRESERVE;   ///< Null-mask policy for the output
+    output_nullability::PRESERVE;  ///< Null-mask policy for the output
+
   bool has_string_offsets = false;  ///< Whether a string output uses preallocated offsets
   std::vector<transform_output_spec> children =
     {};  ///< Specifications of string offsets or nested child columns
@@ -116,6 +120,11 @@ struct transform_output_spec {
  * Construction retrieves the kernel for the UDF and the supplied input and output specifications.
  * Subsequent calls to `run` reuse that kernel and otherwise follow the regular `transform`
  * execution path. Runtime inputs and outputs must match the specifications used at construction.
+ *
+ * @note The compatibility requirement of `transform_program` is that the runtime inputs and outputs
+ * must have the same type, nullability, and string-offset representation as the specifications used
+ * to construct the program. The actual column sizes and null counts may differ.
+ *
  */
 struct transform_program {
  private:
