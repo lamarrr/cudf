@@ -1283,6 +1283,7 @@ std::unique_ptr<column> compute_column_jit(table_view const& table,
                                            cuda::stream_ref stream,
                                            rmm::device_async_resource_ref mr)
 {
+  CUDF_FUNC_RANGE();
   std::array<std::reference_wrapper<ast::expression const>, 1> expressions{expr};
   auto args = detail::row_ir::ast_converter::compute_table(
     detail::row_ir::target::CUDA, expressions, table, {}, "compute_operation", stream, mr);
@@ -1306,6 +1307,7 @@ std::unique_ptr<table> compute_table_jit(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr)
 {
+  CUDF_FUNC_RANGE();
   auto args = detail::row_ir::ast_converter::compute_table(
     detail::row_ir::target::CUDA, expressions, table, {}, "compute_operation", stream, mr);
   return transform(args.udf,
@@ -1491,6 +1493,7 @@ transform_program::transform_program(std::string const& udf,
                                      std::span<transform_input_spec const> inputs,
                                      std::span<transform_output_spec const> outputs)
 {
+  CUDF_FUNC_RANGE();
   impl_ =
     std::make_unique<impl>(udf,
                            source_type,
@@ -1506,6 +1509,7 @@ transform_program::transform_program(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr)
 {
+  CUDF_FUNC_RANGE();
   auto args = detail::row_ir::ast_converter::compute_table(
     detail::row_ir::target::CUDA, expressions, table, {}, "compute_operation", stream, mr);
   impl_ =
@@ -1557,6 +1561,7 @@ std::unique_ptr<table> transform_program::run(table_view const& table,
                                               rmm::cuda_stream_view stream,
                                               rmm::device_async_resource_ref mr)
 {
+  CUDF_FUNC_RANGE();
   CUDF_EXPECTS(impl_->ast_input_column_indices_.has_value(),
                "Transform program was not constructed from an AST expression",
                std::invalid_argument);

@@ -118,45 +118,6 @@ static void BM_ast_transform(nvbench::state& state)
     mem_stats_logger.peak_memory_usage(), "peak_memory_usage", "peak_memory_usage");
 }
 
-static void BM_ast_transform_dispatch(nvbench::state& state)
-{
-  auto const num_rows         = static_cast<cudf::size_type>(state.get_int64("num_rows"));
-  auto const expression_depth = static_cast<cudf::size_type>(state.get_int64("expression_depth"));
-  auto const api              = state.get_string("api");
-  auto source_table =
-    create_sequence_table({cudf::type_id::INT32}, row_count{num_rows}, std::nullopt);
-  auto const table = source_table->view();
-
-  cudf::ast::tree tree;
-  tree.push(cudf::ast::column_reference{0});
-  tree.push(cudf::ast::operation{cudf::ast::ast_operator::ADD, tree.at(0), tree.at(0)});
-  for (cudf::size_type level = 1; level < expression_depth; ++level) {
-    tree.push(cudf::ast::operation{cudf::ast::ast_operator::ADD, tree.back(), tree.at(0)});
-  }
-  auto const& expression = tree.back();
-
-  std::unique_ptr<cudf::transform_program> program;
-  if (api == "transform_program") {
-    std::reference_wrapper<cudf::ast::expression const> expressions[] = {expression};
-    program = std::make_unique<cudf::transform_program>(table, expressions);
-  } else {
-    // Populate the JIT cache before timing, matching transform_program construction.
-    cudf::compute_column_jit(table, expression);
-  }
-
-  state.add_global_memory_reads<int32_t>(static_cast<std::size_t>(num_rows) *
-                                         (expression_depth + 1));
-  state.add_global_memory_writes<int32_t>(num_rows);
-
-  state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
-    if (program) {
-      program->run(table, launch.get_stream().get_stream());
-    } else {
-      cudf::compute_column_jit(table, expression, launch.get_stream().get_stream());
-    }
-  });
-}
-
 template <cudf::ast::ast_operator cmp_op, cudf::ast::ast_operator reduce_op>
 static void BM_string_compare_ast_transform(nvbench::state& state)
 {
@@ -277,9 +238,3 @@ AST_TRANSFORM_BENCHMARK_DEFINE(
 AST_STRING_COMPARE_TRANSFORM_BENCHMARK_DEFINE(ast_string_equal_logical_and,
                                               cudf::ast::ast_operator::EQUAL,
                                               cudf::ast::ast_operator::LOGICAL_AND);
-
-NVBENCH_BENCH(BM_ast_transform_dispatch)
-  .set_name("ast_transform_dispatch")
-  .add_string_axis("api", {"compute_column_jit", "transform_program"})
-  .add_int64_axis("expression_depth", {1, 5, 10})
-  .add_int64_axis("num_rows", {1, 1'000, 100'000, 1'000'000});
