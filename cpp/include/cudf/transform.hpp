@@ -118,12 +118,8 @@ struct transform_output_spec {
  * @brief A reusable transform program that retains a JIT-compiled kernel.
  *
  * Construction retrieves the kernel for the UDF and the supplied input and output specifications.
- * Subsequent calls to `run` reuse that kernel and otherwise follow the regular `transform`
- * execution path. Runtime inputs and outputs must match the specifications used at construction.
- *
- * @note The compatibility requirement of `transform_program` is that the runtime inputs and outputs
- * must have the same type, nullability, and string-offset representation as the specifications used
- * to construct the program. The actual column sizes and null counts may differ.
+ * Subsequent calls to `run` reuse that kernel.
+ * Runtime inputs and outputs must be compatible with the specifications used at construction.
  *
  */
 struct transform_program {
@@ -216,12 +212,8 @@ struct transform_program {
   /**
    * @brief Runs the transform program on the given inputs and outputs.
    *
-   * @warning The transform program must have a matching set of input and output specifications as
-   * the inputs and outputs provided to this function.
-   *
-   * @throws std::invalid_argument if the inputs, outputs, or string offsets do not match the
-   * specifications used to construct the program
-   * @throws std::logic_error if this is a moved-from program
+   * @throws std::invalid_argument if the inputs, outputs, or string offsets are not compatible with
+   * the specifications used to construct the program
    *
    * @param inputs The inputs to the transform program
    * @param outputs The outputs of the transform program
@@ -245,11 +237,8 @@ struct transform_program {
   /**
    * @brief Evaluates the AST expressions used to construct this program on a table.
    *
-   * @warning The input table must have types and nullability compatible with the table used during
-   * construction.
-   *
-   * @throws std::invalid_argument if this program was not constructed from an AST expression or
-   * if the table is incompatible with the program
+   * @throws std::invalid_argument if the table is not compatible with the specifications used to
+   * construct the program
    *
    * @param table The table used for expression evaluation
    * @param stream CUDA stream used for device memory operations and kernel launches
