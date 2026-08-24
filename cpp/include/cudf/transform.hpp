@@ -187,26 +187,37 @@ struct transform_program {
    * retained by the program, while column inputs are rebound to the table passed to `run`.
    *
    * @param table A table whose schema is used to lower the expression and retrieve its kernel
-   * @param expr The root of the expression tree
+   * @param expressions The AST expressions to lower and construct the program from
    * @param stream CUDA stream used for device memory operations during construction
    * @param mr Device memory resource used for device memory allocations during construction
    */
   transform_program(table_view const& table,
-                    ast::expression const& expr,
+                    std::span<std::reference_wrapper<ast::expression const> const> expressions,
                     rmm::cuda_stream_view stream      = cudf::get_default_stream(),
                     rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
-  transform_program(transform_program const&) = delete;             ///< Deleted copy constructor
-  transform_program(transform_program&&);                           ///< Move constructor
+  /**
+   * @brief Move constructor for transform_program
+   * @param other The transform_program to move from
+   */
+  transform_program(transform_program&& other);
+
+  /**
+   * @brief Move assignment operator for transform_program
+   * @param other The transform_program to move from
+   * @return A reference to the current transform_program
+   */
+  transform_program& operator=(transform_program&& other);
+
+  transform_program(transform_program const&)            = delete;  ///< Deleted copy constructor
   transform_program& operator=(transform_program const&) = delete;  ///< Deleted copy assignment
-  transform_program& operator=(transform_program&&);                ///< Move assignment operator
   ~transform_program();                                             ///< Destructor
 
   /**
    * @brief Runs the transform program on the given inputs and outputs.
    *
-   * The transform program must have a matching set of input and output specifications as the inputs
-   * and outputs provided to this function.
+   * @warning The transform program must have a matching set of input and output specifications as
+   * the inputs and outputs provided to this function.
    *
    * @throws std::invalid_argument if the inputs, outputs, or string offsets do not match the
    * specifications used to construct the program
@@ -232,19 +243,20 @@ struct transform_program {
     rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
   /**
-   * @brief Evaluates the AST expression used to construct this program on a table.
+   * @brief Evaluates the AST expressions used to construct this program on a table.
    *
-   * The input table must have types compatible with the table used during construction.
+   * @warning The input table must have types and nullability compatible with the table used during
+   * construction.
    *
    * @throws std::invalid_argument if this program was not constructed from an AST expression or
-   * if the referenced input columns are incompatible with the program
+   * if the table is incompatible with the program
    *
    * @param table The table used for expression evaluation
    * @param stream CUDA stream used for device memory operations and kernel launches
    * @param mr Device memory resource used to allocate the returned column device memory
-   * @return The column resulting from evaluating the expression
+   * @return The table resulting from evaluating the expression
    */
-  std::unique_ptr<column> run(
+  std::unique_ptr<table> run(
     table_view const& table,
     rmm::cuda_stream_view stream      = cudf::get_default_stream(),
     rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());

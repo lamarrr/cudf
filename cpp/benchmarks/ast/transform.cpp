@@ -137,7 +137,8 @@ static void BM_ast_transform_dispatch(nvbench::state& state)
 
   std::unique_ptr<cudf::transform_program> program;
   if (api == "transform_program") {
-    program = std::make_unique<cudf::transform_program>(table, expression);
+    std::reference_wrapper<cudf::ast::expression const> expressions[] = {expression};
+    program = std::make_unique<cudf::transform_program>(table, expressions);
   } else {
     // Populate the JIT cache before timing, matching transform_program construction.
     cudf::compute_column_jit(table, expression);

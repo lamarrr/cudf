@@ -1500,13 +1500,14 @@ transform_program::transform_program(std::string const& udf,
                            std::vector<transform_output_spec>{outputs.begin(), outputs.end()});
 }
 
-transform_program::transform_program(table_view const& table,
-                                     ast::expression const& expr,
-                                     rmm::cuda_stream_view stream,
-                                     rmm::device_async_resource_ref mr)
+transform_program::transform_program(
+  table_view const& table,
+  std::span<std::reference_wrapper<ast::expression const> const> expressions,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
 {
-  auto args = detail::row_ir::ast_converter::compute_column(
-    detail::row_ir::target::CUDA, expr, table, {}, "compute_operation", stream, mr);
+  auto args = detail::row_ir::ast_converter::compute_table(
+    detail::row_ir::target::CUDA, expressions, table, {}, "compute_operation", stream, mr);
   impl_ =
     std::make_unique<impl>(args.udf,
                            args.source_type,
@@ -1552,9 +1553,9 @@ std::unique_ptr<table> transform_program::run(std::span<transform_input const> i
                            mr);
 }
 
-std::unique_ptr<column> transform_program::run(table_view const& table,
-                                               rmm::cuda_stream_view stream,
-                                               rmm::device_async_resource_ref mr)
+std::unique_ptr<table> transform_program::run(table_view const& table,
+                                              rmm::cuda_stream_view stream,
+                                              rmm::device_async_resource_ref mr)
 {
   CUDF_EXPECTS(impl_->ast_input_column_indices_.has_value(),
                "Transform program was not constructed from an AST expression",
@@ -1575,9 +1576,7 @@ std::unique_ptr<column> transform_program::run(table_view const& table,
       inputs.emplace_back(scalar_column_view{impl_->ast_scalar_columns_[scalar_index++]->view()});
     }
   }
-  auto result  = run(inputs, impl_->ast_outputs_, {}, table.num_rows(), stream, mr);
-  auto columns = result->release();
-  return std::move(columns.front());
+  return run(inputs, impl_->ast_outputs_, {}, table.num_rows(), stream, mr);
 }
 
 }  // namespace cudf
