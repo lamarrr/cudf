@@ -181,6 +181,7 @@ set(CUDF_CXX_FLAGS "")
 set(CUDF_CUDA_FLAGS "")
 set(CUDF_CXX_DEFINITIONS "")
 set(CUDF_CUDA_DEFINITIONS "")
+set(CUDF_LTO_ARCHITECTURE 75)
 
 # For now, disable CMake's automatic module scanning for C++ files. There is an sccache bug in the
 # version RAPIDS uses in CI that causes it to handle the resulting -M* flags incorrectly with
@@ -430,6 +431,9 @@ if(NOT BUILD_SHARED_LIBS)
     install(TARGETS conda_env EXPORT cudf-exports)
   endif()
 endif()
+
+# ##################################################################################################
+# * JIT embedding ----------------------------------------------------------------------------------
 
 rtcx_add_embed(cudf_cuda_embed)
 
@@ -1218,8 +1222,10 @@ target_include_directories(
 )
 
 target_compile_definitions(
-  cudf PUBLIC "$<$<COMPILE_LANGUAGE:CXX>:${CUDF_CXX_DEFINITIONS}>"
-              "$<BUILD_INTERFACE:$<$<COMPILE_LANGUAGE:CUDA>:${CUDF_CUDA_DEFINITIONS}>>"
+  cudf
+  PUBLIC "$<$<COMPILE_LANGUAGE:CXX>:${CUDF_CXX_DEFINITIONS}>"
+         "$<BUILD_INTERFACE:$<$<COMPILE_LANGUAGE:CUDA>:${CUDF_CUDA_DEFINITIONS}>>"
+         "CUDF_LTO_ARCHITECTURE=${CUDF_LTO_ARCHITECTURE}"
 )
 
 # Per-thread default stream
