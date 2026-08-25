@@ -591,7 +591,7 @@ void run(bool is_null_aware,
          int32_t* d_max_error,
          std::string const& udf,
          udf_source_type source_type,
-         rmm::cuda_stream_view stream,
+         cuda::stream_ref stream,
          rmm::device_async_resource_ref mr)
 {
   auto kernel = get_kernel(is_null_aware, has_user_data, inputs, outputs, udf, source_type);
@@ -610,7 +610,7 @@ void run(kernel const& kernel,
          std::span<input_column_view const> inputs,
          std::span<output_column const> outputs,
          int32_t* d_max_error,
-         rmm::cuda_stream_view stream,
+         cuda::stream_ref stream,
          rmm::device_async_resource_ref mr)
 {
   auto [cols, handles] = to_args(inputs, outputs, stream, mr);
@@ -1304,7 +1304,7 @@ std::unique_ptr<column> compute_column_jit(table_view const& table,
 std::unique_ptr<table> compute_table_jit(
   table_view const& table,
   std::span<std::reference_wrapper<ast::expression const> const> expressions,
-  rmm::cuda_stream_view stream,
+  cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
@@ -1506,7 +1506,7 @@ transform_program::transform_program(std::string const& udf,
 transform_program::transform_program(
   table_view const& table,
   std::span<std::reference_wrapper<ast::expression const> const> expressions,
-  rmm::cuda_stream_view stream,
+  cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
@@ -1537,7 +1537,7 @@ std::unique_ptr<table> transform_program::run(std::span<transform_input const> i
                                               std::span<transform_output const> outputs,
                                               std::vector<std::unique_ptr<column>>&& string_offsets,
                                               std::optional<size_type> row_size,
-                                              rmm::cuda_stream_view stream,
+                                              cuda::stream_ref stream,
                                               rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
@@ -1558,7 +1558,7 @@ std::unique_ptr<table> transform_program::run(std::span<transform_input const> i
 }
 
 std::unique_ptr<table> transform_program::run(table_view const& table,
-                                              rmm::cuda_stream_view stream,
+                                              cuda::stream_ref stream,
                                               rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();

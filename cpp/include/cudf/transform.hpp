@@ -189,7 +189,7 @@ struct transform_program {
    */
   transform_program(table_view const& table,
                     std::span<std::reference_wrapper<ast::expression const> const> expressions,
-                    rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+                    cuda::stream_ref stream           = cudf::get_default_stream(),
                     rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
   /**
@@ -231,7 +231,7 @@ struct transform_program {
     std::span<transform_output const> outputs,
     std::vector<std::unique_ptr<column>>&& string_offsets,
     std::optional<size_type> row_size,
-    rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+    cuda::stream_ref stream           = cudf::get_default_stream(),
     rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
   /**
@@ -247,7 +247,7 @@ struct transform_program {
    */
   std::unique_ptr<table> run(
     table_view const& table,
-    rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+    cuda::stream_ref stream           = cudf::get_default_stream(),
     rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 };
 
@@ -499,7 +499,7 @@ std::unique_ptr<column> compute_column_jit(
 std::unique_ptr<table> compute_table_jit(
   table_view const& table,
   std::span<std::reference_wrapper<ast::expression const> const> expressions,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**

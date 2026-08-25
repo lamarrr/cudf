@@ -101,8 +101,7 @@ void BM_transform_dispatch(nvbench::state& state)
     }
   }
 
-  state.add_global_memory_reads<int32_t>(static_cast<std::size_t>(num_rows) *
-                                         (expression_depth + 1));
+  state.add_global_memory_reads<int32_t>(static_cast<std::size_t>(num_rows));
   state.add_global_memory_writes<int32_t>(num_rows);
 
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
