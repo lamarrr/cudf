@@ -19,7 +19,7 @@ enum class init_flags : std::uint32_t {
   /// @brief Load the nvCOMP library during initialization
   LOAD_NVCOMP = 1 << 0,
   /// @brief Default initialization steps
-  DEFAULT = LOAD_NVCOMP,
+  DEFAULT = NONE,
   /// @brief All initialization steps
   ALL = LOAD_NVCOMP
 };
