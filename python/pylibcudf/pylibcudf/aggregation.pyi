@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 from enum import IntEnum
@@ -99,7 +99,6 @@ def collect_set(
     nulls_equal: NullEquality = NullEquality.EQUAL,
     nans_equal: NanEquality = NanEquality.ALL_EQUAL,
 ) -> Aggregation: ...
-def udf(operation: str, output_type: DataType) -> Aggregation: ...
 def correlation(type: CorrelationType, min_periods: int) -> Aggregation: ...
 def covariance(min_periods: int, ddof: int) -> Aggregation: ...
 def rank(
