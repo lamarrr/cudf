@@ -18,10 +18,10 @@ struct ContextTest : public cudf::test::BaseFixture {};
 
 TEST_F(ContextTest, MultipleInitializeCalls)
 {
-  cudf::detail::initialize(cudf::init_flags::DEFAULT);
+  cudf::detail::initialize(cudf::detail::init_flags::DEFAULT);
 
-  EXPECT_NO_THROW(cudf::detail::initialize(cudf::init_flags::LOAD_NVCOMP));
-  EXPECT_NO_THROW(cudf::detail::initialize(cudf::init_flags::ALL));
+  EXPECT_NO_THROW(cudf::detail::initialize(cudf::detail::init_flags::LOAD_NVCOMP));
+  EXPECT_NO_THROW(cudf::detail::initialize(cudf::detail::init_flags::ALL));
 }
 
 TEST_F(ContextTest, JitCacheUse)
@@ -38,10 +38,10 @@ TEST_F(ContextTest, JitCacheUse)
     EXPECT_EQ(result->size(), cudf::size_type{4});
   };
 
-  cudf::detail::initialize(cudf::init_flags::DEFAULT);
+  cudf::detail::initialize(cudf::detail::init_flags::DEFAULT);
   ASSERT_NO_THROW(compute_column());
 
-  cudf::detail::initialize(cudf::init_flags::DEFAULT);
+  cudf::detail::initialize(cudf::detail::init_flags::DEFAULT);
   ASSERT_NO_THROW(compute_column());
 }
 
@@ -65,11 +65,11 @@ TEST_F(ContextTest, MultipleInitializeCallsMultiThreaded)
   auto init_task = [](size_t thread_id) {
     auto role = thread_id % 3;
     if (role == 0) {
-      EXPECT_NO_THROW(cudf::detail::initialize(cudf::init_flags::NONE));
+      EXPECT_NO_THROW(cudf::detail::initialize(cudf::detail::init_flags::NONE));
     } else if (role == 1) {
-      EXPECT_NO_THROW(cudf::detail::initialize(cudf::init_flags::LOAD_NVCOMP));
+      EXPECT_NO_THROW(cudf::detail::initialize(cudf::detail::init_flags::LOAD_NVCOMP));
     } else {
-      EXPECT_NO_THROW(cudf::detail::initialize(cudf::init_flags::ALL));
+      EXPECT_NO_THROW(cudf::detail::initialize(cudf::detail::init_flags::ALL));
     }
   };
   EXPECT_NO_FATAL_FAILURE(run_multithreaded(init_task));

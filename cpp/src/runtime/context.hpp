@@ -64,10 +64,10 @@ class context {
 
   void initialize_jit();
 
-  void initialize_components(init_flags flags);
+  void initialize_components(detail::init_flags flags);
 
  public:
-  context(context_config cfg = {}, init_flags flags = init_flags::DEFAULT);
+  context(context_config cfg = {}, detail::init_flags flags = detail::init_flags::DEFAULT);
   context(context const&)            = delete;
   context& operator=(context const&) = delete;
   context(context&&)                 = delete;
@@ -94,6 +94,6 @@ class context {
 };
 
 /// @brief Get the cuDF global context
-context& get_context(init_flags flags = init_flags::DEFAULT);
+context& get_context(detail::init_flags flags = detail::init_flags::DEFAULT);
 
 }  // namespace cudf

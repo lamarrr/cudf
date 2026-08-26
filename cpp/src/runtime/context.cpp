@@ -50,7 +50,7 @@ int32_t get_current_device_compute_capability()
 
 }  // namespace
 
-context::context(context_config cfg, init_flags flags)
+context::context(context_config cfg, detail::init_flags flags)
   : _config{std::move(cfg)},
     _device_properties{
       get_driver_version(), get_runtime_version(), get_current_device_compute_capability()},
@@ -128,10 +128,10 @@ std::optional<int32_t> context::nvrtc_version() const { return _nvrtc_version; }
 
 std::optional<int32_t> context::nvjitlink_version() const { return _nvjitlink_version; }
 
-void context::initialize_components(init_flags flags)
+void context::initialize_components(detail::init_flags flags)
 {
   CUDF_FUNC_RANGE();
-  if (has_flag(flags, init_flags::LOAD_NVCOMP)) { preload_nvcomp(); }
+  if (has_flag(flags, detail::init_flags::LOAD_NVCOMP)) { preload_nvcomp(); }
 }
 
 namespace {
@@ -209,7 +209,7 @@ std::filesystem::path get_cudf_kernel_cache_dir()
     std::runtime_error);
 }
 
-context make_context(init_flags flags)
+context make_context(detail::init_flags flags)
 {
   auto const dump_codegen       = detail::get_bool_env_or("LIBCUDF_JIT_DUMP_CODEGEN", false);
   auto const use_jit            = detail::get_bool_env_or("LIBCUDF_JIT_ENABLED", false);
@@ -232,7 +232,7 @@ context make_context(init_flags flags)
   auto const jit_pch_dir    = cache_dir / "pch";
   auto const jit_tmp_dir    = cache_dir / "tmp";
 
-  flags = flags | (preload_nvcomp ? init_flags::LOAD_NVCOMP : init_flags::NONE);
+  flags = flags | (preload_nvcomp ? detail::init_flags::LOAD_NVCOMP : detail::init_flags::NONE);
 
   context_config cfg{.dump_codegen               = dump_codegen,
                      .use_jit                    = use_jit,
@@ -254,6 +254,18 @@ context make_context(init_flags flags)
 
 }  // namespace
 
+context& get_context(detail::init_flags flags)
+{
+  static context instance = make_context(flags);
+  return instance;
+}
+
+namespace detail {
+
+void initialize(init_flags flags) { get_context(flags); }
+
+}  // namespace detail
+
 void enable_jit_cache(bool enabled)
 {
   auto& cache = get_context().rtcx_cache();
@@ -266,17 +278,5 @@ void clear_jit_cache()
   cache.clear_memory_store();
   cache.clear_disk_store();
 }
-
-context& get_context(init_flags flags)
-{
-  static context instance = make_context(flags);
-  return instance;
-}
-
-namespace detail {
-
-void initialize(init_flags flags) { get_context(flags); }
-
-}  // namespace detail
 
 }  // namespace cudf

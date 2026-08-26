@@ -11,6 +11,7 @@
 #include <type_traits>
 
 namespace CUDF_EXPORT cudf {
+namespace detail {
 
 /// @brief Flags for controlling initialization steps
 enum class init_flags : std::uint32_t {
@@ -63,8 +64,6 @@ constexpr bool has_flag(init_flags flags, init_flags flag) noexcept
 {
   return (flags | flag) == flags;
 }
-
-namespace detail {
 
 /// @brief Ensure the cudf global context is initialized. Only the first call to this function will
 /// have an effect, subsequent calls are no-ops regardless of the initialization flags.
