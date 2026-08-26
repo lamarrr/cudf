@@ -184,10 +184,9 @@ set(CUDF_CUDA_DEFINITIONS "")
 
 # LTO IR can only be linked for targets greater than or equal to its architecture. An explicit
 # override must therefore not exceed the architecture of any target GPU on which it will be linked.
-set(
-  CUDF_LTO_ARCHITECTURE
-  ""
-  CACHE STRING "LTO fragment architecture; empty selects the minimum supported by the toolkit"
+set(CUDF_LTO_ARCHITECTURE
+    ""
+    CACHE STRING "LTO fragment architecture; empty selects the minimum supported by the toolkit"
 )
 
 if(CUDF_LTO_ARCHITECTURE STREQUAL "")
