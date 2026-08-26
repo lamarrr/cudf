@@ -262,7 +262,8 @@ std::string reflect_output_element(transform_output_spec const& spec, bool use_p
 std::string reflect_input_value_type(transform_input_spec const& spec, bool use_physical_type)
 {
   if (spec.type == type_id::DICTIONARY32) {
-    return reflect_input_value_type(spec.children.at(dictionary_keys_column_index), use_physical_type);
+    return reflect_input_value_type(spec.children.at(dictionary_keys_column_index),
+                                    use_physical_type);
   }
   return reflect_input_element(spec, use_physical_type);
 }
