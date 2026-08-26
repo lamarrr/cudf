@@ -225,13 +225,10 @@ struct element_type_name_fn {
   std::string operator()(transform_input_spec const& spec, bool use_physical_type) const
     requires(std::same_as<T, cudf::dictionary32>)
   {
-    CUDF_EXPECTS(spec.children.size() > static_cast<size_t>(dictionary_keys_column_index),
-                 "Dictionary transform input specifications must include indices and keys",
-                 std::invalid_argument);
     return std::format(
       "cudf::dictionary_element<{}, {}>",
-      get_element_type_name(spec.children[dictionary_indices_column_index], use_physical_type),
-      get_element_type_name(spec.children[dictionary_keys_column_index], use_physical_type));
+      get_element_type_name(spec.children.at(dictionary_indices_column_index), use_physical_type),
+      get_element_type_name(spec.children.at(dictionary_keys_column_index), use_physical_type));
   }
 
   template <typename T>
@@ -265,10 +262,7 @@ std::string reflect_output_element(transform_output_spec const& spec, bool use_p
 std::string reflect_input_value_type(transform_input_spec const& spec, bool use_physical_type)
 {
   if (spec.type == type_id::DICTIONARY32) {
-    CUDF_EXPECTS(spec.children.size() > static_cast<size_t>(dictionary_keys_column_index),
-                 "Dictionary transform input specifications must include indices and keys",
-                 std::invalid_argument);
-    return reflect_input_value_type(spec.children[dictionary_keys_column_index], use_physical_type);
+    return reflect_input_value_type(spec.children.at(dictionary_keys_column_index), use_physical_type);
   }
   return reflect_input_element(spec, use_physical_type);
 }
