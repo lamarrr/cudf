@@ -13,11 +13,8 @@ include_guard(GLOBAL)
 # final library with metadata that allows it to be looked up at runtime.
 macro(add_fragment)
   set(TARGET ${ARGV0})
-  set(OPTIONS)
   set(ONE_VALUE_ARGS FRAGMENT SOURCE KERNEL_ONLY KERNEL_INSTANCE UDF_TYPE)
-  set(MULTI_VALUE_ARGS DEFINITIONS ARRAY_IDS ARRAY_VALUES INCLUDE_DIRECTORIES LINK_LIBRARIES
-                       COMPILE_OPTIONS
-  )
+  set(MULTI_VALUE_ARGS DEFINITIONS ARRAY_IDS ARRAY_VALUES)
   cmake_parse_arguments(ARG "${OPTIONS}" "${ONE_VALUE_ARGS}" "${MULTI_VALUE_ARGS}" ${ARGN})
 
   if(NOT ARG_FRAGMENT)
@@ -56,22 +53,7 @@ macro(add_fragment)
     )
   endif()
 
-  if(ARG_INCLUDE_DIRECTORIES)
-    target_include_directories(${OBJECT_ID} PRIVATE ${ARG_INCLUDE_DIRECTORIES})
-  endif()
-
-  if(ARG_LINK_LIBRARIES)
-    target_link_libraries(${OBJECT_ID} PRIVATE ${ARG_LINK_LIBRARIES})
-  endif()
-
-  if(ARG_COMPILE_OPTIONS)
-    target_compile_options(${OBJECT_ID} PRIVATE ${ARG_COMPILE_OPTIONS})
-  endif()
-
-  if(ARG_DEFINITIONS)
-    target_compile_definitions(${OBJECT_ID} PRIVATE ${ARG_DEFINITIONS})
-  endif()
-
+  target_compile_definitions(${OBJECT_ID} PRIVATE ${ARG_DEFINITIONS})
   set_target_properties(
     ${OBJECT_ID}
     PROPERTIES CUDA_SEPARABLE_COMPILATION ON
@@ -87,6 +69,17 @@ macro(add_fragment)
                CUDA_VISIBILITY_PRESET hidden
                CUDA_ARCHITECTURES ${CUDF_LTO_ARCHITECTURE}-real
   )
+  target_link_libraries(
+    ${OBJECT_ID}
+    PUBLIC CCCL::CCCL rapids_logger::rapids_logger rmm::rmm $<BUILD_LOCAL_INTERFACE:BS::thread_pool>
+    PRIVATE $<BUILD_LOCAL_INTERFACE:nvtx3::nvtx3-cpp> $<BUILD_LOCAL_INTERFACE:cuco::cuco>
+            ZLIB::ZLIB nvcomp::nvcomp kvikio::kvikio nanoarrow::nanoarrow zstd
+  )
+  target_include_directories(
+    ${OBJECT_ID} PRIVATE "$<BUILD_INTERFACE:${CUDF_SOURCE_DIR}/include>"
+                         "$<BUILD_INTERFACE:${CUDF_SOURCE_DIR}/src>"
+  )
+  target_compile_options(${OBJECT_ID} PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDF_CUDA_FLAGS}>")
 
   rtcx_embed_blob(
     ${TARGET} FILE $<TARGET_OBJECTS:${OBJECT_ID}> DEST fragments/${ARG_FRAGMENT}.fatbin ID

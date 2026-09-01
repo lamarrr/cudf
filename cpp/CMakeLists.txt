@@ -537,12 +537,6 @@ function(precompile_fixed_width_kernel_fragments)
       ARRAY_VALUES
       ${FILE_INDEX}
       "${INSTANCE}"
-      COMPILE_OPTIONS
-      ${LIBCUDF_FRAGMENT_COMPILE_OPTIONS}
-      INCLUDE_DIRECTORIES
-      ${LIBCUDF_FRAGMENT_INCLUDE_DIRECTORIES}
-      LINK_LIBRARIES
-      ${LIBCUDF_FRAGMENT_LINK_LIBRARIES}
     )
 
   endforeach()
@@ -579,12 +573,6 @@ function(precompile_fixed_width_kernel_fragments)
         ARRAY_VALUES
         ${FILE_INDEX}
         "${INSTANCE}"
-        COMPILE_OPTIONS
-        ${LIBCUDF_FRAGMENT_COMPILE_OPTIONS}
-        INCLUDE_DIRECTORIES
-        ${LIBCUDF_FRAGMENT_INCLUDE_DIRECTORIES}
-        LINK_LIBRARIES
-        ${LIBCUDF_FRAGMENT_LINK_LIBRARIES}
       )
     endforeach()
   endforeach()
@@ -653,12 +641,6 @@ function(precompile_string_kernel_fragments)
         ARRAY_VALUES
         ${FILE_INDEX}
         "${INSTANCE}"
-        COMPILE_OPTIONS
-        ${LIBCUDF_FRAGMENT_COMPILE_OPTIONS}
-        INCLUDE_DIRECTORIES
-        ${LIBCUDF_FRAGMENT_INCLUDE_DIRECTORIES}
-        LINK_LIBRARIES
-        ${LIBCUDF_FRAGMENT_LINK_LIBRARIES}
       )
     endforeach()
   endforeach()

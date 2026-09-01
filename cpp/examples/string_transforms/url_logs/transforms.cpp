@@ -57,6 +57,7 @@ constexpr char parse_url_udf[] = R"***(
   auto parse_url = [&](url_ranges* out) {
     *out = {};
     auto n = input.size_bytes();
+    auto str = input.data();
     auto is_alpha = [](char c) {
       return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
     };
@@ -84,7 +85,7 @@ constexpr char parse_url_udf[] = R"***(
 
     auto scheme_end = n;
     for (auto i = 1; i + 2 < n; ++i) {
-      if (input.data()[i] == ':' && input.data()[i + 1] == '/' && input.data()[i + 2] == '/') {
+      if (str[i] == ':' && str[i + 1] == '/' && str[i + 2] == '/') {
         scheme_end = i;
         break;
       }
@@ -92,20 +93,20 @@ constexpr char parse_url_udf[] = R"***(
     if (scheme_end == n) { return false; }
 
     auto url_begin = scheme_end;
-    while (url_begin > 0 && is_scheme_char(input.data()[url_begin - 1])) { --url_begin; }
-    if (url_begin == scheme_end || !is_alpha(input.data()[url_begin])) { return false; }
+    while (url_begin > 0 && is_scheme_char(str[url_begin - 1])) { --url_begin; }
+    if (url_begin == scheme_end || !is_alpha(str[url_begin])) { return false; }
 
     auto url_end = n;
     for (auto i = scheme_end + 3; i < n; ++i) {
-      if (is_context_delimiter(input.data()[i])) {
+      if (is_context_delimiter(str[i])) {
         url_end = i;
         break;
       }
     }
     for (auto i = url_begin; i < url_end; ++i) {
-      auto c = input.data()[i];
+      auto c = str[i];
       if (c == '%') {
-        if (i + 2 >= url_end || !is_hex(input.data()[i + 1]) || !is_hex(input.data()[i + 2])) {
+        if (i + 2 >= url_end || !is_hex(str[i + 1]) || !is_hex(str[i + 2])) {
           return false;
         }
         i += 2;
@@ -116,14 +117,14 @@ constexpr char parse_url_udf[] = R"***(
 
     auto hash = url_end;
     for (auto i = scheme_end + 3; i < url_end; ++i) {
-      if (input.data()[i] == '#') {
+      if (str[i] == '#') {
         hash = i;
         break;
       }
     }
     auto question = hash;
     for (auto i = scheme_end + 3; i < hash; ++i) {
-      if (input.data()[i] == '?') {
+      if (str[i] == '?') {
         question = i;
         break;
       }
@@ -136,7 +137,7 @@ constexpr char parse_url_udf[] = R"***(
     auto authority_begin = scheme_end + 3;
     auto authority_end         = base_end;
     for (auto i = authority_begin; i < base_end; ++i) {
-      if (input.data()[i] == '/') {
+      if (str[i] == '/') {
         authority_end = i;
         break;
       }
@@ -145,12 +146,12 @@ constexpr char parse_url_udf[] = R"***(
 
     auto host_begin = authority_begin;
     for (auto i = authority_begin; i < authority_end; ++i) {
-      if (input.data()[i] == '@') { host_begin = i + 1; }
+      if (str[i] == '@') { host_begin = i + 1; }
     }
-    if (host_begin < authority_end && input.data()[host_begin] == '[') {
+    if (host_begin < authority_end && str[host_begin] == '[') {
       auto close = authority_end;
       for (auto i = host_begin + 1; i < authority_end; ++i) {
-        if (input.data()[i] == ']') {
+        if (str[i] == ']') {
           close = i;
           break;
         }
@@ -158,19 +159,19 @@ constexpr char parse_url_udf[] = R"***(
       if (close == authority_end) { return false; }
       out->host = {host_begin, close + 1};
       if (close + 1 < authority_end) {
-        if (input.data()[close + 1] != ':') { return false; }
+        if (str[close + 1] != ':') { return false; }
         out->port = {close + 2, authority_end};
       }
     } else {
       auto colon = authority_end;
       for (auto i = host_begin; i < authority_end; ++i) {
-        if (input.data()[i] == ':') { colon = i; }
+        if (str[i] == ':') { colon = i; }
       }
       out->host = {host_begin, colon};
       if (colon < authority_end) { out->port = {colon + 1, authority_end}; }
     }
     for (auto i = out->port.begin; i < out->port.end; ++i) {
-      if (!is_digit(input.data()[i])) { return false; }
+      if (!is_digit(str[i])) { return false; }
     }
     return true;
   };
