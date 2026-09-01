@@ -55,6 +55,8 @@ add_string_transforms_example(format_phone_precompiled format_phone_precompiled.
 add_string_transforms_example(localize_phone_jit localize_phone_jit.cpp)
 add_string_transforms_example(localize_phone_precompiled localize_phone_precompiled.cpp)
 
+# This macro is used to create object libraries for JIT compilation fragments, and embed them into
+# the executable.
 macro(add_fragment)
   set(TARGET ${ARGV0})
   set(OPTIONS)
