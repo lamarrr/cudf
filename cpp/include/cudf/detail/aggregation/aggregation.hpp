@@ -1379,7 +1379,7 @@ bool is_valid_aggregation(data_type source, aggregation::Kind k);
  */
 void initialize_with_identity(mutable_table_view const& table,
                               host_span<cudf::aggregation::Kind const> aggs,
-                              rmm::cuda_stream_view stream);
+                              cuda::stream_ref stream);
 
 }  // namespace detail
 }  // namespace cudf

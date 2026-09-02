@@ -16,10 +16,10 @@
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
 
+#include <cuda/stream>
 #include <thrust/uninitialized_fill.h>
 
 #include <memory>
@@ -42,7 +42,7 @@ std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
 equality_join_indices(cudf::hash_join const& hash_joiner,
                       table_view const& left_equality,
                       join_kind join_type,
-                      rmm::cuda_stream_view stream,
+                      cuda::stream_ref stream,
                       rmm::device_async_resource_ref mr)
 {
   switch (join_type) {
@@ -65,7 +65,7 @@ mixed_join(table_view const& left_equality,
            null_equality compare_nulls,
            join_kind join_type,
            output_size_data_type const& output_size_data,
-           rmm::cuda_stream_view stream,
+           cuda::stream_ref stream,
            rmm::device_async_resource_ref mr)
 {
   CUDF_EXPECTS((join_type != join_kind::LEFT_SEMI_JOIN) && (join_type != join_kind::LEFT_ANTI_JOIN),
@@ -101,8 +101,12 @@ mixed_join(table_view const& left_equality,
                                  std::nullopt,
                                  stream,
                                  mr);
-    return finalize_full_join(
-      std::move(left_outer), left_conditional.num_rows(), right_conditional.num_rows(), stream, mr);
+    return finalize_full_join(std::move(left_outer),
+                              left_conditional.num_rows(),
+                              right_conditional.num_rows(),
+                              std::nullopt,
+                              stream,
+                              mr);
   }
 
   auto const hash_joiner = cudf::hash_join{right_equality, compare_nulls, stream};
@@ -132,7 +136,7 @@ compute_mixed_join_output_size(table_view const& left_equality,
                                ast::expression const& binary_predicate,
                                null_equality compare_nulls,
                                join_kind join_type,
-                               rmm::cuda_stream_view stream,
+                               cuda::stream_ref stream,
                                rmm::device_async_resource_ref mr)
 {
   CUDF_EXPECTS(join_type != join_kind::FULL_JOIN,
@@ -188,7 +192,7 @@ mixed_inner_join(
   ast::expression const& binary_predicate,
   null_equality compare_nulls,
   std::optional<std::pair<std::size_t, device_span<size_type const>>> const output_size_data,
-  rmm::cuda_stream_view stream,
+  cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
@@ -211,7 +215,7 @@ std::pair<std::size_t, std::unique_ptr<rmm::device_uvector<size_type>>> mixed_in
   table_view const& right_conditional,
   ast::expression const& binary_predicate,
   null_equality compare_nulls,
-  rmm::cuda_stream_view stream,
+  cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
@@ -235,7 +239,7 @@ mixed_left_join(table_view const& left_equality,
                 ast::expression const& binary_predicate,
                 null_equality compare_nulls,
                 output_size_data_type const output_size_data,
-                rmm::cuda_stream_view stream,
+                cuda::stream_ref stream,
                 rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
@@ -258,7 +262,7 @@ std::pair<std::size_t, std::unique_ptr<rmm::device_uvector<size_type>>> mixed_le
   table_view const& right_conditional,
   ast::expression const& binary_predicate,
   null_equality compare_nulls,
-  rmm::cuda_stream_view stream,
+  cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
@@ -282,7 +286,7 @@ mixed_full_join(table_view const& left_equality,
                 ast::expression const& binary_predicate,
                 null_equality compare_nulls,
                 output_size_data_type const output_size_data,
-                rmm::cuda_stream_view stream,
+                cuda::stream_ref stream,
                 rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
