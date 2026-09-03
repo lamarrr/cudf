@@ -102,7 +102,7 @@ set_output 0 f32 nonullable %magnitude
 
 #### IR Node Diagram
 
-The following diagram shows the Row IR graph for the vector-magnitude example, including all attribute information:
+The following diagram shows the Row IR graph for the vector-magnitude example, including all node attribute information:
 
 ```mermaid
 graph TD
