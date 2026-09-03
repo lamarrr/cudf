@@ -145,7 +145,7 @@ void BM_filter_min_max(nvbench::state& state)
                                                     std::nullopt,
                                                     predicate_inputs,
                                                     outputs,
-                                                           {},
+                                                    {},
                                                     std::nullopt,
                                                     stream,
                                                     mr);
