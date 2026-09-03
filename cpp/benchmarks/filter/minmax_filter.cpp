@@ -19,6 +19,7 @@
 #include <nvbench/nvbench.cuh>
 #include <nvbench/types.cuh>
 
+#include <array>
 #include <concepts>
 #include <vector>
 
@@ -136,20 +137,20 @@ void BM_filter_min_max(nvbench::state& state)
           predicate_column->view(),
           cudf::scalar_column_view(min_scalar_column->view()),
           cudf::scalar_column_view(max_scalar_column->view())};
-        auto const filter_boolean =
-          cudf::transform(udf,
-                          cudf::udf_source_type::CUDA,
-                          cudf::null_aware::NO,
-                          std::nullopt,
-                          predicate_inputs,
-                          {cudf::transform_output{cudf::data_type{cudf::type_to_id<bool>()},
-                                                  cudf::output_nullability::PRESERVE}},
-                          {},
-                          std::nullopt,
-                          stream,
-                          mr);
+        cudf::transform_output outputs[] = {cudf::transform_output{
+          cudf::data_type{cudf::type_to_id<bool>()}, cudf::output_nullability::PRESERVE}};
+        auto const filter_boolean        = cudf::transform(udf,
+                                                    cudf::udf_source_type::CUDA,
+                                                    cudf::null_aware::NO,
+                                                    std::nullopt,
+                                                    predicate_inputs,
+                                                    outputs,
+                                                           {},
+                                                    std::nullopt,
+                                                    stream,
+                                                    mr);
         auto const result =
-          cudf::apply_boolean_mask(filter_table, filter_boolean->view().column(0), stream, mr);
+          cudf::apply_retention_mask(filter_table, filter_boolean->view().column(0), stream, mr);
       } break;
       default: CUDF_UNREACHABLE("Unrecognised engine type requested");
     }
