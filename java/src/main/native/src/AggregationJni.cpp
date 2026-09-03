@@ -159,10 +159,10 @@ JNIEXPORT jlong JNICALL Java_ai_rapids_cudf_Aggregation_createTDigestAgg(JNIEnv*
     std::unique_ptr<cudf::aggregation> ret;
     // These numbers come from Aggregation.java and must stay in sync
     switch (kind) {
-      case 32:  // TDIGEST
+      case 30:  // TDIGEST
         ret = cudf::make_tdigest_aggregation<cudf::groupby_aggregation>(delta);
         break;
-      case 33:  // MERGE_TDIGEST
+      case 31:  // MERGE_TDIGEST
         ret = cudf::make_merge_tdigest_aggregation<cudf::groupby_aggregation>(delta);
         break;
       default: throw std::logic_error("Unsupported TDigest Aggregation Operation");
