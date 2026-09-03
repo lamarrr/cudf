@@ -103,7 +103,7 @@ For example:
 
 ```cpp
 // runtime UDF
-__device__ int transform(float* out, int lhs, float rhs) { 
+__device__ int transform(float* out, int lhs, float rhs) {
     *out = (lhs + rhs) * 0.5F;
     return 0;
 }
