@@ -16,5 +16,6 @@ cupy-interop
 performance-comparisons/index
 PandasCompat
 memory-profiling
+spilling
 developer_guide/index
 ```
