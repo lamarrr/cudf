@@ -79,7 +79,7 @@ This environment variable removes all kernel artifacts from libcudf's JIT kernel
 
 #### `LIBCUDF_KERNEL_CACHE_LIMIT_PER_PROCESS:integer`
 
-This environment variable limits the number of kernels cached by each process. Use it to control the cache memory footprint in multiprocess environments or to disable kernel caching for benchmarks.
+This environment variable limits the number of kernels cached by each process. Use it to control the cache memory footprint in multiprocess environments.
 
 ### JIT and CUDA Code-Generation Controls
 
@@ -111,7 +111,7 @@ This environment variable writes a text JIT compilation trace to the command lin
 
 #### `LIBCUDF_JIT_DUMP_TIME_PROFILE:bool`
 
-This environment variable produces a Perfetto JSON trace instead of a text trace. The output is named `libcudf_kernel_${kernel_name}_trace.json` (for example, `libcudf_kernel_transform_trace.json` or `libcudf_kernel_filter_join_indices_trace.json`) and is written to the current working directory. Open the file with Chrome's tracing tool or the Perfetto UI.
+This environment variable produces a Perfetto JSON trace instead of a text trace. The output is named `cudf_kernel_${kernel_name}_trace.json` (for example, `libcudf_kernel_transform_trace.json` or `libcudf_kernel_filter_join_indices_trace.json`) and is written to the current working directory. Open the file with Chrome's tracing tool or the Perfetto UI.
 
 ### Programmatic Cache Controls
 
@@ -119,10 +119,6 @@ This environment variable produces a Perfetto JSON trace instead of a text trace
 
 This function enables or disables the libcudf JIT kernel cache. Disable the cache for cold-cache benchmarks, and combine it with `LIBCUDF_JIT_DISABLE_CUDA_CACHE` for fully cold-cache measurements. It is the programmatic equivalent of `LIBCUDF_KERNEL_CACHE_DISABLED`.
 
-#### `cudf::enable_cuda_cache(bool)`
-
-This function enables or disables cuDF's CUDA code-generation cache. Disable the cache to ensure that benchmarked JIT compilations use the cold code-generation path. It is the programmatic equivalent of `LIBCUDF_JIT_DISABLE_CUDA_CACHE`.
-
 #### `cudf::clear_jit_cache()`
 
-This function removes all artifacts from libcudf's JIT kernel cache. Use it with `cudf::enable_cuda_cache(false)` for fully cold-cache benchmark measurements. It is the programmatic equivalent of `LIBCUDF_KERNEL_CACHE_CLEAR`.
+This function removes all artifacts from libcudf's JIT kernel cache. Use it with `LIBCUDF_JIT_DISABLE_CUDA_CACHE=1` for fully cold-cache benchmark measurements. It is the programmatic equivalent of `LIBCUDF_KERNEL_CACHE_CLEAR`.

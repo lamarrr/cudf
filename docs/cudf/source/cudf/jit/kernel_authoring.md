@@ -35,11 +35,11 @@ __device__ void binary_op_kernel(column_device_view const* inputs,
   for (auto i = start; i < n; i += stride) {
     GENERIC_TRANSFORM_OP(&output->element<OutputType>(i),
                          inputs[0]->element<LhsType>(i),
-                         inputs[1]->element<RhsType>(i * RhsIsScalar));
+                         inputs[1]->element<RhsType>(i * (RhsIsScalar? 1 : 0)));
   }
 }
 
-extern "C" __device__ void cudf_kernel_entry(column_device_view const* inputs,
+extern "C" __global__ void cudf_kernel_entry(column_device_view const* inputs,
                                              mutable_column_device_view const* outputs,
                                              size_type n)
 {
@@ -89,7 +89,7 @@ std::string reflect_binary_op_kernel(data_type lhs_type /* = type_id::INT32 */,
                                      bool rhs_is_scalar /* = false */,
                                      data_type output_type /* = type_id::FLOAT32 */);
 
-// Kernel instance specialization (substituted during call to `cudf::get_udf_kernel`)
+// Kernel instance specialization (substituted during call to `cudf::jit::get_udf_kernel`)
 // #define CUDF_KERNEL_INSTANCE binary_op_kernel<int32_t, float, false, float>
 ```
 
@@ -108,7 +108,7 @@ __device__ int transform(float* out, int lhs, float rhs) {
     return 0;
 }
 
-// Kernel UDF specialization (substituted during call to `cudf::get_udf_kernel`)
+// Kernel UDF specialization (substituted during call to `cudf::jit::get_udf_kernel`)
 // #define GENERIC_TRANSFORM_OP(...) transform(__VA_ARGS__)
 ```
 
@@ -120,14 +120,14 @@ The compiled kernel can be launched on the GPU using its handle and arguments. B
 auto kernel_instance = "binary_op_kernel<int32_t, float, false, float>";
 auto udf =
   "__device__ void transform(float * out, int lhs, float rhs){ *out = (lhs + rhs) * 0.5F; }";
-auto kernel = cudf::get_udf_kernel("binary_op_kernel.cu", kernel_instance, udf);
+auto kernel = cudf::jit::get_udf_kernel("binary_op_kernel.cu", kernel_instance, udf);
 column_device_view const* inputs          = ...;
 mutable_column_device_view const* outputs = ...;
 size_type n                               = ...;
 kernel.launch_with({grid_size}, {block_size}, 0, stream, inputs, outputs, n);
 ```
 
-`cudf::get_udf_kernel` generates the specialized CUDA source, compiles and caches the kernel, and returns a handle (`cudf::kernel`) to the compiled kernel.
+`cudf::jit::get_udf_kernel` generates the specialized CUDA source, compiles and caches the kernel, and returns a handle (`cudf::kernel`) to the compiled kernel.
 
 As of version 26.06, PTX UDFs are supported by converting them to CUDA C++ with the `asm` directive. This approach still incurs the full cost of CUDA C++ frontend compilation.
 
@@ -168,7 +168,7 @@ __device__ void binary_op_kernel(column_device_view const* inputs,
   }
 }
 
-extern "C" __device__ void cudf_kernel_entry(column_device_view const* inputs,
+extern "C" __global__ void cudf_kernel_entry(column_device_view const* inputs,
                                              mutable_column_device_view const* outputs,
                                              size_type n)
 {
@@ -252,7 +252,7 @@ The following is an example cuDF transform kernel:
 ```cpp
 template <template <typename... I> class Inputs,
           template <typename... O> class Outputs>
-extern "C" __device__ void transform_kernel(column_device_view const* inputs,
+__device__ void transform_kernel(column_device_view const* inputs,
                                             mutable_column_device_view const* output,
                                             size_type n);
 ```
