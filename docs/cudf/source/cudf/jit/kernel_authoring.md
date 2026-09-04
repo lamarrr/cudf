@@ -35,7 +35,7 @@ __device__ void binary_op_kernel(column_device_view const* inputs,
   for (auto i = start; i < n; i += stride) {
     GENERIC_TRANSFORM_OP(&output->element<OutputType>(i),
                          inputs[0]->element<LhsType>(i),
-                         inputs[1]->element<RhsType>(i * (RhsIsScalar? 1 : 0)));
+                         inputs[1]->element<RhsType>(i * (RhsIsScalar? 0 : 1)));
   }
 }
 
