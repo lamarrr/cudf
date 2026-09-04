@@ -111,7 +111,7 @@ This environment variable writes a text JIT compilation trace to the command lin
 
 #### `LIBCUDF_JIT_DUMP_TIME_PROFILE:bool`
 
-This environment variable produces a Perfetto JSON trace instead of a text trace. The output is named `cudf_kernel_${kernel_name}_trace.json` (for example, `libcudf_kernel_transform_trace.json` or `libcudf_kernel_filter_join_indices_trace.json`) and is written to the current working directory. Open the file with Chrome's tracing tool or the Perfetto UI.
+This environment variable produces a Perfetto JSON trace instead of a text trace. The output is named `cudf_kernel_${kernel_name}_trace.json` (for example, `cudf_kernel_transform_trace.json` or `cudf_kernel_filter_join_indices_trace.json`) and is written to the current working directory. Open the file with Chrome's tracing tool or the Perfetto UI.
 
 ### Programmatic Cache Controls
 
