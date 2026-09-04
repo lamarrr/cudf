@@ -236,7 +236,17 @@ auto kernel_range =
 std::span kernel_fragment = cudf_fragments::files.subspan(kernel_range[0], kernel_range[1]);
 auto udf_range            = user_fragments::file_ranges[user_fragments::user_udf];
 auto udf_fragment         = user_fragments::files.subspan(udf_range[0], udf_range[1]);
-auto kernel = cudf::get_lto_linked_kernel("binary_op_kernel", {}, {kernel_fragment, udf_fragment});
+rtcx::memory_fragment fragments[] = {
+  {
+    .data = kernel_fragment,
+    .type = rtcx::binary_type::FATBIN
+  },
+  {
+    .data = udf_fragment,
+    .type = rtcx::binary_type::FATBIN
+  }
+  };
+auto kernel = cudf::get_lto_linked_kernel("binary_op_kernel", {}, fragments);
 column_device_view const* inputs          = ...;
 mutable_column_device_view const* outputs = ...;
 size_type n                               = ...;
