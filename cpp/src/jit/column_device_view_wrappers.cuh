@@ -15,6 +15,38 @@
 namespace cudf {
 namespace jit {
 
+/** @brief A typed view of one row of a list column. */
+template <typename Offset, typename Child>
+struct list_row {
+  using offset_type = Offset;
+  using child_type  = Child;
+  column_device_view_core column;
+  size_type row;
+
+  [[nodiscard]] __device__ bool is_null() const noexcept { return column.is_null(row); }
+  [[nodiscard]] __device__ bool is_valid() const noexcept { return column.is_valid(row); }
+};
+
+/** @brief A typed view of one row of a struct column. */
+template <typename Children>
+struct struct_row {
+  using children_type = Children;
+  column_device_view_core column;
+  size_type row;
+
+  [[nodiscard]] __device__ bool is_null() const noexcept { return column.is_null(row); }
+  [[nodiscard]] __device__ bool is_valid() const noexcept { return column.is_valid(row); }
+};
+
+template <typename T>
+inline constexpr bool is_nested_row = false;
+
+template <typename Offset, typename Child>
+inline constexpr bool is_nested_row<list_row<Offset, Child>> = true;
+
+template <typename Children>
+inline constexpr bool is_nested_row<struct_row<Children>> = true;
+
 /**
  * @brief A column wrapper type that treats a column as a vector of elements.
  *

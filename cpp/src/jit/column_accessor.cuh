@@ -13,6 +13,8 @@
 #include <cuda/std/span>
 #include <cuda/std/type_traits>
 
+#include <jit/column_device_view_wrappers.cuh>
+
 namespace cudf {
 namespace jit {
 
@@ -47,7 +49,11 @@ struct column_accessor {
 
   static __device__ auto element(auto const* __restrict__ cols, size_type row)
   {
-    return column(cols).template element<element_type>(map_index(row));
+    if constexpr (is_nested_row<element_type>) {
+      return element_type{column(cols), map_index(row)};
+    } else {
+      return column(cols).template element<element_type>(map_index(row));
+    }
   }
 
   static __device__ bool is_null(auto const* __restrict__ cols, size_type row)
@@ -62,7 +68,16 @@ struct column_accessor {
 
   static __device__ auto nullable_element(auto const* __restrict__ cols, size_type row)
   {
-    return column(cols).template nullable_element<element_type>(map_index(row));
+    if constexpr (is_nested_row<element_type>) {
+      return element_type{column(cols), map_index(row)};
+    } else if constexpr (cudf::is_dictionary_encoded<element_type>) {
+      using key_type = typename element_type::key_type;
+      if (is_null(cols, row)) { return cuda::std::optional<key_type>{}; }
+      return cuda::std::optional<key_type>{
+        column(cols).template element<element_type>(map_index(row))};
+    } else {
+      return column(cols).template nullable_element<element_type>(map_index(row));
+    }
   }
 
   static __device__ void set_null_mask_word(auto const* __restrict__ cols,
@@ -83,6 +98,12 @@ struct column_accessor {
     column(cols).template assign<element_type>(row, value);
   }
 
+  static __device__ element_type* direct_output_ptr(auto const* __restrict__ cols, size_type row)
+    requires(!as_scalar && cudf::is_rep_layout_compatible<element_type>())
+  {
+    return column(cols).template data<element_type>() + row;
+  }
+
   static __device__ element_type output_arg(auto const* __restrict__ cols, size_type row)
     requires(!as_scalar)
   {
@@ -101,6 +122,32 @@ struct column_accessor {
       return element(cols, row);
     } else {
       return {};
+    }
+  }
+};
+
+/**
+ * @brief A typed, non-owning accessor for transform inputs at one row.
+ *
+ * Unlike the ordinary transform input tuple, this object does not load any column values when it
+ * is constructed. A UDF can call `get<I>()` to load and consume inputs one at a time, reducing the
+ * number of simultaneously live values for wide schemas.
+ */
+template <bool IsNullAware, typename InputAccessors>
+struct row_accessor {
+  column_device_view_core const* columns;
+  size_type row;
+
+  static constexpr int32_t size = InputAccessors::size;
+
+  template <int32_t I>
+  __device__ auto get() const
+  {
+    using accessor = typename InputAccessors::template at<I>;
+    if constexpr (IsNullAware) {
+      return accessor::nullable_element(columns, row);
+    } else {
+      return accessor::element(columns, row);
     }
   }
 };

@@ -425,7 +425,8 @@ kernel get_kernel(std::string const& name,
                   std::string const& source_file_id,
                   std::span<char const* const> header_include_names,
                   std::span<char const* const> headers,
-                  std::string const& kernel_instance)
+                  std::string const& kernel_instance,
+                  std::string_view kernel_entry)
 {
   CUDF_FUNC_RANGE();
 
@@ -449,6 +450,7 @@ arch={}
 bundle={}
 source_file={}
 kernel_instance={}
+kernel_entry={}
 )***",
                           name,
                           runtime,
@@ -456,7 +458,8 @@ kernel_instance={}
                           sm,
                           bundle_hash,
                           source_file,
-                          kernel_instance);
+                          kernel_instance,
+                          kernel_entry);
 
   XXH3_state_t state;
   XXH3_INITSTATE(&state);
@@ -478,8 +481,9 @@ kernel_instance={}
 
   auto fut = cache.get_or_add_library(key, rtcx::library_compile_func::from_functor(compile));
 
-  auto lib = fut.get();
-  return kernel{lib, lib->get_kernel("cudf_kernel_entry")};
+  auto lib        = fut.get();
+  auto entry_name = std::string{kernel_entry};
+  return kernel{lib, lib->get_kernel(entry_name.c_str())};
 }
 
 rtcx::blob get_nvvm_fragment(std::string const& name, std::span<char const> ir)

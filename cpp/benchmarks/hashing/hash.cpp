@@ -9,6 +9,7 @@
 #include <cudf/hashing.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/error.hpp>
 
 #include <nvbench/nvbench.cuh>
 
@@ -22,13 +23,20 @@ static void bench_hash(nvbench::state& state)
   // disable null bitmask if probability is exactly 0.0
   bool const no_nulls  = nulls == 0.0;
   auto const hash_name = state.get_string("hash_name");
+  auto const layout    = state.get_string("layout");
 
   data_profile const profile =
     data_profile_builder().null_probability(no_nulls ? std::nullopt : std::optional<double>{nulls});
-  auto const data =
-    create_random_table(cycle_dtypes({cudf::type_id::INT64, cudf::type_id::STRING}, num_cols),
-                        row_count{num_rows},
-                        profile);
+  auto const types = layout == "int64"   ? cycle_dtypes({cudf::type_id::INT64}, num_cols)
+                     : layout == "string" ? cycle_dtypes({cudf::type_id::STRING}, num_cols)
+                     : layout == "mixed"
+                       ? cycle_dtypes({cudf::type_id::INT64, cudf::type_id::STRING}, num_cols)
+                       : std::vector<cudf::type_id>{};
+  if (types.empty()) {
+    state.skip(layout + ": unknown input layout");
+    return;
+  }
+  auto const data = create_random_table(types, row_count{num_rows}, profile);
 
   auto stream = cudf::get_default_stream();
   state.set_cuda_stream(nvbench::make_cuda_stream_view(stream.get()));
@@ -43,6 +51,25 @@ static void bench_hash(nvbench::state& state)
 
     state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
       auto result = cudf::hashing::murmurhash3_x86_32(data->view());
+    });
+  } else if (hash_name == "xxhash_32") {
+    state.add_global_memory_writes<nvbench::uint32_t>(num_rows);
+
+    state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
+      auto result = cudf::hashing::xxhash_32(data->view());
+    });
+  } else if (hash_name == "xxhash_32_jit") {
+    state.add_global_memory_writes<nvbench::uint32_t>(num_rows);
+
+    // Keep compilation and cache loading outside the measured region. NVBench also performs a
+    // warm-up execution, but this makes the JIT benchmark's steady-state intent explicit.
+    {
+      auto warmup = cudf::hashing::xxhash_32_jit(data->view());
+      CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+    }
+
+    state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
+      auto result = cudf::hashing::xxhash_32_jit(data->view());
     });
   } else if (hash_name == "md5") {
     // md5 creates a 32-byte string
@@ -94,5 +121,14 @@ NVBENCH_BENCH(bench_hash)
   .add_int64_axis("num_rows", {65536, 16777216})
   .add_int64_axis("num_cols", {2, 64})
   .add_float64_axis("nulls", {0.0, 0.1})
+  .add_string_axis("layout", {"mixed"})
   .add_string_axis("hash_name",
-                   {"murmurhash3_x86_32", "md5", "sha1", "sha224", "sha256", "sha384", "sha512"});
+                   {"murmurhash3_x86_32",
+                    "xxhash_32",
+                    "xxhash_32_jit",
+                    "md5",
+                    "sha1",
+                    "sha224",
+                    "sha256",
+                    "sha384",
+                    "sha512"});

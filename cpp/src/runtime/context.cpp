@@ -111,7 +111,6 @@ context::~context()
 }
 
 rtcx::cache_t& context::rtcx_cache() { return *_rtcx_cache; }
-rtcx::cache_t& context::rtcx_cache() { return *_rtcx_cache; }
 
 jit_bundle_t& context::jit_bundle() { return *_jit_bundle; }
 

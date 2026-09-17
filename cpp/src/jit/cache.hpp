@@ -11,6 +11,7 @@
 #include <rtcx/rtcx.hpp>
 
 #include <span>
+#include <string_view>
 
 namespace CUDF_EXPORT cudf {
 
@@ -84,12 +85,14 @@ struct [[nodiscard]] kernel {
  * @param headers Contents of any additional embedded header files to include during compilation
  * @param kernel_instance String identifier for the specific kernel instance being requested (used
  * for caching)
+ * @param kernel_entry Name of the global kernel entry symbol to retrieve
  */
 kernel get_kernel(std::string const& name,
                   std::string const& source_file_id,
                   std::span<char const* const> header_include_names,
                   std::span<char const* const> headers,
-                  std::string const& kernel_instance);
+                  std::string const& kernel_instance,
+                  std::string_view kernel_entry = "cudf_kernel_entry");
 
 /**
  * @brief Gets a kernel fragment from an embedded CUDA source file

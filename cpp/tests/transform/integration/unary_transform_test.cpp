@@ -30,6 +30,7 @@
 #include <cudf_test/table_utilities.hpp>
 #include <cudf_test/type_lists.hpp>
 
+#include <cudf/detail/device_scalar.hpp>
 #include <cudf/detail/iterator.cuh>
 #include <cudf/dictionary/encode.hpp>
 #include <cudf/transform.hpp>
@@ -91,16 +92,118 @@ TEST_F(AssertsTest, TypeSupport)
 
   cudf::transform_input struct_inputs[] = {struct_col, cudf::scalar_column_view(t)};
 
-  EXPECT_THROW(
-    (void)cudf::transform(cudf::cuda_udf{udf, "lerp"},
-                          cudf::null_aware::NO,
+  static constexpr char const* struct_udf = R"***(
+    #include <jit/column_device_view_wrappers.cuh>
+    #include <jit/type_list.cuh>
+    __device__ inline void struct_valid(
+      cuda::std::optional<float>* out,
+      cudf::jit::struct_row<cudf::jit::type_list<float, float>> row,
+      cuda::std::optional<float> t)
+    {
+      *out = row.is_valid() ? t : cuda::std::nullopt;
+    }
+    )***";
+
+  EXPECT_NO_THROW(
+    (void)cudf::transform(cudf::cuda_udf{struct_udf, "struct_valid"},
+                          cudf::null_aware::YES,
                           std::nullopt,
                           struct_inputs,
                           std::array{cudf::transform_output{cudf::data_type{cudf::type_id::FLOAT32},
                                                             cudf::output_nullability::PRESERVE}},
                           {},
-                          std::nullopt),
-    std::invalid_argument);
+                          std::nullopt));
+}
+
+TEST_F(RuntimeSupportTest, RowAccessorInputMode)
+{
+  static constexpr char const* row_udf = R"***(
+    template <typename Row>
+    __device__ void lazy_lerp(float* out, Row const& row)
+    {
+      auto const a = row.template get<0>();
+      auto const b = row.template get<1>();
+      auto const t = row.template get<2>();
+      *out = a - t * a + t * b;
+    }
+    )***";
+
+  cudf::transform_input inputs[] = {a, b, cudf::scalar_column_view(t)};
+  auto result =
+    cudf::transform(cudf::cuda_udf{row_udf, "lazy_lerp", cudf::cuda_udf_input_mode::ROW_ACCESSOR},
+                    cudf::null_aware::NO,
+                    std::nullopt,
+                    inputs,
+                    std::array{cudf::transform_output{cudf::data_type{cudf::type_id::FLOAT32},
+                                                      cudf::output_nullability::ALL_VALID}},
+                    {},
+                    std::nullopt);
+
+  auto expected = cudf::test::fixed_width_column_wrapper<float>{
+    0.55F, 1.125F, 1.75F, 2.05F, 2.7F, 3.375F, 3.6F, 4.165F, 4.725F, 5.33F};
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(result->view().column(0), expected);
+}
+
+TEST_F(RuntimeSupportTest, RowAccessorScalarInput)
+{
+  static constexpr char const* row_udf = R"***(
+    template <typename Row>
+    __device__ void copy_scalar(uint32_t* out, Row const& row)
+    {
+      *out = row.template get<0>();
+    }
+    )***";
+
+  auto const stream = cudf::get_default_stream();
+  cudf::detail::device_scalar<uint32_t> seed{42, stream};
+  auto const seed_view =
+    cudf::column_view{cudf::data_type{cudf::type_id::UINT32}, 1, seed.data(), nullptr, 0};
+  cudf::transform_input inputs[] = {cudf::scalar_column_view(seed_view)};
+  auto result =
+    cudf::transform(cudf::cuda_udf{row_udf, "copy_scalar", cudf::cuda_udf_input_mode::ROW_ACCESSOR},
+                    cudf::null_aware::NO,
+                    std::nullopt,
+                    inputs,
+                    std::array{cudf::transform_output{cudf::data_type{cudf::type_id::UINT32},
+                                                      cudf::output_nullability::ALL_VALID}},
+                    {},
+                    3,
+                    stream);
+
+  auto expected = cudf::test::fixed_width_column_wrapper<uint32_t>{42, 42, 42};
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(result->view().column(0), expected);
+}
+
+TEST_F(RuntimeSupportTest, NullableRowAccessorInputMode)
+{
+  static constexpr char const* row_udf = R"***(
+    template <typename Row>
+    __device__ void nullable_lazy_lerp(cuda::std::optional<float>* out, Row const& row)
+    {
+      auto const a = row.template get<0>();
+      auto const b = row.template get<1>();
+      auto const t = row.template get<2>();
+      *out = a.has_value() && b.has_value() && t.has_value()
+               ? cuda::std::optional<float>{*a - *t * *a + *t * *b}
+               : cuda::std::nullopt;
+    }
+    )***";
+
+  cudf::transform_input inputs[] = {a, b_nulls, cudf::scalar_column_view(t)};
+  auto result                    = cudf::transform(
+    cudf::cuda_udf{row_udf, "nullable_lazy_lerp", cudf::cuda_udf_input_mode::ROW_ACCESSOR},
+    cudf::null_aware::YES,
+    std::nullopt,
+    inputs,
+    std::array{cudf::transform_output{cudf::data_type{cudf::type_id::FLOAT32},
+                                      cudf::output_nullability::PRESERVE}},
+    {},
+    std::nullopt);
+
+  auto expected = cudf::test::fixed_width_column_wrapper<float>{
+    {0.55F, 1.125F, 1.75F, 2.05F, 2.7F, 3.375F, 3.6F, 4.165F, 4.725F, 5.33F},
+    {true, true, true, true, true, true, true, true, true, false}};
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(result->view().column(0), expected);
 }
 
 TEST_F(AssertsTest, UnequalRowCount)
@@ -155,8 +258,7 @@ TEST_F(RuntimeSupportTest, TransformProgram)
                                        input_specs,
                                        output_specs};
 
-  auto expected = cudf::transform(udf,
-                                  cudf::udf_source_type::CUDA,
+  auto expected = cudf::transform(cudf::cuda_udf{udf, "lerp"},
                                   cudf::null_aware::NO,
                                   std::nullopt,
                                   inputs,

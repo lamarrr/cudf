@@ -84,7 +84,7 @@ struct transform_output {
  * @brief Describes a transform input independently of a particular column.
  *
  * An input specification contains the type information needed to reflect and retrieve a transform
- * kernel. Dictionary specifications recursively describe their indices and keys through `children`.
+ * kernel. Dictionary, list, and struct specifications recursively describe their children.
  * String specifications retain their offsets child type so `INT32` and `INT64` layouts can be
  * distinguished.
  */
@@ -94,7 +94,7 @@ struct transform_input_spec {
   bool is_scalar = false;  ///< Whether the input is presented to the UDF as a scalar
 
   std::vector<transform_input_spec> children =
-    {};  ///< Specifications of dictionary children or string offsets
+    {};  ///< Recursive child specifications, or string offsets
 };
 
 /**

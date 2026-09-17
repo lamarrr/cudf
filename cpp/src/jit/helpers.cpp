@@ -88,7 +88,8 @@ kernel get_udf_kernel(std::string const& source_file,
                       std::string const& cuda_source,
                       std::string const& udf_expression,
                       std::span<char const*> extra_include_names,
-                      std::span<char const*> extra_includes)
+                      std::span<char const*> extra_includes,
+                      std::string_view kernel_entry)
 {
   CUDF_FUNC_RANGE();
 
@@ -108,7 +109,8 @@ kernel get_udf_kernel(std::string const& source_file,
   include_names.insert(include_names.end(), extra_include_names.begin(), extra_include_names.end());
   include_headers.insert(include_headers.end(), extra_includes.begin(), extra_includes.end());
 
-  return get_kernel(source_file, source_file, include_names, include_headers, kernel_name);
+  return get_kernel(
+    source_file, source_file, include_names, include_headers, kernel_name, kernel_entry);
 }
 
 rtcx::blob get_udf_kernel_fragment(std::string const& source_file,

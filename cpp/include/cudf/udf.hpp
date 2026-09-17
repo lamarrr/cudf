@@ -17,6 +17,14 @@
 namespace CUDF_EXPORT cudf {
 
 /**
+ * @brief Selects how a CUDA transform UDF receives its input columns.
+ */
+enum class cuda_udf_input_mode : uint8_t {
+  VALUES,       ///< Pass one eagerly loaded value for each input column
+  ROW_ACCESSOR  ///< Pass one typed row accessor that loads input values on demand
+};
+
+/**
  * @brief A CUDA UDF containing the source code and the expression name to be used as the UDF.
  */
 struct cuda_udf {
@@ -27,6 +35,8 @@ struct cuda_udf {
                       ///< provided for the UDF compilation
   std::span<char const*> includes{};  ///< Null-terminated strings containing the contents of the
   ///< included files to be provided for the UDF compilation
+  cuda_udf_input_mode input_mode =
+    cuda_udf_input_mode::VALUES;  ///< How transform inputs are passed to the UDF
 
   /**
    * @brief Construct a CUDA UDF with the given source code and expression name.
@@ -34,6 +44,22 @@ struct cuda_udf {
    * @param expression The expression name of the UDF.
    */
   cuda_udf(char const* source, std::string_view expression) : source{source}, expression{expression}
+  {
+  }
+
+  /**
+   * @brief Construct a CUDA UDF with an explicit input passing mode.
+   *
+   * A `ROW_ACCESSOR` UDF receives a single `cudf::jit::row_accessor` after its output arguments
+   * instead of one value per input column. The accessor's `get<I>()` member loads input `I` for the
+   * current row on demand.
+   *
+   * @param source The source code of the UDF, a null-terminated C string.
+   * @param expression The expression name of the UDF.
+   * @param input_mode How transform inputs are passed to the UDF.
+   */
+  cuda_udf(char const* source, std::string_view expression, cuda_udf_input_mode input_mode)
+    : source{source}, expression{expression}, input_mode{input_mode}
   {
   }
 

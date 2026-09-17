@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <span>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -77,7 +78,8 @@ kernel get_udf_kernel(std::string const& source_file,
                       std::string const& cuda_source,
                       std::string const& udf_expression,
                       std::span<char const*> include_names,
-                      std::span<char const*> includes);
+                      std::span<char const*> includes,
+                      std::string_view kernel_entry = "cudf_kernel_entry");
 
 rtcx::blob get_udf_kernel_fragment(std::string const& source_file,
                                    std::string const& kernel_name,

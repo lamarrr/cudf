@@ -116,6 +116,137 @@ __device__ void transform_kernel(size_type row_size,
   ref.fetch_max(static_cast<int32_t>(thread_error), cuda::std::memory_order_relaxed);
 }
 
+/// @brief Transform kernel variant that passes a lazy row accessor instead of eager input values.
+template <bool is_null_aware, bool has_user_data, typename InputAccessors, typename OutputAccessors>
+__device__ void transform_row_kernel(
+  size_type row_size,
+  bitmask_type const* __restrict__ stencil,
+  void* __restrict__ user_data,
+  column_device_view_core const* __restrict__ input_cols,
+  mutable_column_device_view_core const* __restrict__ output_cols,
+  int32_t* __restrict__ max_error)
+{
+  auto start        = detail::grid_1d::global_thread_id();
+  auto stride       = detail::grid_1d::grid_stride();
+  auto thread_error = errc::SUCCESS;
+
+  for (auto row = start; row < row_size; row += stride) {
+    auto operation = [&]<typename Args>(Args args) {
+      auto input = row_accessor<is_null_aware, InputAccessors>{input_cols, row};
+      auto func  = [&](auto... output_args) {
+        if constexpr (has_user_data) {
+          if constexpr (!cuda::std::is_void_v<decltype(CUDF_DISPATCH_UDF(
+                          user_data, row, output_args..., input))>) {
+            return static_cast<cudf::errc>(
+              CUDF_DISPATCH_UDF(user_data, row, output_args..., input));
+          } else {
+            (void)CUDF_DISPATCH_UDF(user_data, row, output_args..., input);
+            return errc::SUCCESS;
+          }
+        } else {
+          if constexpr (!cuda::std::is_void_v<decltype(CUDF_DISPATCH_UDF(output_args..., input))>) {
+            return static_cast<cudf::errc>(CUDF_DISPATCH_UDF(output_args..., input));
+          } else {
+            (void)CUDF_DISPATCH_UDF(output_args..., input);
+            return errc::SUCCESS;
+          }
+        }
+      };
+      return cuda::std::apply(func, args);
+    };
+
+    if constexpr (!is_null_aware) {
+      if (stencil != nullptr && !bit_is_set(stencil, row)) { continue; }
+
+      auto outs = OutputAccessors::map(
+        [&]<typename... A>() { return cuda::std::tuple{A::output_arg(output_cols, row)...}; });
+      auto out_ptrs =
+        cuda::std::apply([&](auto&... args) { return cuda::std::tuple{&args...}; }, outs);
+
+      auto row_error = operation(out_ptrs);
+
+      OutputAccessors::map([&]<typename... A>() {
+        (A::assign(output_cols, row, cuda::std::get<A::index>(outs)), ...);
+      });
+
+      thread_error = cuda::std::max(thread_error, row_error);
+    } else {
+      auto active_mask = __ballot_sync(__activemask(), row < row_size);
+
+      auto outs = OutputAccessors::map(
+        [&]<typename... A>() { return cuda::std::tuple{A::null_output_arg(output_cols, row)...}; });
+      auto out_ptrs =
+        cuda::std::apply([&](auto&... args) { return cuda::std::tuple{&args...}; }, outs);
+
+      auto row_error = operation(out_ptrs);
+
+      OutputAccessors::map([&]<typename... A>() {
+        (A::assign(output_cols, row, *cuda::std::get<A::index>(outs)), ...);
+        (warp_compact_validity<A>(
+           active_mask, output_cols, row, cuda::std::get<A::index>(outs).has_value()),
+         ...);
+      });
+
+      thread_error = cuda::std::max(thread_error, row_error);
+    }
+  }
+
+  if (thread_error == errc::SUCCESS) { return; }
+
+  cuda::atomic_ref ref(*max_error);
+  ref.fetch_max(static_cast<int32_t>(thread_error), cuda::std::memory_order_relaxed);
+}
+
+/// @brief Lazy-input transform specialized for direct fixed-width output stores.
+template <bool is_null_aware, bool has_user_data, typename InputAccessors, typename OutputAccessors>
+__device__ void transform_row_direct_kernel(
+  size_type row_size,
+  bitmask_type const* __restrict__ stencil,
+  void* __restrict__ user_data,
+  column_device_view_core const* __restrict__ input_cols,
+  mutable_column_device_view_core const* __restrict__ output_cols,
+  int32_t* __restrict__ max_error)
+{
+  auto start        = detail::grid_1d::global_thread_id();
+  auto stride       = detail::grid_1d::grid_stride();
+  auto thread_error = errc::SUCCESS;
+
+  for (auto row = start; row < row_size; row += stride) {
+    if constexpr (!is_null_aware) {
+      if (stencil != nullptr && !bit_is_set(stencil, row)) { continue; }
+    }
+
+    auto input     = row_accessor<is_null_aware, InputAccessors>{input_cols, row};
+    auto operation = [&](auto... outputs) {
+      if constexpr (has_user_data) {
+        if constexpr (!cuda::std::is_void_v<decltype(CUDF_DISPATCH_UDF(
+                        user_data, row, outputs..., input))>) {
+          return static_cast<cudf::errc>(CUDF_DISPATCH_UDF(user_data, row, outputs..., input));
+        } else {
+          (void)CUDF_DISPATCH_UDF(user_data, row, outputs..., input);
+          return errc::SUCCESS;
+        }
+      } else {
+        if constexpr (!cuda::std::is_void_v<decltype(CUDF_DISPATCH_UDF(outputs..., input))>) {
+          return static_cast<cudf::errc>(CUDF_DISPATCH_UDF(outputs..., input));
+        } else {
+          (void)CUDF_DISPATCH_UDF(outputs..., input);
+          return errc::SUCCESS;
+        }
+      }
+    };
+
+    auto const row_error = OutputAccessors::map(
+      [&]<typename... A>() { return operation(A::direct_output_ptr(output_cols, row)...); });
+    thread_error = cuda::std::max(thread_error, row_error);
+  }
+
+  if (thread_error == errc::SUCCESS) { return; }
+
+  cuda::atomic_ref ref(*max_error);
+  ref.fetch_max(static_cast<int32_t>(thread_error), cuda::std::memory_order_relaxed);
+}
+
 }  // namespace jit
 }  // namespace cudf
 
@@ -138,3 +269,18 @@ extern "C" __global__ void CUDF_KERNEL_ENTRY(
 {
   CUDF_KERNEL_INSTANCE(row_size, stencil, user_data, input_cols, output_cols, max_error);
 }
+
+#ifndef CUDF_LTO_MODE
+// Lazy row UDFs consume their inputs in bounded groups. This entry point caps registers so at
+// least two 256-thread blocks can reside on an SM, without changing the ordinary transform kernel.
+extern "C" __global__ __launch_bounds__(256, 2) void cudf_row_kernel_entry(
+  cudf::size_type row_size,
+  cudf::bitmask_type const* __restrict__ stencil,
+  void* __restrict__ user_data,
+  cudf::column_device_view_core const* __restrict__ input_cols,
+  cudf::mutable_column_device_view_core const* __restrict__ output_cols,
+  int32_t* __restrict__ max_error)
+{
+  CUDF_KERNEL_INSTANCE(row_size, stencil, user_data, input_cols, output_cols, max_error);
+}
+#endif

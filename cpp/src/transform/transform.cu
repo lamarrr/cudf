@@ -14,6 +14,7 @@
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/detail/valid_if.cuh>
 #include <cudf/errc.hpp>
+#include <cudf/lists/lists_column_view.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/strings/detail/strings_column_factories.cuh>
@@ -234,9 +235,38 @@ struct element_type_name_fn {
   }
 
   template <typename T>
+  std::string operator()(transform_input_spec const& spec, bool use_physical_type) const
+    requires(std::same_as<T, cudf::list_view>)
+  {
+    CUDF_EXPECTS(spec.children.size() > lists_column_view::child_column_index,
+                 "A list transform input must have an offsets and child column",
+                 std::invalid_argument);
+    return std::format(
+      "cudf::jit::list_row<{}, {}>",
+      get_element_type_name(spec.children.at(lists_column_view::offsets_column_index),
+                            use_physical_type),
+      get_element_type_name(spec.children.at(lists_column_view::child_column_index),
+                            use_physical_type));
+  }
+
+  template <typename T>
+  std::string operator()(transform_input_spec const& spec, bool use_physical_type) const
+    requires(std::same_as<T, cudf::struct_view>)
+  {
+    std::vector<std::string> children;
+    children.reserve(spec.children.size());
+    for (auto const& child : spec.children) {
+      children.push_back(get_element_type_name(child, use_physical_type));
+    }
+    return std::format("cudf::jit::struct_row<{}>",
+                       rtcx::reflect_template("cudf::jit::type_list", children));
+  }
+
+  template <typename T>
   std::string operator()(transform_input_spec const& spec, bool) const
     requires(!is_fixed_width<T>() && !std::same_as<T, cudf::string_view> &&
-             !std::same_as<T, cudf::dictionary32>)
+             !std::same_as<T, cudf::dictionary32> && !std::same_as<T, cudf::list_view> &&
+             !std::same_as<T, cudf::struct_view>)
   {
     CUDF_FAIL("Unsupported type for JIT compilation: " + type_to_name(data_type{spec.type}));
   }
@@ -255,6 +285,9 @@ std::string reflect_input_element(transform_input_spec const& spec, bool use_phy
 
 std::string reflect_output_element(transform_output_spec const& spec, bool use_physical_type)
 {
+  CUDF_EXPECTS(spec.type != type_id::LIST && spec.type != type_id::STRUCT,
+               "Nested transform outputs are not supported",
+               std::invalid_argument);
   if (spec.type == type_id::STRING) {
     return spec.has_string_offsets ? "cuda::std::span<char>" : "cudf::string_view";
   }
@@ -347,7 +380,8 @@ auto reflect(std::variant<udf_source_type, fragment_type> source_type,
 transform_input_spec make_input_spec(column_view const& column, bool is_scalar)
 {
   transform_input_spec result{.type = column.type().id(), .is_scalar = is_scalar};
-  if (is_dictionary(column.type())) {
+  if (is_dictionary(column.type()) || column.type().id() == type_id::LIST ||
+      column.type().id() == type_id::STRUCT) {
     for (size_type i = 0; i < column.num_children(); ++i) {
       result.children.push_back(make_input_spec(column.child(i), false));
     }
@@ -380,7 +414,9 @@ std::vector<transform_input_spec> make_input_specs(std::span<input_column_view c
 
 transform_output_spec make_output_spec(fixed_width_column const& output)
 {
-  return {.type = output._col->type().id()};
+  return {.type = output._col->type().id(),
+          .nullability =
+            output._col->nullable() ? output_nullability::PRESERVE : output_nullability::ALL_VALID};
 }
 
 transform_output_spec make_output_spec(string_views_column const&)
@@ -424,6 +460,26 @@ std::vector<transform_output_spec> make_output_specs(
   return result;
 }
 
+struct is_direct_output_type_fn {
+  template <typename T>
+  constexpr bool operator()() const
+  {
+    return cudf::is_rep_layout_compatible<T>();
+  }
+};
+
+bool use_direct_output_kernel(bool is_null_aware, std::span<transform_output_spec const> outputs)
+{
+  auto const all_direct_types = std::all_of(outputs.begin(), outputs.end(), [](auto const& output) {
+    return cudf::type_dispatcher(data_type{output.type}, is_direct_output_type_fn{});
+  });
+  auto const all_outputs_valid =
+    std::all_of(outputs.begin(), outputs.end(), [](auto const& output) {
+      return output.nullability == output_nullability::ALL_VALID;
+    });
+  return all_direct_types && (!is_null_aware || all_outputs_valid);
+}
+
 auto reflect(std::variant<udf_source_type, fragment_type> source_type,
              std::span<input_column_view const> inputs,
              std::span<output_column const> outputs)
@@ -442,8 +498,10 @@ std::string reflect_udf_signature(bool is_null_aware,
   std::vector<std::string> in_types;
 
   for (size_t i = 0; i < inputs.size(); i++) {
-    auto element = reflect_input_value_type(inputs[i], use_physical_types);
-    in_types.push_back(is_null_aware ? std::format("cuda::std::optional<{}>", element) : element);
+    auto element         = reflect_input_value_type(inputs[i], use_physical_types);
+    auto const is_nested = inputs[i].type == type_id::LIST || inputs[i].type == type_id::STRUCT;
+    in_types.push_back(is_null_aware && !is_nested ? std::format("cuda::std::optional<{}>", element)
+                                                   : element);
   }
 
   std::vector<std::string> out_types;
@@ -650,17 +708,24 @@ kernel build_kernel(bool is_null_aware,
 {
   auto [in_types, out_types, ptx_in_types, ptx_out_types] =
     reflect(udf_source_type::CUDA, inputs, outputs);
-  auto kernel_instance = rtcx::reflect_template("cudf::jit::transform_kernel",
-                                                rtcx::reflect(is_null_aware),
-                                                rtcx::reflect(has_user_data),
-                                                in_types,
-                                                out_types);
+  auto const output_specs  = make_output_specs(outputs);
+  auto const row_accessor  = descriptor.input_mode == cuda_udf_input_mode::ROW_ACCESSOR;
+  auto const direct_output = row_accessor && use_direct_output_kernel(is_null_aware, output_specs);
+  auto const kernel_name   = direct_output  ? "cudf::jit::transform_row_direct_kernel"
+                             : row_accessor ? "cudf::jit::transform_row_kernel"
+                                            : "cudf::jit::transform_kernel";
+  auto kernel_instance     = rtcx::reflect_template(
+    kernel_name, rtcx::reflect(is_null_aware), rtcx::reflect(has_user_data), in_types, out_types);
+  auto const kernel_entry = descriptor.input_mode == cuda_udf_input_mode::ROW_ACCESSOR
+                              ? "cudf_row_kernel_entry"
+                              : "cudf_kernel_entry";
   return jit::get_udf_kernel("cudf/cpp/src/transform/jit/kernel.cu",
                              kernel_instance,
                              descriptor.source,
                              descriptor.expression,
                              descriptor.include_names,
-                             descriptor.includes);
+                             descriptor.includes,
+                             kernel_entry);
 }
 
 kernel build_kernel(bool is_null_aware,
@@ -751,17 +816,23 @@ kernel get_kernel(bool is_null_aware,
 {
   auto [in_types, out_types, ptx_in_types, ptx_out_types] =
     reflect(udf_source_type::CUDA, inputs, outputs);
-  auto kernel_instance = rtcx::reflect_template("cudf::jit::transform_kernel",
-                                                rtcx::reflect(is_null_aware),
-                                                rtcx::reflect(has_user_data),
-                                                in_types,
-                                                out_types);
+  auto const row_accessor  = descriptor.input_mode == cuda_udf_input_mode::ROW_ACCESSOR;
+  auto const direct_output = row_accessor && use_direct_output_kernel(is_null_aware, outputs);
+  auto const kernel_name   = direct_output  ? "cudf::jit::transform_row_direct_kernel"
+                             : row_accessor ? "cudf::jit::transform_row_kernel"
+                                            : "cudf::jit::transform_kernel";
+  auto kernel_instance     = rtcx::reflect_template(
+    kernel_name, rtcx::reflect(is_null_aware), rtcx::reflect(has_user_data), in_types, out_types);
+  auto const kernel_entry = descriptor.input_mode == cuda_udf_input_mode::ROW_ACCESSOR
+                              ? "cudf_row_kernel_entry"
+                              : "cudf_kernel_entry";
   return jit::get_udf_kernel("cudf/cpp/src/transform/jit/kernel.cu",
                              kernel_instance,
                              descriptor.source,
                              descriptor.expression,
                              descriptor.include_names,
-                             descriptor.includes);
+                             descriptor.includes,
+                             kernel_entry);
 }
 
 kernel get_kernel(bool is_null_aware,
@@ -1024,7 +1095,8 @@ void perform_checks(std::variant<udf_source_type, fragment_type> source_type,
                std::invalid_argument);
 
   static constexpr auto is_input_value_supported = [](auto const& c) {
-    return is_fixed_width(c.type()) || c.type().id() == type_id::STRING || is_dictionary(c.type());
+    return is_fixed_width(c.type()) || c.type().id() == type_id::STRING ||
+           is_dictionary(c.type()) || is_nested(c.type());
   };
   static constexpr auto is_supported_input_type = [&](auto const& c) {
     auto col = std::visit([](auto const& c) { return as_column_view(c); }, c);
@@ -1035,7 +1107,7 @@ void perform_checks(std::variant<udf_source_type, fragment_type> source_type,
   CUDF_EXPECTS(
     std::none_of(
       inputs.begin(), inputs.end(), [&](auto const& in) { return !is_supported_input_type(in); }),
-    "Transforms only support input of fixed-width, string, or dictionary types",
+    "Transforms only support input of fixed-width, string, dictionary, list, or struct types",
     std::invalid_argument);
 
   if (!in_row_size.has_value()) {

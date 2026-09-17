@@ -15,4 +15,5 @@
 #include <cudf/detail/operators/math.cuh>
 #include <cudf/detail/operators/null_handling.cuh>
 #include <cudf/detail/operators/trigonometric.cuh>
+#include <cudf/detail/operators/xxhash.cuh>
 #include <cudf/errc.hpp>

@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cudf/table/table_device_view.cuh>
+#include <cudf/table/table_view.hpp>
 
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
@@ -63,6 +64,14 @@ struct preprocessed_table {
    */
   operator table_device_view() { return *_t; }
 
+  /**
+   * @brief Returns the host view of the preprocessed, verticalized table.
+   *
+   * The returned view remains valid for the lifetime of this object. Any temporary columns and
+   * null masks referenced by the view are owned by this object.
+   */
+  [[nodiscard]] table_view const& table() const noexcept { return _table; }
+
  private:
   friend class self_comparator;
   friend class two_table_comparator;
@@ -77,15 +86,18 @@ struct preprocessed_table {
                                                        cuda::stream_ref,
                                                        rmm::device_async_resource_ref>;
 
-  preprocessed_table(table_device_view_owner&& table,
+  preprocessed_table(table_view table,
+                     table_device_view_owner&& device_table,
                      std::vector<rmm::device_buffer>&& null_buffers,
                      std::vector<std::unique_ptr<column>>&& tmp_columns)
-    : _t(std::move(table)),
+    : _table(std::move(table)),
+      _t(std::move(device_table)),
       _null_buffers(std::move(null_buffers)),
       _tmp_columns(std::move(tmp_columns))
   {
   }
 
+  table_view _table;
   table_device_view_owner _t;
   std::vector<rmm::device_buffer> _null_buffers;
   std::vector<std::unique_ptr<column>> _tmp_columns;

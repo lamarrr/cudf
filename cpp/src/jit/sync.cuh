@@ -34,6 +34,8 @@ __device__ void warp_compact_validity(unsigned int active_mask,
                                       size_type row,
                                       bool is_valid)
 {
+  if (Out::column(outcols).null_mask() == nullptr) { return; }
+
   auto null_word = __ballot_sync(active_mask, is_valid);
   // use warp-elect to make sure we only issue one memory transaction per warp
   if (warp_elect(active_mask)) {

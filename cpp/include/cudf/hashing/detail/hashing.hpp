@@ -52,7 +52,7 @@ std::unique_ptr<column> sha512(table_view const& input,
                                rmm::device_async_resource_ref mr);
 
 std::unique_ptr<column> xxhash_32(table_view const& input,
-                                  uint64_t seed,
+                                  uint32_t seed,
                                   cuda::stream_ref,
                                   rmm::device_async_resource_ref mr);
 

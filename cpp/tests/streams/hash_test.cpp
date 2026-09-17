@@ -41,6 +41,10 @@ TEST_F(HashTest, MultiValue)
 
   auto const output1 = cudf::hashing::murmurhash3_x86_32(
     input1, cudf::DEFAULT_HASH_SEED, cudf::test::get_default_stream());
+  auto const output2 =
+    cudf::hashing::xxhash_32(input1, cudf::DEFAULT_HASH_SEED, cudf::test::get_default_stream());
+  auto const output3 =
+    cudf::hashing::xxhash_32_jit(input1, cudf::DEFAULT_HASH_SEED, cudf::test::get_default_stream());
 }
 
 CUDF_TEST_PROGRAM_MAIN()

@@ -180,6 +180,25 @@ std::unique_ptr<column> xxhash_32(
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
+ * @brief Computes the XXHash_32 hash value of each row using the JIT transform implementation
+ *
+ * This entry point always uses the JIT implementation, independently of `LIBCUDF_JIT_ENABLED`.
+ * Its results and null handling are identical to `xxhash_32`.
+ *
+ * @param input The table of columns to hash
+ * @param seed Optional seed value to use for the hash function
+ * @param stream CUDA stream used for device memory operations and kernel launches
+ * @param mr Device memory resource used to allocate the returned column's device memory
+ *
+ * @returns A column where each row is the hash of a row from the input
+ */
+std::unique_ptr<column> xxhash_32_jit(
+  table_view const& input,
+  uint32_t seed                     = DEFAULT_HASH_SEED,
+  cuda::stream_ref stream           = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+/**
  * @brief Computes the XXHash_64 hash value of each row in the given table
  *
  * This function takes a 64-bit seed value and returns a column of type UINT64.
