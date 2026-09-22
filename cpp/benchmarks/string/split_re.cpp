@@ -41,16 +41,15 @@ static void bench_split_re(nvbench::state& state)
 
   auto const& pattern = patterns[pattern_index];
   auto prog = backend == "interpreter" ? cudf::strings::regex_program::create(pattern) : nullptr;
+  auto jit_program = backend == "jit"
+                       ? cudf::experimental::regex_jit_program::create(
+                           pattern, cudf::experimental::regex_operation::SPLIT_RECORD)
+                       : nullptr;
 
   data_profile const profile = data_profile_builder().distribution(
     cudf::type_id::STRING, distribution_id::NORMAL, min_width, max_width);
   auto const column = create_random_column(cudf::type_id::STRING, row_count{num_rows}, profile);
   cudf::strings_column_view input(column->view());
-  if (backend == "jit") {
-    static_cast<void>(cudf::experimental::split_record_re_jit(input, pattern));
-    cudf::get_default_stream().synchronize();
-  }
-
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().get()));
   // gather some throughput statistics as well
   auto const data_size = column->alloc_size();
@@ -60,7 +59,7 @@ static void bench_split_re(nvbench::state& state)
   auto const mem_stats_logger = cudf::memory_stats_logger();
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
     if (backend == "jit") {
-      static_cast<void>(cudf::experimental::split_record_re_jit(input, pattern));
+      static_cast<void>(cudf::experimental::split_record_re(input, *jit_program, -1));
     } else {
       static_cast<void>(cudf::strings::split_record_re(input, *prog));
     }

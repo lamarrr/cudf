@@ -1,7 +1,8 @@
 /*
- * Copyright (c) 2026, Regex IR contributors.
+ * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
+
 #pragma once
 
 #include <cstddef>
@@ -52,6 +53,14 @@ enum class operation_kind : std::uint8_t {
 };
 
 /**
+ * @brief Result of compiling a regular expression
+ */
+struct compile_result {
+  std::string nvvm_ir;
+  std::uint32_t capture_count;
+};
+
+/**
  * @brief Compile a regular expression into operation-specialized NVVM IR
  *
  * `replacement` is required for `REPLACE` and rejected for every other
@@ -61,12 +70,12 @@ enum class operation_kind : std::uint8_t {
  * @param operation Operation implemented by the generated entry point
  * @param replacement Replacement template for `REPLACE`
  * @param options Regex syntax, character-mode, and resource-limit options
- * @return Self-contained textual NVVM IR
+ * @return Generated NVVM IR and the number of explicit capture groups
  */
-[[nodiscard]] std::string compile(std::string_view pattern,
-                                  operation_kind operation,
-                                  std::optional<std::string> replacement = std::nullopt,
-                                  compile_options const& options         = {});
+[[nodiscard]] compile_result compile(std::string_view pattern,
+                                     operation_kind operation,
+                                     std::optional<std::string> replacement = std::nullopt,
+                                     compile_options const& options         = {});
 
 /**
  * @brief Helpers for constructing cuDF-compatible NVVM kernel modules
@@ -83,38 +92,51 @@ struct replacement_piece {
 
 [[nodiscard]] std::string assemble(std::string matcher, std::string kernel);
 
-[[nodiscard]] std::string make_fixed_kernel(bool offset64, operation_kind operation);
+[[nodiscard]] std::string make_fixed_kernel(bool offset64,
+                                            operation_kind operation,
+                                            std::string_view kernel_name);
 
 [[nodiscard]] std::string make_capture_kernel(bool offset64,
                                               std::int32_t capture_slots,
                                               std::int32_t first_group,
                                               std::int32_t output_groups,
-                                              bool column_major);
+                                              bool column_major,
+                                              std::string_view kernel_name);
 
 [[nodiscard]] std::string make_enumeration_size_kernel(bool offset64,
                                                        std::int32_t capture_slots,
                                                        std::int32_t multiplier,
-                                                       bool require_match);
+                                                       bool require_match,
+                                                       std::string_view kernel_name);
 
 [[nodiscard]] std::string make_enumeration_emit_kernel(bool offset64,
                                                        std::int32_t capture_slots,
                                                        std::int32_t groups,
-                                                       bool findall);
+                                                       bool findall,
+                                                       std::string_view kernel_name);
 
 [[nodiscard]] std::string make_limited_replace_kernel(
   bool offset64,
   bool emit,
+  bool output_offset64,
   std::span<replacement_piece const> replacement,
   std::int32_t capture_slots,
-  std::int32_t max_replace_count);
+  std::int32_t max_replace_count,
+  std::string_view kernel_name);
 
 [[nodiscard]] std::string encode_replacement(std::span<replacement_piece const> replacement);
 
-[[nodiscard]] std::string make_replace_kernel(bool offset64, bool emit);
+[[nodiscard]] std::string make_replace_kernel(bool offset64,
+                                              bool emit,
+                                              std::string_view kernel_name);
 
-[[nodiscard]] std::string make_split_size_kernel(bool offset64, std::int32_t maxsplit);
+[[nodiscard]] std::string make_split_size_kernel(bool offset64,
+                                                 std::int32_t maxsplit,
+                                                 std::string_view kernel_name);
 
-[[nodiscard]] std::string make_split_emit_kernel(bool offset64, bool reverse);
+[[nodiscard]] std::string make_split_emit_kernel(bool offset64,
+                                                 bool reverse,
+                                                 std::string_view kernel_name);
 
 }  // namespace nvvm
 

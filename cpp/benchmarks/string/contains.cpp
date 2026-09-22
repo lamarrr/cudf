@@ -47,18 +47,16 @@ static void bench_contains(nvbench::state& state)
 
   auto pattern = patterns[pattern_index];
   auto program = backend == "interpreter" ? cudf::strings::regex_program::create(pattern) : nullptr;
-  if (backend == "jit") {
-    static_cast<void>(cudf::experimental::contains_re_jit(input, pattern));
-    cudf::get_default_stream().synchronize();
-  }
-
+  auto jit_program = backend == "jit" ? cudf::experimental::regex_jit_program::create(
+                                          pattern, cudf::experimental::regex_operation::CONTAINS)
+                                      : nullptr;
   state.add_global_memory_reads<nvbench::int8_t>(col->alloc_size());
   state.add_global_memory_writes<nvbench::int32_t>(input.size());
 
   auto const mem_stats_logger = cudf::memory_stats_logger();
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
     if (backend == "jit") {
-      static_cast<void>(cudf::experimental::contains_re_jit(input, pattern));
+      static_cast<void>(cudf::experimental::contains_re(input, *jit_program));
     } else {
       static_cast<void>(cudf::strings::contains_re(input, *program));
     }

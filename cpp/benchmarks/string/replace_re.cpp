@@ -47,6 +47,14 @@ static void bench_replace(nvbench::state& state)
   auto const pat =
     (rtype == "backref") ? "(" + patterns[pattern_index] + ")" : patterns[pattern_index];
   auto program = backend == "interpreter" ? cudf::strings::regex_program::create(pat) : nullptr;
+  auto jit_operation = rtype == "backref"
+                         ? cudf::experimental::regex_operation::REPLACE_WITH_BACKREFS
+                         : cudf::experimental::regex_operation::REPLACE;
+  auto jit_options   = cudf::experimental::regex_jit_program_options{
+      .replacement = rtype == "backref" ? "#\\1X" : "77"};
+  auto jit_program = backend == "jit" ? cudf::experimental::regex_jit_program::create(
+                                          pat, jit_operation, jit_options)
+                                      : nullptr;
 
   auto const data_size = column->alloc_size();
   state.add_global_memory_reads<nvbench::int8_t>(data_size);
@@ -55,28 +63,19 @@ static void bench_replace(nvbench::state& state)
   auto const mem_stats_logger = cudf::memory_stats_logger();
   if (rtype == "backref") {
     auto replacement = std::string("#\\1X");
-    if (backend == "jit") {
-      static_cast<void>(
-        cudf::experimental::replace_with_backrefs_jit(input, pat, replacement));
-      cudf::get_default_stream().synchronize();
-    }
     state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
       if (backend == "jit") {
         static_cast<void>(
-          cudf::experimental::replace_with_backrefs_jit(input, pat, replacement));
+          cudf::experimental::replace_with_backrefs(input, *jit_program, replacement));
       } else {
         static_cast<void>(cudf::strings::replace_with_backrefs(input, *program, replacement));
       }
     });
   } else {
     auto replacement = cudf::string_scalar("77");
-    if (backend == "jit") {
-      static_cast<void>(cudf::experimental::replace_re_jit(input, pat, replacement));
-      cudf::get_default_stream().synchronize();
-    }
     state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
       if (backend == "jit") {
-        static_cast<void>(cudf::experimental::replace_re_jit(input, pat, replacement));
+        static_cast<void>(cudf::experimental::replace_re(input, *jit_program, replacement));
       } else {
         static_cast<void>(cudf::strings::replace_re(input, *program, replacement));
       }
