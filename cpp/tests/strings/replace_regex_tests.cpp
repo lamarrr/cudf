@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -15,7 +15,7 @@
 #include <cudf/strings/replace_re.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 
-#include <thrust/iterator/transform_iterator.h>
+#include <cuda/iterator>
 
 #include <ranges>
 #include <span>
@@ -383,7 +383,7 @@ TYPED_TEST(StringsReplaceRegexTest, ReplaceBackrefsWithEmptyCapture)
   cudf::test::strings_column_wrapper input({"one\ntwo", "three\n\n", "four\r\n"});
   auto sv = cudf::strings_column_view(input);
 
-  // https://github.com/rapidsai/cudf/issues/13404
+  // https://github.com/NVIDIA/cudf/issues/13404
   auto pattern       = std::string("(\r\n|\r)?$");
   auto repl_template = std::string("[\\1]");
   auto expected =
@@ -392,7 +392,7 @@ TYPED_TEST(StringsReplaceRegexTest, ReplaceBackrefsWithEmptyCapture)
   auto results = TypeParam::replace_with_backrefs(sv, *prog, repl_template);
   CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(*results, expected);
 
-  // https://github.com/rapidsai/cudf/issues/22707
+  // https://github.com/NVIDIA/cudf/issues/22707
   pattern  = std::string("^(a?)");
   expected = cudf::test::strings_column_wrapper({"[]one\ntwo", "[]three\n\n", "[]four\r\n"});
   prog     = TypeParam::create(pattern);
@@ -428,9 +428,9 @@ TYPED_TEST(StringsReplaceRegexTest, MediumReplaceRegex)
     "12345678901234567890",
     "abcdefghijklmnopqrstuvwxyz"};
   cudf::test::strings_column_wrapper strings(
-    h_strings.begin(),
-    h_strings.end(),
-    thrust::make_transform_iterator(h_strings.begin(), [](auto str) { return str != nullptr; }));
+    h_strings.begin(), h_strings.end(), cuda::transform_iterator(h_strings.begin(), [](auto str) {
+      return str != nullptr;
+    }));
 
   auto strings_view = cudf::strings_column_view(strings);
   auto results      = TypeParam::replace_re(strings_view, *prog);
@@ -439,7 +439,7 @@ TYPED_TEST(StringsReplaceRegexTest, MediumReplaceRegex)
   cudf::test::strings_column_wrapper expected(
     h_expected.begin(),
     h_expected.end(),
-    thrust::make_transform_iterator(h_expected.begin(), [](auto str) { return str != nullptr; }));
+    cuda::transform_iterator(h_expected.begin(), [](auto str) { return str != nullptr; }));
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(*results, expected);
 }
 
@@ -457,9 +457,9 @@ TYPED_TEST(StringsReplaceRegexTest, LargeReplaceRegex)
     "12345678901234567890",
     "abcdefghijklmnopqrstuvwxyz"};
   cudf::test::strings_column_wrapper strings(
-    h_strings.begin(),
-    h_strings.end(),
-    thrust::make_transform_iterator(h_strings.begin(), [](auto str) { return str != nullptr; }));
+    h_strings.begin(), h_strings.end(), cuda::transform_iterator(h_strings.begin(), [](auto str) {
+      return str != nullptr;
+    }));
 
   auto strings_view = cudf::strings_column_view(strings);
   auto results      = TypeParam::replace_re(strings_view, *prog);
@@ -468,7 +468,7 @@ TYPED_TEST(StringsReplaceRegexTest, LargeReplaceRegex)
   cudf::test::strings_column_wrapper expected(
     h_expected.begin(),
     h_expected.end(),
-    thrust::make_transform_iterator(h_expected.begin(), [](auto str) { return str != nullptr; }));
+    cuda::transform_iterator(h_expected.begin(), [](auto str) { return str != nullptr; }));
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(*results, expected);
 }
 

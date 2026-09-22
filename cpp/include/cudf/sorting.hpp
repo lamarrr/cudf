@@ -14,13 +14,16 @@
 #include <memory>
 #include <vector>
 
+/**
+ * @file
+ * @brief Column APIs for sort and rank
+ */
+
 namespace CUDF_EXPORT cudf {
 
 /**
  * @addtogroup column_sort
  * @{
- * @file
- * @brief Column APIs for sort and rank
  */
 
 /**
@@ -42,7 +45,7 @@ std::unique_ptr<column> sorted_order(
   table_view const& input,
   std::vector<order> const& column_order         = {},
   std::vector<null_order> const& null_precedence = {},
-  rmm::cuda_stream_view stream                   = cudf::get_default_stream(),
+  cuda::stream_ref stream                        = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr              = cudf::get_current_device_resource_ref());
 
 /**
@@ -57,7 +60,7 @@ std::unique_ptr<column> stable_sorted_order(
   table_view const& input,
   std::vector<order> const& column_order         = {},
   std::vector<null_order> const& null_precedence = {},
-  rmm::cuda_stream_view stream                   = cudf::get_default_stream(),
+  cuda::stream_ref stream                        = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr              = cudf::get_current_device_resource_ref());
 
 /**
@@ -80,7 +83,7 @@ std::unique_ptr<column> stable_sorted_order(
 bool is_sorted(cudf::table_view const& table,
                std::vector<order> const& column_order,
                std::vector<null_order> const& null_precedence,
-               rmm::cuda_stream_view stream = cudf::get_default_stream());
+               cuda::stream_ref stream = cudf::get_default_stream());
 
 /**
  * @brief Performs a lexicographic sort of the rows of a table
@@ -101,7 +104,7 @@ std::unique_ptr<table> sort(
   table_view const& input,
   std::vector<order> const& column_order         = {},
   std::vector<null_order> const& null_precedence = {},
-  rmm::cuda_stream_view stream                   = cudf::get_default_stream(),
+  cuda::stream_ref stream                        = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr              = cudf::get_current_device_resource_ref());
 
 /**
@@ -113,7 +116,7 @@ std::unique_ptr<table> stable_sort(
   table_view const& input,
   std::vector<order> const& column_order         = {},
   std::vector<null_order> const& null_precedence = {},
-  rmm::cuda_stream_view stream                   = cudf::get_default_stream(),
+  cuda::stream_ref stream                        = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr              = cudf::get_current_device_resource_ref());
 
 /**
@@ -143,7 +146,7 @@ std::unique_ptr<table> sort_by_key(
   table_view const& keys,
   std::vector<order> const& column_order         = {},
   std::vector<null_order> const& null_precedence = {},
-  rmm::cuda_stream_view stream                   = cudf::get_default_stream(),
+  cuda::stream_ref stream                        = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr              = cudf::get_current_device_resource_ref());
 
 /**
@@ -156,7 +159,7 @@ std::unique_ptr<table> stable_sort_by_key(
   table_view const& keys,
   std::vector<order> const& column_order         = {},
   std::vector<null_order> const& null_precedence = {},
-  rmm::cuda_stream_view stream                   = cudf::get_default_stream(),
+  cuda::stream_ref stream                        = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr              = cudf::get_current_device_resource_ref());
 
 /**
@@ -223,7 +226,7 @@ std::unique_ptr<column> rank(
   null_policy null_handling,
   null_order null_precedence,
   bool percentage,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
@@ -278,7 +281,7 @@ std::unique_ptr<column> segmented_sorted_order(
   column_view const& segment_offsets,
   std::vector<order> const& column_order         = {},
   std::vector<null_order> const& null_precedence = {},
-  rmm::cuda_stream_view stream                   = cudf::get_default_stream(),
+  cuda::stream_ref stream                        = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr              = cudf::get_current_device_resource_ref());
 
 /**
@@ -291,7 +294,7 @@ std::unique_ptr<column> stable_segmented_sorted_order(
   column_view const& segment_offsets,
   std::vector<order> const& column_order         = {},
   std::vector<null_order> const& null_precedence = {},
-  rmm::cuda_stream_view stream                   = cudf::get_default_stream(),
+  cuda::stream_ref stream                        = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr              = cudf::get_current_device_resource_ref());
 
 /**
@@ -347,7 +350,7 @@ std::unique_ptr<table> segmented_sort_by_key(
   column_view const& segment_offsets,
   std::vector<order> const& column_order         = {},
   std::vector<null_order> const& null_precedence = {},
-  rmm::cuda_stream_view stream                   = cudf::get_default_stream(),
+  cuda::stream_ref stream                        = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr              = cudf::get_current_device_resource_ref());
 
 /**
@@ -361,7 +364,7 @@ std::unique_ptr<table> stable_segmented_sort_by_key(
   column_view const& segment_offsets,
   std::vector<order> const& column_order         = {},
   std::vector<null_order> const& null_precedence = {},
-  rmm::cuda_stream_view stream                   = cudf::get_default_stream(),
+  cuda::stream_ref stream                        = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr              = cudf::get_current_device_resource_ref());
 
 /**
@@ -384,7 +387,7 @@ std::unique_ptr<column> top_k(
   column_view const& col,
   size_type k,
   order topk_order                  = order::DESCENDING,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
@@ -407,7 +410,7 @@ std::unique_ptr<column> top_k_order(
   column_view const& col,
   size_type k,
   order topk_order                  = order::DESCENDING,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
@@ -454,7 +457,7 @@ std::unique_ptr<column> segmented_top_k(
   column_view const& segment_offsets,
   size_type k,
   order topk_order                  = order::DESCENDING,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
@@ -501,7 +504,7 @@ std::unique_ptr<column> segmented_top_k_order(
   column_view const& segment_offsets,
   size_type k,
   order topk_order                  = order::DESCENDING,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /** @} */  // end of group

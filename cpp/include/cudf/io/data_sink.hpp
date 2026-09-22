@@ -8,13 +8,18 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/error.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <algorithm>
 #include <future>
 #include <memory>
 #include <string>
 #include <vector>
+
+/**
+ * @file
+ * @brief Interface classes for writing output data to files, host memory, or device memory.
+ */
 
 namespace CUDF_EXPORT cudf {
 //! IO interfaces
@@ -23,8 +28,6 @@ namespace io {
 /**
  * @addtogroup io_datasinks
  * @{
- * @file
- * @brief Interface classes for writing output data to files, host memory, or device memory.
  */
 
 /**
@@ -150,7 +153,7 @@ class data_sink {
    * @param size Number of bytes to write
    * @param stream CUDA stream to use
    */
-  virtual void device_write(void const* gpu_data, size_t size, rmm::cuda_stream_view stream)
+  virtual void device_write(void const* gpu_data, size_t size, cuda::stream_ref stream)
   {
     CUDF_FAIL("data_sink classes that support device_write must override it.");
   }
@@ -179,7 +182,7 @@ class data_sink {
    */
   virtual std::future<void> device_write_async(void const* gpu_data,
                                                size_t size,
-                                               rmm::cuda_stream_view stream)
+                                               cuda::stream_ref stream)
   {
     CUDF_FAIL("data_sink classes that support device_write_async must override it.");
   }

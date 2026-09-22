@@ -15,12 +15,15 @@
 #include <string>
 #include <type_traits>
 
+/**
+ * @file
+ * @brief Exception types and error-checking macros used throughout libcudf.
+ */
+
 namespace CUDF_EXPORT cudf {
 /**
  * @addtogroup utility_error
  * @{
- * @file
- * @brief Exception types and error-checking macros used throughout libcudf.
  */
 
 /**
@@ -47,6 +50,7 @@ struct logic_error : std::logic_error {
   // TODO Add an error code member? This would be useful for translating an
   // exception to an error code in a pure-C API
 
+  /// @brief Destroy the logic error object
   ~logic_error() override
   {
     // Needed so that the first instance of the implicit destructor for any TU isn't 'constructed'

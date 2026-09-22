@@ -8,13 +8,16 @@
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
+/**
+ * @file
+ * @brief Strings column APIs for converting to/from integer numeric types.
+ */
+
 namespace CUDF_EXPORT cudf {
 namespace strings {
 /**
  * @addtogroup strings_convert
  * @{
- * @file
- * @brief Strings column APIs for converting to/from integer numeric types.
  */
 
 /**
@@ -44,7 +47,7 @@ namespace strings {
 std::unique_ptr<column> to_integers(
   strings_column_view const& input,
   data_type output_type,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
@@ -65,7 +68,7 @@ std::unique_ptr<column> to_integers(
  */
 std::unique_ptr<column> from_integers(
   column_view const& integers,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
@@ -94,7 +97,7 @@ std::unique_ptr<column> from_integers(
  */
 std::unique_ptr<column> is_integer(
   strings_column_view const& input,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
@@ -128,7 +131,7 @@ std::unique_ptr<column> is_integer(
 std::unique_ptr<column> is_integer(
   strings_column_view const& input,
   data_type int_type,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
@@ -158,7 +161,7 @@ std::unique_ptr<column> is_integer(
 std::unique_ptr<column> hex_to_integers(
   strings_column_view const& input,
   data_type output_type,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
@@ -185,7 +188,7 @@ std::unique_ptr<column> hex_to_integers(
  */
 std::unique_ptr<column> is_hex(
   strings_column_view const& input,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
@@ -218,7 +221,7 @@ std::unique_ptr<column> is_hex(
  */
 std::unique_ptr<column> integers_to_hex(
   column_view const& input,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /** @} */  // end of doxygen group

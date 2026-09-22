@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -56,7 +56,7 @@ static void bench_extract(nvbench::state& state)
     cudf::get_default_stream().synchronize();
   }
 
-  state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().value()));
+  state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().get()));
   // gather some throughput statistics as well
   auto data_size = input->alloc_size();
   state.add_global_memory_reads<nvbench::int8_t>(data_size);   // all bytes are read;

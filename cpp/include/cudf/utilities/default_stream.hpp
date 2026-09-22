@@ -7,14 +7,17 @@
 
 #include <cudf/utilities/export.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
+
+/**
+ * @file
+ * @brief APIs for querying the default CUDA stream and per-thread default stream status.
+ */
 
 namespace CUDF_EXPORT cudf {
 /**
  * @addtogroup default_stream
  * @{
- * @file
- * @brief APIs for querying the default CUDA stream and per-thread default stream status.
  */
 
 /**
@@ -22,7 +25,7 @@ namespace CUDF_EXPORT cudf {
  *
  * @return The current default stream.
  */
-rmm::cuda_stream_view const get_default_stream();
+cuda::stream_ref const get_default_stream();
 
 /**
  * @brief Check if per-thread default stream is enabled.
