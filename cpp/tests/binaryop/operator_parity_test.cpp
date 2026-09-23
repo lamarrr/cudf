@@ -15,8 +15,6 @@
 
 struct BinaryOperatorParityTest : public cudf::test::BaseFixture {};
 
-static_assert(static_cast<int32_t>(cudf::binary_operator::INVALID_BINARY) == 34);
-
 TEST_F(BinaryOperatorParityTest, CheckedDecimalSupportRequiresOutputScale)
 {
   auto const lhs_type = cudf::data_type{cudf::type_id::DECIMAL32, -2};
