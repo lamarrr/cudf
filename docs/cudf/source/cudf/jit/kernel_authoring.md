@@ -2,7 +2,7 @@
 
 This document presents the mental model for developing CUDA kernels that libcudf compiles just in time (JIT). It is intended for developers familiar with CUDA programming who want to write custom kernels that can be compiled at runtime.
 
-This page follows the source-based JIT lifecycle before introducing LTO JIT and the hybrid model.
+This page follows the source-based JIT lifecycle, then introduces JIT-LTO and the hybrid model.
 
 Across these compilation models, cuDF supports two types of kernel specialization:
 
