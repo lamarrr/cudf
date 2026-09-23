@@ -131,7 +131,7 @@ kernel.launch_with({grid_size}, {block_size}, 0, stream, inputs, outputs, n);
 
 PTX UDFs are supported by converting them to CUDA C++ with the `asm` directive. This approach still incurs the full cost of CUDA C++ frontend compilation.
 
-## LTO JIT Model
+## JIT-LTO Model
 
 The model described so far uses source-based CUDA JIT compilation. Although convenient, it has several drawbacks:
 
