@@ -66,10 +66,10 @@ rtcx_embed_includes(
   cudf_cuda_embed
   # Directory containing the kernel source template
   SOURCE_DIRECTORY
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/sample_unary_op_kernel/jit"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/sample_binary_op_kernel/jit"
   # Host installation directory for the source template
   DEST_DIRECTORY
-  cudf/cpp/src/sample_unary_op_kernel/jit
+  cudf/cpp/src/sample_binary_op_kernel/jit
   # Include directory added to the target
   INCLUDE_DIRECTORIES
   cudf/cpp/src
