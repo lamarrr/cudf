@@ -86,12 +86,12 @@ enum class binary_operator : int32_t {
                      ///< operands are true, returns true; otherwise returns null
   NULL_LOGICAL_OR,   ///< three-valued (Kleene) ||: if any operand is true, returns true; if both
                      ///< operands are false, returns false; otherwise returns null
-  INVALID_BINARY,    ///< invalid operation
   ADD_OVERFLOW,      ///< Addition with overflow detection
   SUB_OVERFLOW,      ///< Subtraction with overflow detection
   MUL_OVERFLOW,      ///< Multiplication with overflow detection
   DIV_OVERFLOW,      ///< Division with overflow and divide-by-zero detection
-  MOD_OVERFLOW       ///< Modulo with divide-by-zero detection
+  MOD_OVERFLOW,      ///< Modulo with divide-by-zero detection
+  INVALID_BINARY     ///< invalid operation
 };
 
 /// Binary operation common type default

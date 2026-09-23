@@ -38,6 +38,8 @@ cdef extern from "cudf/unary.hpp" namespace "cudf" nogil:
         BIT_INVERT
         NOT
         NEGATE
+        NEG_OVERFLOW
+        ABS_OVERFLOW
 
     cdef extern unique_ptr[column] unary_operation(
         column_view input,
