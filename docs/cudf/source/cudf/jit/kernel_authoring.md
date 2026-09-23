@@ -138,7 +138,7 @@ The model described so far uses source-based CUDA JIT compilation. Although conv
 - **High compilation time**: Most JIT compilation time is spent in the CUDA C++ frontend. The kernel's translation unit contains a substantial amount of code from cuDF and its dependencies that must be processed for every compilation request, even though much of the preprocessed translation unit is redundant.
 - **Correctness**: Because source-based JIT code is not compiled until runtime, compilation correctness cannot be verified ahead of time.
 
-Link-time optimization (LTO) JIT addresses both issues and resembles the C++ translation-unit linking process.
+Just-in-time Link-time optimization (JIT-LTO) is a compilation technology in NVIDIA CUDA that defers device code optimization and linking to runtime, allowing modular code across separate files to achieve performance close to whole-program compilation. JIT-LTO addresses both of the drawbacks described above and resembles the C++ translation-unit linking process.
 
 LTO JIT allows users to define functions in separate translation units and link them at runtime. For example, the translation unit above can be compiled and distributed without defining the `transform` function. If both the kernel and the UDF are compiled ahead of time (AOT), runtime work is limited to JIT linking, bypassing the CUDA C++ frontend. Like source-based CUDA JIT, LTO JIT allows users to extend cuDF kernels and implement new functionality while providing shorter JIT compilation times and stronger AOT correctness checks. CUDA source is compiled into LTO IR, a binary program representation.
 
