@@ -129,7 +129,7 @@ kernel.launch_with({grid_size}, {block_size}, 0, stream, inputs, outputs, n);
 
 `cudf::jit::get_udf_kernel` generates the specialized CUDA source, compiles and caches the kernel, and returns a handle (`cudf::kernel`) to the compiled kernel.
 
-As of version 26.06, PTX UDFs are supported by converting them to CUDA C++ with the `asm` directive. This approach still incurs the full cost of CUDA C++ frontend compilation.
+PTX UDFs are supported by converting them to CUDA C++ with the `asm` directive. This approach still incurs the full cost of CUDA C++ frontend compilation.
 
 ## LTO JIT Model
 
