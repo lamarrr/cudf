@@ -10,6 +10,7 @@
 
 #include <cudf/experimental/strings/regex.hpp>
 #include <cudf/strings/extract.hpp>
+#include <cudf/strings/findall.hpp>
 #include <cudf/strings/regex/regex_program.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -22,7 +23,7 @@ static void bench_extract(nvbench::state& state)
 {
   auto const num_rows  = static_cast<cudf::size_type>(state.get_int64("num_rows"));
   auto const row_width = static_cast<cudf::size_type>(state.get_int64("row_width"));
-  auto const backend   = state.get_string("backend");
+  auto backend         = state.get_string("backend");
 
   auto groups = static_cast<cudf::size_type>(state.get_int64("groups"));
 
@@ -72,9 +73,71 @@ static void bench_extract(nvbench::state& state)
     mem_stats_logger.peak_memory_usage(), "peak_memory_usage", "peak_memory_usage");
 }
 
+static void bench_enumeration(nvbench::state& state)
+{
+  auto num_rows  = static_cast<cudf::size_type>(state.get_int64("num_rows"));
+  auto row_width = static_cast<cudf::size_type>(state.get_int64("row_width"));
+  auto backend   = state.get_string("backend");
+  auto api       = state.get_string("api");
+
+  std::default_random_engine generator;
+  std::uniform_int_distribution<int> words_dist(0, 999);
+  std::vector<std::string> samples(100);
+  std::generate(samples.begin(), samples.end(), [&]() {
+    std::string row;
+    while (static_cast<cudf::size_type>(row.size()) < row_width) {
+      row += std::to_string(words_dist(generator)) + " ";
+    }
+    return row;
+  });
+
+  auto pattern = api == "findall" ? ".+[0-9]" : "(.+[0-9])";
+  cudf::test::strings_column_wrapper samples_column(samples.begin(), samples.end());
+  data_profile const profile = data_profile_builder().no_validity().distribution(
+    cudf::type_to_id<cudf::size_type>(), distribution_id::UNIFORM, 0ul, samples.size() - 1);
+  auto map =
+    create_random_column(cudf::type_to_id<cudf::size_type>(), row_count{num_rows}, profile);
+  auto input = cudf::gather(
+    cudf::table_view{{samples_column}}, map->view(), cudf::out_of_bounds_policy::DONT_CHECK);
+  cudf::strings_column_view strings_view(input->get_column(0).view());
+  auto prog = backend == "interpreter" ? cudf::strings::regex_program::create(pattern) : nullptr;
+  auto operation = api == "findall" ? cudf::experimental::regex_operation::FINDALL
+                                    : cudf::experimental::regex_operation::EXTRACT_ALL_RECORD;
+  auto jit_program =
+    backend == "jit" ? cudf::experimental::regex_jit_program::create(pattern, operation) : nullptr;
+  state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().get()));
+  auto data_size = input->alloc_size();
+  state.add_global_memory_reads<nvbench::int8_t>(data_size);
+  state.add_global_memory_writes<nvbench::int8_t>(data_size);
+
+  auto mem_stats_logger = cudf::memory_stats_logger();
+  state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
+    if (api == "findall") {
+      if (backend == "jit") {
+        static_cast<void>(cudf::experimental::findall(strings_view, *jit_program));
+      } else {
+        static_cast<void>(cudf::strings::findall(strings_view, *prog));
+      }
+    } else if (backend == "jit") {
+      static_cast<void>(cudf::experimental::extract_all_record(strings_view, *jit_program));
+    } else {
+      static_cast<void>(cudf::strings::extract_all_record(strings_view, *prog));
+    }
+  });
+  state.add_buffer_size(
+    mem_stats_logger.peak_memory_usage(), "peak_memory_usage", "peak_memory_usage");
+}
+
 NVBENCH_BENCH(bench_extract)
   .set_name("extract")
   .add_int64_axis("row_width", {32, 64, 128, 256})
   .add_int64_axis("num_rows", {32768, 262144, 2097152})
   .add_int64_axis("groups", {1, 2, 4})
+  .add_string_axis("backend", {"interpreter", "jit"});
+
+NVBENCH_BENCH(bench_enumeration)
+  .set_name("regex_enumeration")
+  .add_int64_axis("row_width", {128, 256})
+  .add_int64_axis("num_rows", {262144, 2097152})
+  .add_string_axis("api", {"findall", "extract_all"})
   .add_string_axis("backend", {"interpreter", "jit"});

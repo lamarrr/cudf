@@ -52,8 +52,11 @@ TYPED_TEST(StringsReplaceRegexTest, ReplaceRegexTest)
   auto repl    = cudf::string_scalar("=");
   cudf::test::strings_column_wrapper expected(
     h_expected.begin(), h_expected.end(), cudf::test::iterators::nulls_from_nullptrs(h_expected));
-  auto prog =
-    TypeParam::create(cudf::experimental::regex_operation::REPLACE, pattern, {.replacement = "="});
+  auto prog = TypeParam::create(
+    cudf::experimental::regex_operation::REPLACE,
+    pattern,
+    {.replacement       = "=",
+     .span_cache_policy = cudf::experimental::regex_jit_span_cache_policy::FORCE});
   auto results = TypeParam::replace_re(strings_view, *prog, repl);
   CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(*results, expected);
 }

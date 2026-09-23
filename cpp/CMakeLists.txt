@@ -1139,7 +1139,7 @@ add_library(
   src/strings/regex/glushkov_regcomp.cpp
   src/strings/regex/regcomp.cpp
   src/strings/regex/regexec.cpp
-  src/strings/regex/jit/regex.cpp
+  src/strings/regex/jit/regex.cu
   src/strings/regex/regex_program.cpp
   src/strings/repeat_strings.cu
   src/strings/replace/backref_re.cu

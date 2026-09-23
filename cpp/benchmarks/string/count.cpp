@@ -32,7 +32,7 @@ static void bench_count(nvbench::state& state)
   auto const min_width     = static_cast<cudf::size_type>(state.get_int64("min_width"));
   auto const max_width     = static_cast<cudf::size_type>(state.get_int64("max_width"));
   auto const pattern_index = state.get_int64("pattern");
-  auto const backend       = state.get_string("backend");
+  auto backend             = state.get_string("backend");
 
   if (pattern_index < 0 || std::cmp_greater_equal(pattern_index, patterns.size())) {
     state.skip("invalid pattern index");
@@ -45,7 +45,7 @@ static void bench_count(nvbench::state& state)
     create_random_table({cudf::type_id::STRING}, row_count{num_rows}, table_profile);
   cudf::strings_column_view input(table->view().column(0));
 
-  auto const& pattern = patterns[pattern_index];
+  auto& pattern = patterns[pattern_index];
   auto prog = backend == "interpreter" ? cudf::strings::regex_program::create(pattern) : nullptr;
   auto jit_program = backend == "jit" ? cudf::experimental::regex_jit_program::create(
                                           pattern, cudf::experimental::regex_operation::COUNT)

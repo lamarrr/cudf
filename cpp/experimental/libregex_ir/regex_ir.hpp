@@ -18,46 +18,75 @@
 
 namespace regex_ir {
 
+/**
+ * @brief Unit used to decode and match input characters
+ */
 enum class character_mode : std::uint8_t {
-  UTF8,
-  BYTES,
+  UTF8,   ///< Decode input as UTF-8 code points
+  BYTES,  ///< Match individual input bytes
 };
 
+/**
+ * @brief Resource limits enforced while compiling a regular expression
+ */
 struct compile_limits {
-  std::size_t max_pattern_bytes = 1U << 20U;
-  std::size_t max_nesting       = 256;
-  std::size_t max_states        = 1U << 18U;
-  std::size_t max_transitions   = 1U << 20U;
-  std::size_t max_captures      = 256;
-  std::uint32_t max_repeat      = 1000;
+  std::size_t max_pattern_bytes = 1U << 20U;  ///< Maximum pattern size in bytes
+  std::size_t max_nesting       = 256;        ///< Maximum nested expression depth
+  std::size_t max_states        = 1U << 18U;  ///< Maximum generated automata states
+  std::size_t max_transitions   = 1U << 20U;  ///< Maximum generated automata transitions
+  std::size_t max_captures      = 256;        ///< Maximum explicit capture groups
+  std::uint32_t max_repeat      = 1000;       ///< Maximum finite repetition bound
 };
 
+/**
+ * @brief Regex syntax and compilation settings
+ */
 struct compile_options {
-  bool case_insensitive : 1 = false;
-  bool multiline        : 1 = false;
-  bool dot_all          : 1 = false;
-  bool ascii_classes    : 1 = true;
-  bool extended_newline : 1 = false;
-  character_mode characters = character_mode::UTF8;
-  compile_limits limits     = compile_limits{};
+  bool case_insensitive : 1 = false;  ///< Enable case-insensitive matching
+  bool multiline        : 1 = false;  ///< Make line anchors recognize internal line boundaries
+  bool dot_all          : 1 = false;  ///< Allow dot to match configured newline characters
+  bool ascii_classes    : 1 = true;   ///< Use ASCII semantics for shorthand character classes
+  bool extended_newline : 1 = false;  ///< Recognize the extended Unicode newline set
+  character_mode characters = character_mode::UTF8;  ///< Input character decoding mode
+  compile_limits limits     = compile_limits{};      ///< Compilation resource limits
 };
 
+/**
+ * @brief Regex API implemented by generated code
+ */
 enum class operation_kind : std::uint8_t {
-  CONTAINS,
-  MATCHES,
-  COUNT,
-  EXTRACT,
-  FIND,
-  REPLACE,
-  SPLIT,
+  CONTAINS,  ///< Test whether the input contains a match
+  MATCHES,   ///< Test whether a match begins at the start of the input
+  COUNT,     ///< Count non-overlapping matches
+  EXTRACT,   ///< Extract capture groups from a match
+  FIND,      ///< Find the span of a match
+  REPLACE,   ///< Replace matching spans
+  SPLIT,     ///< Split input around matching spans
+};
+
+/**
+ * @brief Matching executor selected by the compiler
+ */
+enum class executor_kind : std::uint8_t {
+  RECURSIVE_THOMPSON,                ///< Ordered recursive Thompson-NFA executor
+  SINGLE_BYTE_LITERAL,               ///< Specialized single-byte literal executor
+  PACKED_ASCII_LITERAL,              ///< Specialized packed ASCII literal executor
+  GLUSHKOV,                          ///< Position-automaton executor
+  DETERMINISTIC,                     ///< Deterministic finite-automaton executor
+  ASSERTION_AWARE_DETERMINISTIC,     ///< Deterministic executor with zero-width assertions
+  PRIORITIZED_DETERMINISTIC,         ///< Deterministic executor preserving branch priority
+  TAGGED_PRIORITIZED_DETERMINISTIC,  ///< Prioritized deterministic executor with captures
 };
 
 /**
  * @brief Result of compiling a regular expression
  */
 struct compile_result {
-  std::string nvvm_ir;
-  std::uint32_t capture_count;
+  std::string nvvm_ir;             ///< Textual operation-specialized NVVM IR
+  std::uint32_t capture_count;     ///< Number of explicit capture groups
+  executor_kind executor;          ///< Executor selected for the pattern and operation
+  std::uint32_t executor_states;   ///< Number of states in the selected executor
+  std::uint32_t alphabet_classes;  ///< Number of character classes in its alphabet partition
 };
 
 /**
@@ -70,7 +99,7 @@ struct compile_result {
  * @param operation Operation implemented by the generated entry point
  * @param replacement Replacement template for `REPLACE`
  * @param options Regex syntax, character-mode, and resource-limit options
- * @return Generated NVVM IR and the number of explicit capture groups
+ * @return Generated NVVM IR and executor metadata
  */
 [[nodiscard]] compile_result compile(std::string_view pattern,
                                      operation_kind operation,
@@ -85,17 +114,48 @@ struct compile_result {
  */
 namespace nvvm {
 
+/**
+ * @brief One literal or capture component of a replacement template
+ */
 struct replacement_piece {
-  std::string literal;
-  std::optional<std::int32_t> capture;
+  std::string literal;                  ///< Literal UTF-8 bytes emitted by this component
+  std::optional<std::int32_t> capture;  ///< Capture index to emit, if present
 };
 
+/**
+ * @brief Combine matcher and kernel NVVM modules into one module
+ *
+ * @param matcher Matcher module returned by `compile`
+ * @param kernel Operation-specific kernel module
+ * @return A complete textual NVVM module containing both inputs
+ * @throw std::invalid_argument If `matcher` has no NVVM version metadata
+ */
 [[nodiscard]] std::string assemble(std::string matcher, std::string kernel);
 
+/**
+ * @brief Generate a fixed-width output kernel
+ *
+ * @param offset64 Whether input string offsets use 64-bit integers
+ * @param operation Regex operation implemented by the kernel
+ * @param kernel_name Exported kernel entry-point name
+ * @return Textual NVVM IR for the kernel
+ * @throw std::invalid_argument If `kernel_name` is not a valid, non-reserved identifier
+ */
 [[nodiscard]] std::string make_fixed_kernel(bool offset64,
                                             operation_kind operation,
                                             std::string_view kernel_name);
 
+/**
+ * @brief Generate a kernel that emits capture spans
+ *
+ * @param offset64 Whether input string offsets use 64-bit integers
+ * @param capture_slots Number of capture-boundary values available from the matcher
+ * @param first_group First explicit capture group to emit
+ * @param output_groups Number of capture groups to emit
+ * @param column_major Whether output spans are grouped by capture instead of input row
+ * @param kernel_name Exported kernel entry-point name
+ * @return Textual NVVM IR for the kernel
+ */
 [[nodiscard]] std::string make_capture_kernel(bool offset64,
                                               std::int32_t capture_slots,
                                               std::int32_t first_group,
@@ -103,40 +163,130 @@ struct replacement_piece {
                                               bool column_major,
                                               std::string_view kernel_name);
 
+/**
+ * @brief Generate the sizing pass for an API that enumerates matches or captures
+ *
+ * @param offset64 Whether input string offsets use 64-bit integers
+ * @param capture_slots Number of capture-boundary values available from the matcher
+ * @param multiplier Number of output spans produced per accepted match
+ * @param require_match Whether rows without a match produce no output entry
+ * @param cache Whether to cache bounded match spans for the emission pass
+ * @param kernel_name Exported kernel entry-point name
+ * @return Textual NVVM IR for the sizing kernel
+ */
 [[nodiscard]] std::string make_enumeration_size_kernel(bool offset64,
                                                        std::int32_t capture_slots,
                                                        std::int32_t multiplier,
                                                        bool require_match,
+                                                       bool cache,
                                                        std::string_view kernel_name);
 
+/**
+ * @brief Generate the emission pass for an API that enumerates matches or captures
+ *
+ * @param offset64 Whether input string offsets use 64-bit integers
+ * @param capture_slots Number of capture-boundary values available from the matcher
+ * @param groups Number of capture groups emitted per match
+ * @param findall Whether to emit whole-match spans instead of capture spans
+ * @param overflow_only Whether to process only rows that overflowed the span cache
+ * @param kernel_name Exported kernel entry-point name
+ * @return Textual NVVM IR for the emission kernel
+ */
 [[nodiscard]] std::string make_enumeration_emit_kernel(bool offset64,
                                                        std::int32_t capture_slots,
                                                        std::int32_t groups,
                                                        bool findall,
+                                                       bool overflow_only,
                                                        std::string_view kernel_name);
 
+/**
+ * @brief Generate a fused sizing or emission kernel for bounded replacement
+ *
+ * @param offset64 Whether input string offsets use 64-bit integers
+ * @param emit Whether to emit output bytes instead of only computing sizes
+ * @param output_offset64 Whether output string offsets use 64-bit integers
+ * @param cache Whether to cache bounded match spans between passes
+ * @param replacement Parsed replacement template to bake into the kernel
+ * @param capture_slots Number of capture-boundary values available from the matcher
+ * @param max_replace_count Maximum replacements performed per input row
+ * @param kernel_name Exported kernel entry-point name
+ * @return Textual NVVM IR for the replacement kernel
+ */
 [[nodiscard]] std::string make_limited_replace_kernel(
   bool offset64,
   bool emit,
   bool output_offset64,
+  bool cache,
   std::span<replacement_piece const> replacement,
   std::int32_t capture_slots,
   std::int32_t max_replace_count,
   std::string_view kernel_name);
 
+/**
+ * @brief Encode a parsed replacement template as regex replacement text
+ *
+ * @param replacement Parsed replacement template
+ * @return Replacement text with capture references and escaped literal dollar signs
+ */
 [[nodiscard]] std::string encode_replacement(std::span<replacement_piece const> replacement);
 
+/**
+ * @brief Generate a generic replacement sizing or emission kernel
+ *
+ * @param offset64 Whether input string offsets use 64-bit integers
+ * @param emit Whether to emit output bytes instead of only computing sizes
+ * @param kernel_name Exported kernel entry-point name
+ * @return Textual NVVM IR for the replacement kernel
+ */
 [[nodiscard]] std::string make_replace_kernel(bool offset64,
                                               bool emit,
                                               std::string_view kernel_name);
 
+/**
+ * @brief Generate the sizing pass for regex split
+ *
+ * @param offset64 Whether input string offsets use 64-bit integers
+ * @param maxsplit Maximum splits per row; a non-positive value means unlimited
+ * @param cache Whether to cache bounded field spans for the emission pass
+ * @param kernel_name Exported kernel entry-point name
+ * @return Textual NVVM IR for the split sizing kernel
+ */
 [[nodiscard]] std::string make_split_size_kernel(bool offset64,
                                                  std::int32_t maxsplit,
+                                                 bool cache,
                                                  std::string_view kernel_name);
 
+/**
+ * @brief Generate the emission pass for regex split
+ *
+ * @param offset64 Whether input string offsets use 64-bit integers
+ * @param reverse Whether to apply the split limit from the end of each input
+ * @param maxsplit Maximum splits per row; a non-positive value means unlimited
+ * @param overflow_only Whether to process only rows that overflowed the span cache
+ * @param kernel_name Exported kernel entry-point name
+ * @return Textual NVVM IR for the split emission kernel
+ */
 [[nodiscard]] std::string make_split_emit_kernel(bool offset64,
                                                  bool reverse,
+                                                 std::int32_t maxsplit,
+                                                 bool overflow_only,
                                                  std::string_view kernel_name);
+
+/**
+ * @brief Generate a sampling kernel used to select a match-span cache size
+ *
+ * @param offset64 Whether input string offsets use 64-bit integers
+ * @param split Whether to sample split fields instead of enumerated match spans
+ * @param capture_slots Number of capture-boundary values available from the matcher
+ * @param match_limit Maximum matches sampled from each row; a non-positive value means unlimited
+ * @param kernel_name Exported kernel entry-point name
+ * @return Textual NVVM IR for the sampling kernel
+ */
+[[nodiscard]] std::string make_span_cache_sample_kernel(bool offset64,
+                                                        bool split,
+                                                        std::int32_t capture_slots,
+                                                        std::int32_t match_limit,
+                                                        std::string_view kernel_name);
 
 }  // namespace nvvm
 
@@ -515,10 +665,8 @@ struct instruction_ir {
  * @brief Options controlling CUDA-oriented NVVM IR generation
  */
 struct nvvm_ir_codegen_options {
-  std::string symbol_prefix    = "regex_ir_generated";  ///< Prefix for internal symbols
-  std::string execute_function = "regex_ir_execute";    ///< Public matcher function name
-  bool prefix_filter : 1       = true;  ///< Enable ASCII-prefix filtering in the recursive fallback
-  bool branch_hints  : 1       = true;  ///< Emit fallback `llvm.expect` branch hints
+  std::string symbol_prefix    = "regex_ir_sym";      ///< Prefix for internal symbols
+  std::string execute_function = "regex_ir_execute";  ///< Public matcher function name
 };
 
 /**
@@ -554,7 +702,7 @@ struct nvvm_ir_codegen_options {
  * replacement output storage must not overlap the input range.
  *
  * @param ir Optimized operation-specialized Instruction IR to render
- * @param options Symbol names and optimization hints
+ * @param options Symbol names
  * @return Textual NVVM IR accepted by libNVVM
  * @throw std::invalid_argument If the IR or a requested symbol name is invalid
  */

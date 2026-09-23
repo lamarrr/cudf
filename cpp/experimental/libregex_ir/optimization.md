@@ -55,8 +55,9 @@ and after the sequence:
 | unreachable removal | compacts reachable blocks and rewrites dense block IDs | reduces generated code and analysis cost | reachability starts at the operation entry block |
 
 These passes do not currently perform DFA minimization, common-subexpression
-elimination, data-dependent planning, row-length analysis, or mandatory
-substring extraction.
+elimination, data-dependent planning, or row-length analysis. After optimization,
+the NVVM planner separately extracts fused ASCII literals whose blocks dominate
+the accept block.
 
 ## Executor selection
 
@@ -235,12 +236,16 @@ The fallback retains several optimizations:
   attributes where valid; and
 - only capture slots live for the selected result are initialized or updated.
 
-The filter is currently one required ASCII byte at the expression entry, not a
-general mandatory-literal analysis. It is also specific to the recursive
-fallback. Historical SASS and Nsight analysis found recursive call frames,
-local-memory traffic, repeated decoding, and divergent backtracking to be the
-dominant costs, so deterministic paths are preferred whenever semantics and
-table bounds permit.
+The fallback uses two complementary filters. An entry literal supplies the
+candidate-start byte check. Separately, the planner selects the longest fused
+ASCII literal whose block dominates acceptance; a packed row-level search can
+then reject inputs that cannot match before any recursive retries begin. The
+row filter runs only for the initial search, so global and materializing APIs do
+not rescan the suffix for every match. Literals that are merely common across
+separate alternative blocks are not yet recovered. Historical SASS and Nsight
+analysis found recursive call frames, local-memory traffic, repeated decoding,
+and divergent backtracking to be the dominant costs, so deterministic paths
+are preferred whenever semantics and table bounds permit.
 
 ### Large boolean alternations
 
@@ -301,8 +306,9 @@ Several local analyses avoid general regex machinery:
   the match span instead of allocating and maintaining a separate capture.
 
 The exact planner does not yet generate a failure-function KMP or Two-Way
-search, nor does it extract mandatory literals at variable offsets from a
-general expression.
+search. General recursive expressions use dominator-proven fused literals as
+variable-offset rejection filters, but do not yet derive a common literal from
+separate alternatives.
 
 ## API specialization
 
@@ -440,7 +446,7 @@ automaton.
 | bit-parallel Glushkov NFA | implemented for gated boolean plans | valuable for sparse follow graphs and DFA state growth; the forced all-pattern experiment regressed exception-heavy cases, so it is not the canonical IR or a universal replacement |
 | profile occupancy, memory use, and divergence | implemented as a development practice | current complex DFA cases are more instruction/lane limited than DRAM limited; direct-byte cases are bandwidth limited |
 | Aho-Corasick | not implemented | useful for many exact literals or a bank of extracted literals, not a general regex replacement; dense transition storage, not automaton state count alone, is the main GPU memory risk |
-| cheap filter then full regex | partially implemented | one required entry ASCII byte exists only in the fallback; broader mandatory-literal and selectivity-aware filtering is a high-value gap |
+| cheap filter then full regex | partially implemented | the recursive fallback has entry-byte filtering and a fused row-level filter for dominator-proven ASCII literals; alternative-intersection and selectivity-aware planning remain gaps |
 | group strings by length | not implemented | promising for high length variance and repeated scans, but binning/permutation/scatter cost must be amortized |
 | pivot strings | not implemented | potentially useful for stable, repeatedly scanned fixed/coarsely bucketed columns; too costly as an unconditional cuDF API step |
 | staged unfinished-row compaction | not implemented | promising for selective contains and highly skewed rows, but extra kernels/global traffic can outweigh divergence savings |
@@ -783,21 +789,21 @@ variance, hit rate, regex complexity, and reuse count.
 
 ### 1. Extend the literal planner
 
-Exact ASCII expressions and sparse first-byte ranges are implemented. The
-remaining work is mandatory-literal extraction from general expressions and a
-regular long-literal algorithm for adversarial repeated prefixes. Useful
-specializations still include:
+Exact ASCII expressions, sparse first-byte ranges, and dominator-proven fused
+ASCII literals in general recursive expressions are implemented. Remaining
+work includes a regular long-literal algorithm for adversarial repeated
+prefixes and intersection of mandatory substrings across separate alternatives.
+Useful specializations still include:
 
 - anchored exact compare for `matches`;
 - KMP or another regular linear search for longer literal-only expressions;
-- a longer mandatory-literal filter before an expensive fallback; and
-- selectivity estimates that can choose the long-literal path without a fixed
-  size threshold.
+- common-substring extraction across alternatives; and
+- selectivity estimates that can decide when the row filter repays its extra
+  input pass.
 
-For a mandatory literal at a variable regex offset, a row-level filter can
-reject misses but cannot always infer the match start. For a fixed prefix it
-can identify candidate starts directly. That distinction belongs in the
-compile-time analysis.
+A mandatory literal at a variable regex offset can reject a row but cannot in
+general identify the match start. A fixed prefix can identify candidate starts
+directly; the planner keeps these optimizations separate.
 
 ### 2. Make cross-row filtering selectivity-aware
 
@@ -823,11 +829,39 @@ leftmost-first and greedy/lazy results exactly.
 
 ### 4. Reuse match work in materializing APIs
 
-Replacement and split currently match during both sizing and emission. Full
-staged rows lost badly in the measured experiment. Any retry should store
-bounded compact spans during sizing, include an overflow/rematch path, and
-select it only when sampled match density and verifier cost repay scratch
-traffic. The direct paths may remain faster when they rematch.
+Replacement, enumeration (`findall` and `extract_all_record`), and split now
+use selective bounded span caching. The sizing kernel can retain up to four
+matches per row in temporary memory. Emission consumes those spans directly;
+rows that exceed the bound are marked and rematched by an overflow-only
+kernel. This keeps the direct two-pass implementation as the fallback and
+avoids making dense or high-capture workloads pay unbounded staging costs.
+
+Selection is automatic for inputs of at least 131,072 rows. A deterministic
+sample of at most 2,048 rows records valid rows, input bytes, bounded match
+count, and overflow count. The policy combines those observations with the
+compiled executor kind, rejects overflow rates above 1%, rejects average match
+counts above 1.25, caps temporary cache storage at 64 MiB, and requires enough
+weighted input work to repay the extra cache traffic. Split receives a larger
+weight because cached field spans also avoid rebuilding token spans. The
+`regex_jit_program_options::span_cache_policy` creation option accepts `AUTO`,
+`OFF`, and `FORCE`, making benchmarking and diagnosis explicit and local to each
+compiled program.
+
+The cache is API-specific. Enumeration stores capture slots and scatters final
+string pairs from them. Replacement stores capture slots plus a per-row match
+count, then executes the baked replacement steps from cached captures. Split
+stores bounded field spans; reverse limited split still rematches overflowing
+rows because it needs the final matches. All cache, overflow, count, and span
+buffers use the temporary memory resource. Empty strings retain a non-null
+sentinel pointer, matching the direct NVVM pair writer.
+
+Representative RTX A6000 end-to-end measurements at 262,144 rows and 256-byte
+maximum/target width showed automatic caching reducing `findall` from 114.56 ms
+to 59.86 ms, `extract_all_record` from 136.13 ms to 70.77 ms, and an expensive
+replacement from 246.92 ms to 145.34 ms. Split improved from 3.40 ms to 2.60 ms
+and from 1.97 ms to 1.60 ms for the two measured late-match expressions. A
+fast tagged-deterministic replacement regressed when caching was forced, so the
+automatic profitability threshold leaves that workload on the direct path.
 
 ### 5. Reduce deterministic-loop instruction count
 

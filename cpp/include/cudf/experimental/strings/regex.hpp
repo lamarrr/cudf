@@ -46,6 +46,15 @@ enum class regex_operation : std::uint8_t {
 };
 
 /**
+ * @brief Policy controlling bounded span caching in materializing regex JIT APIs
+ */
+enum class regex_jit_span_cache_policy : std::uint8_t {
+  AUTO,   ///< Enable caching when input sampling predicts a benefit
+  OFF,    ///< Disable caching and rematch rows during materialization
+  FORCE,  ///< Enable caching whenever the input fits the bounded cache
+};
+
+/**
  * @brief Values embedded in an operation-specialized regex JIT program
  */
 struct regex_jit_program_options {
@@ -53,6 +62,8 @@ struct regex_jit_program_options {
   std::optional<std::string> replacement{};      ///< Replacement for replace APIs
   std::optional<size_type> max_replace_count{};  ///< Replacement limit for `replace_re`
   size_type maxsplit{-1};                        ///< Split limit for split APIs
+  /// Span-cache selection policy
+  regex_jit_span_cache_policy span_cache_policy{regex_jit_span_cache_policy::AUTO};
 };
 
 /**

@@ -31,7 +31,7 @@ static void bench_replace(nvbench::state& state)
   auto const max_width     = static_cast<cudf::size_type>(state.get_int64("max_width"));
   auto const pattern_index = state.get_int64("pattern");
   auto const rtype         = state.get_string("type");
-  auto const backend       = state.get_string("backend");
+  auto backend             = state.get_string("backend");
 
   if (pattern_index < 0 || std::cmp_greater_equal(pattern_index, patterns.size())) {
     state.skip("invalid pattern index");
