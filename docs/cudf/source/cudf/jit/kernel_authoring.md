@@ -50,7 +50,7 @@ extern "C" __global__ void cudf_kernel_entry(column_device_view const* inputs,
 Key points:
 
 - The `binary_op_kernel` template is parameterized by the input and output types, enabling it to be instantiated and specialized for each type combination.
-- The `cudf_kernel_entry` function provides a scope-independent kernel entry point. Because its name does not depend on template parameters, callers can reference it without relying on complex name mangling.
+- The `cudf_kernel_entry` function provides a scope-independent kernel entry point. Because it is marked as `extern "C"`, its name does not depend on template parameters. This means callers can reference it without relying on complex name mangling.
 - The `CUDF_KERNEL_INSTANCE` macro selects the input and output type specialization at runtime and represents kernel configuration specialization.
 - The `GENERIC_TRANSFORM_OP` macro selects the UDF specialization at runtime and represents kernel UDF specialization.
 
