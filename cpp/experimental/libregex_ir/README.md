@@ -11,7 +11,4 @@ notes:
 
 - `regex_ir.hpp`: public compiler and NVVM module-construction API
 - `regex_ir.cpp`: compiler, embedded Unicode data, and cuDF kernel-module construction
-- `optimization.md`: optimization design notes
-
-The code is integrated, built, and tested through the enclosing cuDF project;
-it is not maintained as a standalone CMake project.
+- `optimization.md`: optimization design notes for agents and developers
