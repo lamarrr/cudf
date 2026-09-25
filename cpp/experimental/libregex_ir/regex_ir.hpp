@@ -47,8 +47,9 @@ struct compile_options {
   bool dot_all          : 1 = false;  ///< Allow dot to match configured newline characters
   bool ascii_classes    : 1 = true;   ///< Use ASCII semantics for shorthand character classes
   bool extended_newline : 1 = false;  ///< Recognize the extended Unicode newline set
-  character_mode characters = character_mode::UTF8;  ///< Input character decoding mode
-  compile_limits limits     = compile_limits{};      ///< Compilation resource limits
+  bool find_match_end_observable : 1 = true;  ///< Require FIND to produce its end offset
+  character_mode characters          = character_mode::UTF8;  ///< Input character decoding mode
+  compile_limits limits              = compile_limits{};      ///< Compilation resource limits
 };
 
 /**
@@ -60,6 +61,7 @@ enum class operation_kind : std::uint8_t {
   COUNT,     ///< Count non-overlapping matches
   EXTRACT,   ///< Extract capture groups from a match
   FIND,      ///< Find the span of a match
+  FIND_ALL,  ///< Find successive whole-match spans beginning at a supplied byte offset
   REPLACE,   ///< Replace matching spans
   SPLIT,     ///< Split input around matching spans
 };
@@ -69,13 +71,19 @@ enum class operation_kind : std::uint8_t {
  */
 enum class executor_kind : std::uint8_t {
   RECURSIVE_THOMPSON,                ///< Ordered recursive Thompson-NFA executor
+  STRING_OPERATIONS,                 ///< Generated composition of specialized string operations
+  WORD_RUN,                          ///< Specialized boundary-delimited word-run executor
   SINGLE_BYTE_LITERAL,               ///< Specialized single-byte literal executor
   PACKED_ASCII_LITERAL,              ///< Specialized packed ASCII literal executor
+  PACKED_UTF8_LITERAL,               ///< Pivoted packed-byte exact UTF-8 literal executor
+  UTF8_KMP_LITERAL,                  ///< Exact UTF-8 literal executor with byte-domain KMP fallback
   GLUSHKOV,                          ///< Position-automaton executor
+  STREAMING_PRIORITIZED_GLUSHKOV,    ///< Streaming prioritized position-automaton executor
   DETERMINISTIC,                     ///< Deterministic finite-automaton executor
   ASSERTION_AWARE_DETERMINISTIC,     ///< Deterministic executor with zero-width assertions
   PRIORITIZED_DETERMINISTIC,         ///< Deterministic executor preserving branch priority
   TAGGED_PRIORITIZED_DETERMINISTIC,  ///< Prioritized deterministic executor with captures
+  BOOLEAN_ALTERNATION,               ///< Dispatcher over separately compiled boolean branches
 };
 
 /**
@@ -87,6 +95,7 @@ struct compile_result {
   executor_kind executor;          ///< Executor selected for the pattern and operation
   std::uint32_t executor_states;   ///< Number of states in the selected executor
   std::uint32_t alphabet_classes;  ///< Number of character classes in its alphabet partition
+  std::optional<std::string> exact_ascii_literal;  ///< Exact ASCII literal recognized, if any
 };
 
 /**
@@ -144,6 +153,18 @@ struct replacement_piece {
 [[nodiscard]] std::string make_fixed_kernel(bool offset64,
                                             operation_kind operation,
                                             std::string_view kernel_name);
+
+/**
+ * @brief Generate a warp-per-row kernel for an exact ASCII literal contains operation
+ *
+ * @param offset64 Whether input string offsets use 64-bit integers
+ * @param literal Non-empty ASCII literal to search for
+ * @param kernel_name Exported kernel entry-point name
+ * @return Textual NVVM IR for the kernel
+ */
+[[nodiscard]] std::string make_warp_literal_contains_kernel(bool offset64,
+                                                            std::string_view literal,
+                                                            std::string_view kernel_name);
 
 /**
  * @brief Generate a kernel that emits capture spans
@@ -235,11 +256,13 @@ struct replacement_piece {
  *
  * @param offset64 Whether input string offsets use 64-bit integers
  * @param emit Whether to emit output bytes instead of only computing sizes
+ * @param output_offset64 Whether output string offsets use 64-bit integers
  * @param kernel_name Exported kernel entry-point name
  * @return Textual NVVM IR for the replacement kernel
  */
 [[nodiscard]] std::string make_replace_kernel(bool offset64,
                                               bool emit,
+                                              bool output_offset64,
                                               std::string_view kernel_name);
 
 /**
@@ -497,6 +520,8 @@ struct automata_ir {
   state_id entry                     = invalid_state;                  ///< Entry state
   state_id accept                    = invalid_state;                  ///< Unique accepting state
   std::uint32_t capture_count        = 0;  ///< Number of explicit capture groups
+  bool has_alternation : 1           = false;  ///< Whether the expression contains alternation
+  bool has_lazy_quantifier : 1       = false;  ///< Whether any repetition prefers its exit edge
 };
 
 /**
@@ -658,6 +683,8 @@ struct instruction_ir {
   block_id entry                             = invalid_block;                     ///< Entry block
   block_id accept                            = invalid_block;  ///< Block containing acceptance
   std::uint32_t capture_count                = 0;              ///< Explicit capture count
+  bool has_alternation : 1                   = false;  ///< Whether the expression has alternation
+  bool has_lazy_quantifier : 1               = false;  ///< Whether repetition priority is lazy
   std::vector<replacement_token> replacement = std::vector<replacement_token>{};  ///< Template
 };
 
@@ -689,7 +716,11 @@ struct nvvm_ir_codegen_options {
  * machines reject immediately after entering their dead state.
  *
  * - contains and matches: `i1(i8*, i64)`;
- * - find: `i1(i8*, i64, i64*)`, with one begin/end pair in the final argument;
+ * - find: `i1(i8*, i64, i64*)`, with one begin/end pair in the final argument. When
+ *   `compile_options::find_match_end_observable` is false, an input-anchored FIND may leave the
+ *   end element unwritten;
+ * - find-all: `i1(i8*, i64, i64, i64*)`, with a search byte offset followed by one whole-match
+ *   begin/end pair;
  * - count: `i64(i8*, i64)`;
  * - extract: `i1(i8*, i64, i64, i64*)`, with a search byte followed by storage for the whole
  *   match and explicit capture pairs;
@@ -703,11 +734,11 @@ struct nvvm_ir_codegen_options {
  *
  * @param ir Optimized operation-specialized Instruction IR to render
  * @param options Symbol names
- * @return Textual NVVM IR accepted by libNVVM
+ * @return Generated NVVM IR and executor metadata
  * @throw std::invalid_argument If the IR or a requested symbol name is invalid
  */
-[[nodiscard]] std::string generate_nvvm_ir(instruction_ir const& ir,
-                                           nvvm_ir_codegen_options const& options = {});
+[[nodiscard]] compile_result generate_nvvm_ir(instruction_ir const& ir,
+                                              nvvm_ir_codegen_options const& options = {});
 
 }  // namespace regex_ir
 

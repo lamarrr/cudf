@@ -53,6 +53,7 @@ struct regex_jit_program::regex_jit_program_impl {
   std::vector<retained_kernel> cache_size_kernels;
   std::vector<retained_kernel> cache_emit_kernels;
   std::vector<retained_kernel> sample_kernels;
+  std::vector<retained_kernel> warp_literal_kernels;
   regex_ir::executor_kind executor;
   size_type cache_values;
   std::optional<std::string> validation_error;
@@ -84,6 +85,13 @@ struct regex_jit_program_accessor {
   static retained_kernel const& sample_kernel(regex_jit_program const& prog, bool offset64)
   {
     return prog._impl->sample_kernels.at(static_cast<std::size_t>(offset64));
+  }
+
+  static retained_kernel const* warp_literal_kernel(regex_jit_program const& prog, bool offset64)
+  {
+    return prog._impl->warp_literal_kernels.empty()
+             ? nullptr
+             : &prog._impl->warp_literal_kernels.at(static_cast<std::size_t>(offset64));
   }
 
   static regex_ir::executor_kind executor(regex_jit_program const& prog)
@@ -120,10 +128,11 @@ static_assert(alignof(pair_t) == alignof(char const*));
 
 constexpr std::size_t required_stack_size = 64U * 1024U;
 
-std::uint32_t block_size(regex_ir::operation_kind operation, std::string_view matcher)
+std::uint32_t block_size(regex_ir::operation_kind operation, regex_ir::executor_kind executor)
 {
-  auto literal = matcher.find("; executor: single-byte literal scan") != std::string_view::npos ||
-                 matcher.find("; executor: packed ASCII literal scan") != std::string_view::npos;
+  auto literal = executor == regex_ir::executor_kind::SINGLE_BYTE_LITERAL ||
+                 executor == regex_ir::executor_kind::PACKED_ASCII_LITERAL ||
+                 executor == regex_ir::executor_kind::PACKED_UTF8_LITERAL;
   // Boolean and direct-literal scans benefit from retaining each thread's sequential input window
   // in L1. Complex ordered span operations are divergence-limited and need smaller blocks for
   // occupancy and scheduling.
@@ -140,6 +149,7 @@ struct input_data {
   bitmask_type const* validity;
   size_type row_offset;
   size_type rows;
+  std::int64_t chars_bytes;
   bool offset64;
 };
 
@@ -155,6 +165,7 @@ input_data get_input_data(strings_column_view const& input, cuda::stream_ref str
                     input.parent().null_mask(),
                     input.offset(),
                     input.size(),
+                    input.chars_size(stream),
                     offsets.type().id() == type_id::INT64};
 }
 
@@ -192,11 +203,12 @@ std::string normalize_pattern(std::string_view pattern)
 regex_ir::compile_options make_compile_options(strings::regex_flags flags)
 {
   regex_ir::compile_options options;
-  options.case_insensitive = strings::is_ignorecase(flags);
-  options.multiline        = strings::is_multiline(flags);
-  options.dot_all          = strings::is_dotall(flags);
-  options.ascii_classes    = strings::is_ascii(flags);
-  options.extended_newline = strings::is_ext_newline(flags);
+  options.case_insensitive          = strings::is_ignorecase(flags);
+  options.multiline                 = strings::is_multiline(flags);
+  options.dot_all                   = strings::is_dotall(flags);
+  options.ascii_classes             = strings::is_ascii(flags);
+  options.extended_newline          = strings::is_ext_newline(flags);
+  options.find_match_end_observable = false;
   return options;
 }
 
@@ -247,15 +259,23 @@ void ensure_stack_size()
 
 retained_kernel compile_kernel(std::string const& matcher,
                                regex_ir::operation_kind operation,
+                               regex_ir::executor_kind executor,
                                std::string wrapper,
                                std::string_view name)
 {
-  auto threads                      = block_size(operation, matcher);
+  auto threads                      = block_size(operation, executor);
   auto module                       = regex_ir::nvvm::assemble(matcher, std::move(wrapper));
   auto fragment                     = get_nvvm_fragment(std::string{name}, module);
   rtcx::memory_fragment fragments[] = {
     {.data = fragment->view(), .type = rtcx::binary_type::LTO_IR, .name = nullptr}};
-  return {get_lto_linked_kernel(std::string{name}, {}, fragments), threads};
+  auto compiled   = get_lto_linked_kernel(std::string{name}, {}, fragments);
+  auto attributes = cudaFuncAttributes{};
+  CUDF_CUDA_TRY(cudaFuncGetAttributes(&attributes, compiled.get().get()));
+  auto maximum_threads = attributes.maxThreadsPerBlock;
+  CUDF_EXPECTS(maximum_threads >= 32, "regex JIT kernel does not support a full warp");
+  threads = std::min(threads, static_cast<std::uint32_t>(maximum_threads));
+  threads -= threads % 32U;
+  return {std::move(compiled), threads};
 }
 
 template <typename... Args>
@@ -273,6 +293,25 @@ void launch(retained_kernel const& prepared,
   auto threads    = prepared.threads;
   auto grid =
     static_cast<std::uint32_t>((static_cast<std::uint32_t>(rows) + threads - 1) / threads);
+  prepared.value.launch_with(
+    {grid, 1, 1}, {threads, 1, 1}, 0, stream, chars, offsets, validity, row_offset, rows, args...);
+}
+
+template <typename... Args>
+void launch_warp_per_row(retained_kernel const& prepared,
+                         input_data const& input,
+                         cuda::stream_ref stream,
+                         Args... args)
+{
+  if (input.rows == 0) { return; }
+  auto chars      = const_cast<char*>(input.chars);
+  auto offsets    = const_cast<void*>(input.offsets);
+  auto validity   = const_cast<bitmask_type*>(input.validity);
+  auto row_offset = input.row_offset;
+  auto rows       = input.rows;
+  auto threads    = prepared.threads;
+  auto warps      = threads / 32U;
+  auto grid = static_cast<std::uint32_t>((static_cast<std::uint32_t>(rows) + warps - 1U) / warps);
   prepared.value.launch_with(
     {grid, 1, 1}, {threads, 1, 1}, 0, stream, chars, offsets, validity, row_offset, rows, args...);
 }
@@ -317,11 +356,15 @@ span_cache_plan select_span_cache(input_data const& input,
       case regex_ir::executor_kind::ASSERTION_AWARE_DETERMINISTIC:
       case regex_ir::executor_kind::PRIORITIZED_DETERMINISTIC:
       case regex_ir::executor_kind::TAGGED_PRIORITIZED_DETERMINISTIC: return 2U;
+      case regex_ir::executor_kind::STREAMING_PRIORITIZED_GLUSHKOV:
+        return split_operation ? 2U : 0U;
       default: return 0U;
     }
   }();
   if (split_operation) { executor_weight *= 2; }
   if (executor_weight == 0) { return {}; }
+  auto known_average_bytes = static_cast<double>(input.chars_bytes) / input.rows;
+  if (known_average_bytes * executor_weight < 384.0) { return {}; }
 
   auto samples = std::min(input.rows, maximum_samples);
   rmm::device_uvector<std::uint64_t> statistics(4, stream, mr);
@@ -465,9 +508,16 @@ std::unique_ptr<column> fixed_result(strings_column_view const& input,
                         stream,
                         mr.get_output_mr());
   if (input.is_empty()) { return result; }
-  auto data      = get_input_data(input, stream);
-  auto& prepared = regex_jit_program_accessor::kernel(prog, data.offset64);
-  launch(prepared, data, stream, result->mutable_view().head<void>());
+  auto data          = get_input_data(input, stream);
+  auto* warp         = regex_jit_program_accessor::warp_literal_kernel(prog, data.offset64);
+  auto non_null_rows = input.size() - input.null_count();
+  auto warp_parallel = non_null_rows > 0 && data.chars_bytes / non_null_rows > 64;
+  if (warp != nullptr && warp_parallel) {
+    launch_warp_per_row(*warp, data, stream, result->mutable_view().head<void>());
+  } else {
+    auto& prepared = regex_jit_program_accessor::kernel(prog, data.offset64);
+    launch(prepared, data, stream, result->mutable_view().head<void>());
+  }
   return result;
 }
 
@@ -645,7 +695,7 @@ std::vector<replacement_piece> literal_replacement(std::string_view replacement)
 }
 
 std::vector<replacement_piece> parse_backref_replacement(std::string_view replacement,
-                                                         size_type group_count)
+                                                         std::optional<size_type> group_count)
 {
   CUDF_EXPECTS(!replacement.empty(), "Parameter replacement must not be empty");
   auto uses_backslash = false;
@@ -699,7 +749,9 @@ std::vector<replacement_piece> parse_backref_replacement(std::string_view replac
     for (auto index = capture_begin; index < capture_end; ++index) {
       capture = capture * 10U + static_cast<std::uint64_t>(replacement[index] - '0');
     }
-    CUDF_EXPECTS(capture <= static_cast<std::uint64_t>(std::min(group_count, size_type{99})),
+    auto max_group =
+      group_count.has_value() ? std::min(*group_count, size_type{99}) : size_type{99};
+    CUDF_EXPECTS(capture <= static_cast<std::uint64_t>(max_group),
                  "Group index numbers must be in the range 0 to group count");
     flush_literal();
     result.push_back({{}, static_cast<size_type>(capture)});
@@ -1005,33 +1057,81 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
     }
 
     auto compile_options = make_compile_options(flags);
-    auto compiled        = regex_ir::compile(
-      compile_pattern, internal_operation(operation), std::nullopt, compile_options);
-    auto capture_count      = static_cast<size_type>(compiled.capture_count);
-    auto executor           = compiled.executor;
-    auto matcher            = std::move(compiled.nvvm_ir);
-    auto kernels            = std::vector<retained_kernel>{};
-    auto cache_size_kernels = std::vector<retained_kernel>{};
-    auto cache_emit_kernels = std::vector<retained_kernel>{};
-    auto sample_kernels     = std::vector<retained_kernel>{};
-    auto cache_values       = size_type{0};
-    auto validation_error   = std::optional<std::string>{};
-    auto internal           = internal_operation(operation);
-    auto kernel_operation =
-      operation == regex_operation::REPLACE || operation == regex_operation::REPLACE_WITH_BACKREFS
-        ? regex_ir::operation_kind::REPLACE
-        : internal;
+    auto internal        = internal_operation(operation);
+    if (operation == regex_operation::FINDALL &&
+        captures == strings::capture_groups::NON_CAPTURE) {
+      internal = regex_ir::operation_kind::FIND_ALL;
+    }
+    auto replacement_operation =
+      operation == regex_operation::REPLACE || operation == regex_operation::REPLACE_WITH_BACKREFS;
+    auto native_replace   = replacement_operation && !program_options.max_replace_count.has_value();
+    auto replacement_text = program_options.replacement.value_or("");
+    if (operation == regex_operation::REPLACE_WITH_BACKREFS) {
+      CUDF_EXPECTS(program_options.replacement.has_value(),
+                   "replace_with_backrefs requires a replacement in regex_jit_program_options");
+    }
+    auto replacement      = literal_replacement(replacement_text);
+    auto validation_error = std::optional<std::string>{};
+    if (native_replace && operation == regex_operation::REPLACE_WITH_BACKREFS) {
+      try {
+        replacement = parse_backref_replacement(replacement_text, std::nullopt);
+      } catch (cudf::logic_error const& error) {
+        validation_error = error.what();
+        replacement      = literal_replacement("");
+        native_replace   = false;
+      }
+    }
+
+    auto compiled = [&] {
+      if (!native_replace) {
+        return regex_ir::compile(compile_pattern, internal, std::nullopt, compile_options);
+      }
+      try {
+        return regex_ir::compile(compile_pattern,
+                                 regex_ir::operation_kind::REPLACE,
+                                 regex_ir::nvvm::encode_replacement(replacement),
+                                 compile_options);
+      } catch (std::invalid_argument const& error) {
+        if (operation != regex_operation::REPLACE_WITH_BACKREFS) { throw; }
+        auto fallback = regex_ir::compile(compile_pattern, internal, std::nullopt, compile_options);
+        validation_error = error.what();
+        replacement      = literal_replacement("");
+        native_replace   = false;
+        return fallback;
+      }
+    }();
+    auto capture_count = static_cast<size_type>(compiled.capture_count);
+    if (!native_replace && operation == regex_operation::REPLACE_WITH_BACKREFS &&
+        !validation_error.has_value()) {
+      try {
+        replacement = parse_backref_replacement(replacement_text, capture_count);
+      } catch (cudf::logic_error const& error) {
+        validation_error = error.what();
+        replacement      = literal_replacement("");
+      }
+    }
+    auto executor             = compiled.executor;
+    auto exact_ascii_literal  = std::move(compiled.exact_ascii_literal);
+    auto matcher              = std::move(compiled.nvvm_ir);
+    auto kernels              = std::vector<retained_kernel>{};
+    auto warp_literal_kernels = std::vector<retained_kernel>{};
+    auto cache_size_kernels   = std::vector<retained_kernel>{};
+    auto cache_emit_kernels   = std::vector<retained_kernel>{};
+    auto sample_kernels       = std::vector<retained_kernel>{};
+    auto cache_values         = size_type{0};
+    auto kernel_operation = replacement_operation ? regex_ir::operation_kind::REPLACE : internal;
 
     auto add_pass = [&](auto&& make_wrapper, std::string_view name) {
       for (auto offset64 : {false, true}) {
-        kernels.push_back(compile_kernel(matcher, kernel_operation, make_wrapper(offset64), name));
+        kernels.push_back(
+          compile_kernel(matcher, kernel_operation, executor, make_wrapper(offset64), name));
       }
     };
     auto add_output_offset_pass = [&](auto&& make_wrapper, std::string_view name) {
       for (auto offset64 : {false, true}) {
         for (auto output_offset64 : {false, true}) {
           kernels.push_back(compile_kernel(
-            matcher, kernel_operation, make_wrapper(offset64, output_offset64), name));
+            matcher, kernel_operation, executor, make_wrapper(offset64, output_offset64), name));
         }
       }
     };
@@ -1046,6 +1146,20 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
             return regex_ir::nvvm::make_fixed_kernel(offset64, internal, KERNEL_ENTRY);
           },
           "cudf.experimental.regex.fixed");
+        if (operation == regex_operation::CONTAINS) {
+          if (exact_ascii_literal.has_value()) {
+            for (auto offset64 : {false, true}) {
+              auto prepared    = compile_kernel(matcher,
+                                             internal,
+                                             executor,
+                                             regex_ir::nvvm::make_warp_literal_contains_kernel(
+                                               offset64, *exact_ascii_literal, KERNEL_ENTRY),
+                                             "cudf.experimental.regex.warp_literal_contains");
+              prepared.threads = 256;
+              warp_literal_kernels.push_back(std::move(prepared));
+            }
+          }
+        }
         break;
       case regex_operation::EXTRACT:
         add_pass(
@@ -1090,17 +1204,20 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
             cache_size_kernels.push_back(
               compile_kernel(matcher,
                              kernel_operation,
+                             executor,
                              regex_ir::nvvm::make_enumeration_size_kernel(
                                offset64, slots, findall ? 1 : groups, !findall, true, KERNEL_ENTRY),
                              "cudf.experimental.regex.enumerate_cache_size"));
             cache_emit_kernels.push_back(
               compile_kernel(matcher,
                              kernel_operation,
+                             executor,
                              regex_ir::nvvm::make_enumeration_emit_kernel(
                                offset64, slots, groups, findall, true, KERNEL_ENTRY),
                              "cudf.experimental.regex.enumerate_overflow_emit"));
             sample_kernels.push_back(compile_kernel(matcher,
                                                     kernel_operation,
+                                                    executor,
                                                     regex_ir::nvvm::make_span_cache_sample_kernel(
                                                       offset64, false, slots, -1, KERNEL_ENTRY),
                                                     "cudf.experimental.regex.enumerate_sample"));
@@ -1110,19 +1227,19 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
       }
       case regex_operation::REPLACE:
       case regex_operation::REPLACE_WITH_BACKREFS: {
-        auto replacement_text = program_options.replacement.value_or("");
-        if (operation == regex_operation::REPLACE_WITH_BACKREFS) {
-          CUDF_EXPECTS(program_options.replacement.has_value(),
-                       "replace_with_backrefs requires a replacement in regex_jit_program_options");
-        }
-        auto replacement = literal_replacement(replacement_text);
-        if (operation == regex_operation::REPLACE_WITH_BACKREFS) {
-          try {
-            replacement = parse_backref_replacement(replacement_text, capture_count);
-          } catch (cudf::logic_error const& error) {
-            validation_error = error.what();
-            replacement      = literal_replacement("");
-          }
+        if (native_replace) {
+          add_pass(
+            [&](bool offset64) {
+              return regex_ir::nvvm::make_replace_kernel(offset64, false, false, KERNEL_ENTRY);
+            },
+            "cudf.experimental.regex.replace_size");
+          add_output_offset_pass(
+            [&](bool offset64, bool output_offset64) {
+              return regex_ir::nvvm::make_replace_kernel(
+                offset64, true, output_offset64, KERNEL_ENTRY);
+            },
+            "cudf.experimental.regex.replace_emit");
+          break;
         }
         auto limit =
           program_options.max_replace_count.has_value() && *program_options.max_replace_count > 0
@@ -1148,11 +1265,13 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
             cache_size_kernels.push_back(compile_kernel(
               matcher,
               kernel_operation,
+              executor,
               regex_ir::nvvm::make_limited_replace_kernel(
                 offset64, false, false, true, replacement, slots, limit, KERNEL_ENTRY),
               "cudf.experimental.regex.replace_cache_size"));
             sample_kernels.push_back(compile_kernel(matcher,
                                                     kernel_operation,
+                                                    executor,
                                                     regex_ir::nvvm::make_span_cache_sample_kernel(
                                                       offset64, false, slots, limit, KERNEL_ENTRY),
                                                     "cudf.experimental.regex.replace_sample"));
@@ -1160,6 +1279,7 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
               cache_emit_kernels.push_back(compile_kernel(
                 matcher,
                 kernel_operation,
+                executor,
                 regex_ir::nvvm::make_limited_replace_kernel(
                   offset64, true, output_offset64, true, replacement, slots, limit, KERNEL_ENTRY),
                 "cudf.experimental.regex.replace_cache_emit"));
@@ -1192,18 +1312,21 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
             cache_size_kernels.push_back(compile_kernel(
               matcher,
               kernel_operation,
+              executor,
               regex_ir::nvvm::make_split_size_kernel(
                 offset64, reverse ? -1 : program_options.maxsplit, true, KERNEL_ENTRY),
               "cudf.experimental.regex.split_cache_size"));
             cache_emit_kernels.push_back(
               compile_kernel(matcher,
                              kernel_operation,
+                             executor,
                              regex_ir::nvvm::make_split_emit_kernel(
                                offset64, reverse, program_options.maxsplit, true, KERNEL_ENTRY),
                              "cudf.experimental.regex.split_overflow_emit"));
             sample_kernels.push_back(compile_kernel(
               matcher,
               kernel_operation,
+              executor,
               regex_ir::nvvm::make_span_cache_sample_kernel(
                 offset64, true, 2, reverse ? -1 : program_options.maxsplit, KERNEL_ENTRY),
               "cudf.experimental.regex.split_sample"));
@@ -1212,15 +1335,16 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
         break;
       }
     }
-    _impl =
-      std::make_unique<regex_jit_program_impl>(regex_jit_program_impl{capture_count,
-                                                                      std::move(kernels),
-                                                                      std::move(cache_size_kernels),
-                                                                      std::move(cache_emit_kernels),
-                                                                      std::move(sample_kernels),
-                                                                      executor,
-                                                                      cache_values,
-                                                                      std::move(validation_error)});
+    _impl = std::make_unique<regex_jit_program_impl>(
+      regex_jit_program_impl{capture_count,
+                             std::move(kernels),
+                             std::move(cache_size_kernels),
+                             std::move(cache_emit_kernels),
+                             std::move(sample_kernels),
+                             std::move(warp_literal_kernels),
+                             executor,
+                             cache_values,
+                             std::move(validation_error)});
   } catch (std::invalid_argument const& error) {
     CUDF_FAIL(error.what());
   }
@@ -1295,6 +1419,7 @@ std::unique_ptr<column> extract_single(strings_column_view const& input,
   auto& options = regex_jit_program_accessor::options(prog);
   CUDF_EXPECTS(options.group == group,
                "extract_single group does not match the regex_jit_program group");
+  if (input.is_empty()) { return make_empty_column(type_id::STRING); }
   CUDF_EXPECTS(group >= 0 && group < prog.groups_count(),
                "group parameter outside the range of capture groups found in the regex pattern",
                std::invalid_argument);

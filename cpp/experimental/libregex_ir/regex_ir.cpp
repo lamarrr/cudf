@@ -256,6 +256,26 @@ bool is_unconditional_empty(node const& value)
   return false;
 }
 
+bool can_match_empty(node const& value)
+{
+  switch (value.kind) {
+    case node_kind::EMPTY:
+    case node_kind::ASSERTION: return true;
+    case node_kind::PREDICATE: return false;
+    case node_kind::GROUP: return can_match_empty(*value.children.front());
+    case node_kind::CONCATENATE:
+      return std::all_of(value.children.begin(), value.children.end(), [](auto& child) {
+        return can_match_empty(*child);
+      });
+    case node_kind::ALTERNATE:
+      return std::any_of(value.children.begin(), value.children.end(), [](auto& child) {
+        return can_match_empty(*child);
+      });
+    case node_kind::REPEAT: return value.minimum == 0 || can_match_empty(*value.children.front());
+  }
+  return false;
+}
+
 bool contains_capture(node const& value)
 {
   if (value.kind == node_kind::GROUP && value.capturing) return true;
@@ -433,8 +453,12 @@ class parser {
   {
     auto lhs = parse_concatenation();
     while (consume('|')) {
+      auto separator = position_ - 1;
       auto rhs       = parse_concatenation();
       auto alternate = make(node_kind::ALTERNATE, lhs->source.offset);
+      if (lhs->kind == node_kind::EMPTY && rhs->kind == node_kind::EMPTY) {
+        fail(diagnostic_code::UNEXPECTED_TOKEN, {separator, 1}, "empty alternation");
+      }
       alternate->children.push_back(std::move(lhs));
       alternate->children.push_back(std::move(rhs));
       alternate->source.length = position_ - alternate->source.offset;
@@ -932,8 +956,12 @@ class thompson_builder {
       case node_kind::ASSERTION: return make_assertion(expression);
       case node_kind::GROUP: return make_group(expression);
       case node_kind::CONCATENATE: return make_concatenate(expression);
-      case node_kind::ALTERNATE: return make_alternate(expression);
-      case node_kind::REPEAT: return make_repeat(expression);
+      case node_kind::ALTERNATE:
+        ir.has_alternation = true;
+        return make_alternate(expression);
+      case node_kind::REPEAT:
+        ir.has_lazy_quantifier = ir.has_lazy_quantifier || !expression.greedy;
+        return make_repeat(expression);
     }
     return {};
   }
@@ -1093,6 +1121,12 @@ class thompson_builder {
   fragment make_repeat(node const& expression)
   {
     auto& repeated = *expression.children.front();
+    if (expression.maximum == unbounded_repeat && can_match_empty(repeated)) {
+      diagnostics.push_back({diagnostic_code::INVALID_QUANTIFIER,
+                             expression.source,
+                             "unbounded repetition of a nullable expression is not supported"});
+      throw parse_failure{};
+    }
     std::optional<fragment> result;
     auto append = [&](fragment next) {
       if (result) {
@@ -1375,6 +1409,162 @@ std::string assemble(std::string matcher, std::string wrapper)
   }
   matcher.insert(metadata, std::move(wrapper));
   return matcher;
+}
+
+std::string make_warp_literal_contains_kernel(bool offset64,
+                                              std::string_view literal,
+                                              std::string_view kernel_name)
+{
+  if (literal.empty()) { throw std::invalid_argument("literal must not be empty"); }
+  auto comparisons = std::string{};
+  auto matched     = std::string{};
+  auto offset      = std::size_t{1};
+  auto index       = std::size_t{0};
+  while (offset < literal.size()) {
+    auto remaining      = literal.size() - offset;
+    auto width          = remaining >= 8U ? 8U : remaining >= 4U ? 4U : remaining >= 2U ? 2U : 1U;
+    std::uint64_t value = 0;
+    for (std::size_t byte = 0; byte < width; ++byte) {
+      value |= static_cast<std::uint64_t>(static_cast<std::uint8_t>(literal[offset + byte]))
+               << (byte * 8U);
+    }
+    auto bits = width * 8U;
+    std::format_to(std::back_inserter(comparisons),
+                   "  %literal_ptr_{0} = getelementptr i8, i8* %data, i64 %literal_offset_{0}\n",
+                   index);
+    if (width == 1U) {
+      std::format_to(std::back_inserter(comparisons),
+                     "  %literal_chunk_{0} = load i8, i8* %literal_ptr_{0}, align 1\n",
+                     index);
+    } else {
+      std::format_to(std::back_inserter(comparisons),
+                     "  %literal_chunk_ptr_{0} = bitcast i8* %literal_ptr_{0} to i{1}*\n"
+                     "  %literal_chunk_{0} = load i{1}, i{1}* %literal_chunk_ptr_{0}, align 1\n",
+                     index,
+                     bits);
+    }
+    std::format_to(std::back_inserter(comparisons),
+                   "  %literal_equal_{0} = icmp eq i{1} %literal_chunk_{0}, {2}\n",
+                   index,
+                   bits,
+                   value);
+    if (matched.empty()) {
+      matched = std::format("%literal_equal_{}", index);
+    } else {
+      std::format_to(std::back_inserter(comparisons),
+                     "  %literal_through_{0} = and i1 {1}, %literal_equal_{0}\n",
+                     index,
+                     matched);
+      matched = std::format("%literal_through_{}", index);
+    }
+    offset += width;
+    ++index;
+  }
+
+  auto offsets = std::string{};
+  offset       = 1;
+  for (std::size_t chunk = 0; chunk < index; ++chunk) {
+    std::format_to(std::back_inserter(offsets),
+                   "  %literal_offset_{0} = add i64 %position, {1}\n",
+                   chunk,
+                   offset);
+    auto remaining = literal.size() - offset;
+    offset += remaining >= 8U ? 8U : remaining >= 4U ? 4U : remaining >= 2U ? 2U : 1U;
+  }
+
+  auto verify = literal.size() == 1U
+                  ? std::string{"  br i1 %first_equal, label %local_yes, label %inner_continue\n"}
+                  : std::format(
+                      R"NVVM(  br i1 %first_equal, label %verify, label %inner_continue
+verify:
+{0}{1}  br i1 {2}, label %local_yes, label %inner_continue
+)NVVM",
+                      offsets,
+                      comparisons,
+                      matched);
+
+  auto result = common_nvvm(offset64, false);
+  result += std::format(
+    R"NVVM(
+declare i1 @llvm.nvvm.vote.any.sync(i32, i1) nounwind convergent
+
+define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output) nounwind {{
+entry:
+  %thread = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %width = call i32 @llvm.nvvm.read.ptx.sreg.ntid.x()
+  %block = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
+  %base = mul i32 %block, %width
+  %global = add i32 %base, %thread
+  %lane = and i32 %thread, 31
+  %row = lshr i32 %global, 5
+  %in_bounds = icmp slt i32 %row, %rows
+  br i1 %in_bounds, label %work, label %done
+work:
+  %physical = add i32 %row_offset, %row
+  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
+  %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
+  %next = add i32 %physical, 1
+  %end = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %next)
+  %size = sub i64 %end, %begin
+  %data = getelementptr i8, i8* %chars, i64 %begin
+  %lane64 = zext i32 %lane to i64
+  %lane_base = mul nuw i64 %lane64, 4
+  br label %search
+search:
+  %round = phi i64 [ 0, %work ], [ %next_round, %continue ]
+  %first_round = icmp eq i64 %round, 0
+  %round_lane = select i1 %first_round, i64 %lane64, i64 %lane_base
+  %candidate_limit = select i1 %first_round, i64 1, i64 4
+  %lane_position = add i64 %round, %round_lane
+  br label %inner
+inner:
+  %candidate_offset = phi i64 [ 0, %search ], [ %next_candidate, %inner_continue ]
+  %position = add i64 %lane_position, %candidate_offset
+  %candidate_end = add i64 %position, {0}
+  %candidate = icmp ule i64 %candidate_end, %size
+  br i1 %candidate, label %compare, label %inner_done
+compare:
+  %first_ptr = getelementptr i8, i8* %data, i64 %position
+  %first = load i8, i8* %first_ptr, align 1
+  %first_equal = icmp eq i8 %first, {1}
+{2}inner_continue:
+  %next_candidate = add nuw i64 %candidate_offset, 1
+  %more_candidates = icmp ult i64 %next_candidate, %candidate_limit
+  br i1 %more_candidates, label %inner, label %inner_done
+local_yes:
+  br label %inner_done
+inner_done:
+  %local_match = phi i1 [ true, %local_yes ], [ false, %inner ], [ false, %inner_continue ]
+  br label %vote
+vote:
+  %warp_match = call i1 @llvm.nvvm.vote.any.sync(i32 -1, i1 %local_match)
+  br i1 %warp_match, label %store_true, label %continue
+continue:
+  %later_round = add i64 %round, 128
+  %next_round = select i1 %first_round, i64 32, i64 %later_round
+  %round_possible = icmp ult i64 %next_round, %size
+  br i1 %round_possible, label %search, label %store_false
+store_true:
+  br label %store
+store_false:
+  br label %store
+store:
+  %value = phi i8 [ 1, %store_true ], [ 0, %store_false ]
+  %lane_zero = icmp eq i32 %lane, 0
+  %write = and i1 %lane_zero, %valid
+  br i1 %write, label %write_value, label %done
+write_value:
+  %out = getelementptr i8, i8* %output, i32 %row
+  store i8 %value, i8* %out, align 1
+  br label %done
+done:
+  ret void
+}}
+)NVVM",
+    literal.size(),
+    static_cast<std::uint32_t>(static_cast<std::uint8_t>(literal.front())),
+    verify);
+  return annotate_kernel(std::move(result), "i8*, i8*, i32*, i32, i32, i8*", kernel_name);
 }
 
 std::string make_fixed_kernel(bool offset64,
@@ -2230,7 +2420,10 @@ std::string encode_replacement(std::span<replacement_piece const> replacement)
   return result;
 }
 
-std::string make_replace_kernel(bool offset64, bool emit, std::string_view kernel_name)
+std::string make_replace_kernel(bool offset64,
+                                bool emit,
+                                bool output_offset64,
+                                std::string_view kernel_name)
 {
   auto result = common_nvvm(offset64, false);
   result += emit ? R"NVVM(
@@ -2249,11 +2442,11 @@ replace:
   %end = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %next)
   %size = sub i64 %end, %begin
   %data = getelementptr i8, i8* %chars, i64 %begin
-  %typed_output_offsets = bitcast i8* %output_offsets to i32*
-  %output_offset_ptr = getelementptr i32, i32* %typed_output_offsets, i32 %row
-  %output_offset = load i32, i32* %output_offset_ptr, align 4
-  %output_offset64 = sext i32 %output_offset to i64
-  %output_ptr = getelementptr i8, i8* %output, i64 %output_offset64
+  %typed_output_offsets = bitcast i8* %output_offsets to @OUTPUT_TYPE@*
+  %output_offset_ptr = getelementptr @OUTPUT_TYPE@, @OUTPUT_TYPE@* %typed_output_offsets, i32 %row
+  %raw_output_offset = load @OUTPUT_TYPE@, @OUTPUT_TYPE@* %output_offset_ptr, align @OUTPUT_ALIGN@
+  %output_offset = @OUTPUT_EXTEND@ @OUTPUT_TYPE@ %raw_output_offset to i64
+  %output_ptr = getelementptr i8, i8* %output, i64 %output_offset
   %written = call i64 @regex_ir_execute(i8* %data, i64 %size, i8* %output_ptr)
   br label %done
 done:
@@ -2291,6 +2484,16 @@ done:
   ret void
 }
 )NVVM";
+  if (emit) {
+    replace_all(result, "@OUTPUT_TYPE@", output_offset64 ? "i64" : "i32");
+    replace_all(result, "@OUTPUT_ALIGN@", output_offset64 ? "8" : "4");
+    replace_all(result, "@OUTPUT_EXTEND@", output_offset64 ? "add i64 0," : "sext");
+    if (output_offset64) {
+      replace_all(result,
+                  "%output_offset = add i64 0, i64 %raw_output_offset to i64",
+                  "%output_offset = add i64 %raw_output_offset, 0");
+    }
+  }
   return annotate_kernel(
     std::move(result),
     emit ? "i8*, i8*, i32*, i32, i32, i8*, i8*" : "i8*, i8*, i32*, i32, i32, i8*",
@@ -2740,6 +2943,9 @@ instruction_result lower(automata_ir const& automata, operation const& selected)
     case operation_kind::FIND:
       result.control = {true, false, true, true, result_shape::MATCH_SPAN};
       break;
+    case operation_kind::FIND_ALL:
+      result.control = {true, false, false, true, result_shape::MATCH_SPAN};
+      break;
     case operation_kind::COUNT:
       result.control = {true, false, false, true, result_shape::MATCH_COUNT};
       break;
@@ -2753,9 +2959,11 @@ instruction_result lower(automata_ir const& automata, operation const& selected)
       result.control = {true, false, false, true, result_shape::SPLIT_FIELDS};
       break;
   }
-  result.entry         = automata.entry;
-  result.accept        = automata.accept;
-  result.capture_count = automata.capture_count;
+  result.entry               = automata.entry;
+  result.accept              = automata.accept;
+  result.capture_count       = automata.capture_count;
+  result.has_alternation     = automata.has_alternation;
+  result.has_lazy_quantifier = automata.has_lazy_quantifier;
   result.blocks.reserve(automata.states.size());
 
   for (auto& state : automata.states) {
@@ -3116,6 +3324,35 @@ void build_start_byte_filter(deterministic_machine& machine)
     ++candidates;
   }
   // sparse, simple ranges repay the extra candidate-dispatch control flow.
+  machine.start_byte_filter =
+    candidates != 0U && candidates <= 16U && machine.start_byte_range_count <= 2U;
+}
+
+void build_assertion_start_byte_filter(deterministic_machine& machine)
+{
+  if (!machine.assertion_aware || machine.class_count == 0U || machine.boundary_class_count == 0U ||
+      machine.dead_state > machine.state_mask) {
+    return;
+  }
+  std::size_t candidates        = 0;
+  auto previous_ascii_candidate = false;
+  for (std::size_t byte = 0; byte < machine.byte_classes.size(); ++byte) {
+    auto candidate = false;
+    for (std::size_t boundary = 0; boundary < machine.boundary_class_count; ++boundary) {
+      auto index = (static_cast<std::size_t>(machine.initial_state) * machine.boundary_class_count +
+                    boundary) *
+                     machine.class_count +
+                   machine.byte_classes[byte];
+      if (index >= machine.transitions.size()) return;
+      auto target = static_cast<std::uint16_t>(machine.transitions[index] & machine.state_mask);
+      candidate |= target != machine.dead_state;
+    }
+    if (byte < 128U && candidate && !previous_ascii_candidate) { ++machine.start_byte_range_count; }
+    if (byte < 128U) previous_ascii_candidate = candidate;
+    if (!candidate) continue;
+    machine.start_byte_bitmap[byte / 64U] |= std::uint64_t{1} << (byte % 64U);
+    ++candidates;
+  }
   machine.start_byte_filter =
     candidates != 0U && candidates <= 16U && machine.start_byte_range_count <= 2U;
 }
@@ -3608,6 +3845,7 @@ std::optional<deterministic_machine> make_assertion_deterministic_machine(
   if (machine.transitions.size() * sizeof(std::uint16_t) > 32U * 1024U) {
     machine.transition_address_space = 1;
   }
+  build_assertion_start_byte_filter(machine);
   return machine;
 }
 
@@ -3933,7 +4171,9 @@ std::optional<deterministic_machine> make_deterministic_machine(instruction_ir c
         next.ordered.push_back(accept_bit);
         next.captures.push_back(std::move(deferred_accept_captures));
       }
-      if (machine.scan_input) {
+      // A deferred acceptance wins before this character. Injecting a new scan start here would
+      // make a nullable initial state accepting again and incorrectly consume the character.
+      if (machine.scan_input && !stop_before) {
         for (std::size_t word = 0; word < next.bits.size(); ++word)
           next.bits[word] |= start_state.bits[word];
         for (std::size_t start_index = 0; start_index < start_state.ordered.size(); ++start_index) {
@@ -4003,25 +4243,89 @@ std::optional<deterministic_machine> make_deterministic_machine(instruction_ir c
 class nvvm_ir_renderer {
  public:
   nvvm_ir_renderer(instruction_ir const& ir, nvvm_ir_codegen_options const& options)
-    : ir_(ir), options_(options)
+    : ir_(ir), options_(options), public_execute_function_(options.execute_function)
   {
+    exact_ascii_literal_metadata_ = exact_ascii_literal();
+    auto result                   = ir_.control.result;
+    auto adapt_count              = result == result_shape::MATCH_COUNT;
+    auto adapt_find = result == result_shape::MATCH_SPAN &&
+                      ir_.selected_operation.kind == operation_kind::FIND &&
+                      !ir_.options.find_match_end_observable;
+    if (begins_at_input_start() && (adapt_count || adapt_find)) {
+      anchored_boolean_result_  = result;
+      options_.execute_function = name("anchored_boolean_execute");
+      ir_.control.result        = result_shape::BOOLEAN;
+      ir_.control.first_only    = true;
+    }
   }
 
-  std::string render()
+  compile_result render()
   {
     require_codegen_ir(ir_);
     require_identifier(options_.symbol_prefix, "symbol_prefix");
     require_identifier(options_.execute_function, "execute_function");
-    capture_slots_      = live_capture_slots();
+    require_identifier(public_execute_function_, "execute_function");
+    whole_match_captures_ = whole_match_captures();
+    capture_slots_        = live_capture_slots();
+    if (!whole_match_captures_.empty()) {
+      for (auto& block : ir_.blocks) {
+        std::erase_if(block.instructions, [&](instruction const& item) {
+          auto* capture = std::get_if<write_capture>(&item);
+          return capture != nullptr &&
+                 std::find(whole_match_captures_.begin(),
+                           whole_match_captures_.end(),
+                           capture->capture_index) != whole_match_captures_.end();
+        });
+      }
+    }
     auto boolean_result = ir_.control.result == result_shape::BOOLEAN;
-    ascii_literal_      = exact_ascii_literal();
+    string_operations_  = string_operation_plan();
+    line_tail_literal_  = string_operations_.has_value() ? std::nullopt : line_tail_literal();
+    word_run_minimum_   = string_operations_.has_value() || line_tail_literal_.has_value()
+                            ? std::nullopt
+                            : word_run_minimum();
+    ascii_literal_      = word_run_minimum_.has_value() || line_tail_literal_.has_value()
+                            ? std::nullopt
+                            : exact_ascii_literal();
+    if (string_operations_.has_value()) { ascii_literal_.reset(); }
+    utf8_literal_ = string_operations_.has_value() || line_tail_literal_.has_value() ||
+                        word_run_minimum_.has_value() || ascii_literal_.has_value()
+                      ? std::nullopt
+                      : exact_utf8_literal();
+    if (boolean_result && !ir_.control.scan_input) { utf8_literal_.reset(); }
+    utf8_literal_pivot_ =
+      utf8_literal_.has_value() ? utf8_literal_pivot(*utf8_literal_) : std::nullopt;
+    prefix_seek_byte_ = required_ascii_prefix();
+    if (ir_.has_alternation || string_operations_.has_value() ||
+        line_tail_literal_.has_value() || word_run_minimum_.has_value() ||
+        ascii_literal_.has_value() || utf8_literal_.has_value()) {
+      prefix_seek_byte_.reset();
+    }
     // short early-hit scans favor the compact DFA; long literals repay wide candidate scans.
     if (boolean_result && ir_.control.scan_input && ascii_literal_.has_value() &&
         ascii_literal_->size() > 1U && ascii_literal_->size() < 16U) {
       ascii_literal_.reset();
     }
-    if (!ascii_literal_.has_value()) {
-      if (boolean_result && !begins_at_input_start()) {
+    if (!line_tail_literal_.has_value() && !word_run_minimum_.has_value() &&
+        !ascii_literal_.has_value() && !utf8_literal_.has_value()) {
+      auto replacement_uses_captures =
+        std::any_of(ir_.replacement.begin(), ir_.replacement.end(), [](auto& token) {
+          return token.type == replacement_token::kind::CAPTURE;
+        });
+      auto span_or_count =
+        ir_.control.result == result_shape::MATCH_SPAN ||
+        ir_.control.result == result_shape::MATCH_COUNT ||
+        (ir_.control.result == result_shape::REPLACEMENT && !replacement_uses_captures) ||
+        ir_.control.result == result_shape::SPLIT_FIELDS ||
+        (ir_.control.result == result_shape::CAPTURES && !uses_capture_buffer());
+      // The streaming position automaton wins when every input position is a plausible restart.
+      // A known prefix instead favors the deterministic executor's restart acceleration, and
+      // capture substitutions need its one-pass capture propagation rather than a second
+      // span-recovery pass.
+      auto accelerated_restart = required_ascii_prefix().has_value();
+      auto streaming_span_result = span_or_count && !uses_capture_buffer() &&
+                                   !ir_.has_lazy_quantifier && !accelerated_restart;
+      if ((boolean_result && !begins_at_input_start()) || streaming_span_result) {
         glushkov_      = make_glushkov_machine(ir_, ir_.control.scan_input);
         deterministic_ = make_deterministic_machine(ir_, ir_.control.scan_input, false);
       } else if (boolean_result && begins_at_input_start() &&
@@ -4037,13 +4341,36 @@ class nvvm_ir_renderer {
         deterministic_ = make_deterministic_machine(
           ir_, boolean_result && ir_.control.scan_input, !boolean_result);
       }
+      // Nullable expressions and large graphs may not have a streaming position representation.
+      // Rebuild their fallback with priority preservation rather than retaining the speculative
+      // unordered DFA used only to compare against a successful streaming plan.
+      if (streaming_span_result && !glushkov_.has_value()) {
+        deterministic_ = make_deterministic_machine(ir_, false, true);
+      }
+      // This assertion machine records longest matches, so keep priority-sensitive syntax on the
+      // ordered executor until assertion closures carry branch-priority metadata.
+      auto assertion_candidate =
+        !boolean_result && !deterministic_.has_value() && !uses_capture_buffer() &&
+        !ir_.has_alternation && ir_.pattern.find('?') == std::string::npos;
+      auto keep_prefix_count =
+        ir_.control.result == result_shape::MATCH_COUNT && required_ascii_prefix().has_value();
+      if (assertion_candidate && !keep_prefix_count) {
+        auto graph = make_deterministic_graph(ir_);
+        if (graph.has_value()) {
+          deterministic_ = make_assertion_deterministic_machine(ir_, *graph, false);
+        }
+      }
     }
     if (glushkov_.has_value()) {
-      if (prefer_glushkov(*glushkov_, deterministic_)) {
+      if (!boolean_result || prefer_glushkov(*glushkov_, deterministic_)) {
         deterministic_.reset();
       } else {
         glushkov_.reset();
       }
+    }
+    if (boolean_result && !glushkov_.has_value() && !deterministic_.has_value() &&
+        ir_.control.scan_input) {
+      deterministic_ = make_deterministic_machine(ir_, true, true);
     }
     auto tagged_result = ir_.control.result == result_shape::CAPTURES &&
                          deterministic_.has_value() && deterministic_->capture_one_pass;
@@ -4051,20 +4378,48 @@ class nvvm_ir_renderer {
         (!deterministic_.has_value() || (uses_capture_buffer() && !tagged_result))) {
       deterministic_.reset();
     }
-    if (!ascii_literal_.has_value() && !glushkov_.has_value() && !deterministic_.has_value()) {
+    if (!ascii_literal_.has_value() && !utf8_literal_.has_value() && !glushkov_.has_value() &&
+        !deterministic_.has_value()) {
       mandatory_ascii_literal_ = mandatory_ascii_literal();
     }
-    auto executor = std::string_view{"recursive Thompson"};
-    if (ascii_literal_.has_value()) {
-      executor =
+    auto executor      = executor_kind::RECURSIVE_THOMPSON;
+    auto executor_name = std::string_view{"recursive Thompson"};
+    if (string_operations_.has_value()) {
+      executor      = executor_kind::STRING_OPERATIONS;
+      executor_name = "generated string operations";
+    } else if (line_tail_literal_.has_value()) {
+      executor      = executor_kind::STRING_OPERATIONS;
+      executor_name = "generated final-line tail search";
+    } else if (word_run_minimum_.has_value()) {
+      executor      = executor_kind::WORD_RUN;
+      executor_name = ir_.options.ascii_classes ? "ASCII word run" : "Unicode word run";
+    } else if (ascii_literal_.has_value()) {
+      executor = ascii_literal_->size() == 1U ? executor_kind::SINGLE_BYTE_LITERAL
+                                              : executor_kind::PACKED_ASCII_LITERAL;
+      executor_name =
         ascii_literal_->size() == 1U ? "single-byte literal scan" : "packed ASCII literal scan";
+    } else if (utf8_literal_.has_value()) {
+      executor      = utf8_literal_pivot_.has_value() ? executor_kind::PACKED_UTF8_LITERAL
+                                                      : executor_kind::UTF8_KMP_LITERAL;
+      executor_name = utf8_literal_pivot_.has_value()
+                        ? (ir_.control.result == result_shape::MATCH_COUNT
+                             ? "guarded-pivot packed UTF-8 literal scan"
+                             : "hybrid guarded-pivot/KMP UTF-8 literal scan")
+                        : "UTF-8 KMP literal scan";
     } else if (glushkov_.has_value()) {
-      executor = "bit-parallel Glushkov NFA";
+      executor =
+        boolean_result ? executor_kind::GLUSHKOV : executor_kind::STREAMING_PRIORITIZED_GLUSHKOV;
+      executor_name =
+        boolean_result ? "bit-parallel Glushkov NFA" : "streaming prioritized Glushkov NFA";
     } else if (deterministic_.has_value()) {
-      executor = deterministic_->assertion_aware ? "assertion-aware deterministic table"
-                 : boolean_result                ? "deterministic table"
-                 : tagged_result                 ? "tagged prioritized deterministic table"
-                                                 : "prioritized deterministic table";
+      executor      = deterministic_->assertion_aware ? executor_kind::ASSERTION_AWARE_DETERMINISTIC
+                      : boolean_result                ? executor_kind::DETERMINISTIC
+                      : tagged_result ? executor_kind::TAGGED_PRIORITIZED_DETERMINISTIC
+                                      : executor_kind::PRIORITIZED_DETERMINISTIC;
+      executor_name = deterministic_->assertion_aware ? "assertion-aware deterministic table"
+                      : boolean_result                ? "deterministic table"
+                      : tagged_result                 ? "tagged prioritized deterministic table"
+                                                      : "prioritized deterministic table";
     }
     output_.emit("{}",
                  std::format(R"NVVM(; NVVM IR generated by Regex IR
@@ -4073,7 +4428,7 @@ target triple = "nvptx64-nvidia-cuda"
 target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i128:128:128-f32:32:32-f64:64:64-v16:16:16-v32:32:32-v64:64:64-v128:128:128-n16:32:64"
 ; executor: {1})NVVM",
                              escaped_comment(ir_.pattern),
-                             executor));
+                             executor_name));
     if (mandatory_ascii_literal_.has_value()) {
       output_.emit("; mandatory ASCII literal filter: {}",
                    escaped_comment(*mandatory_ascii_literal_));
@@ -4094,8 +4449,19 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i1
     emit_load_byte();
     emit_decode_width();
     emit_decode_codepoint();
-    if (ascii_literal_.has_value() && boolean_result) {
+    if (prefix_seek_byte_.has_value()) { emit_prefix_byte_seek(*prefix_seek_byte_); }
+    if (string_operations_.has_value()) {
+      emit_string_operation_execute(*string_operations_);
+    } else if (line_tail_literal_.has_value()) {
+      emit_line_tail_execute(*line_tail_literal_);
+    } else if (word_run_minimum_.has_value()) {
+      if (!ir_.options.ascii_classes) emit_is_word();
+      emit_word_run_execute(*word_run_minimum_);
+    } else if (ascii_literal_.has_value() && boolean_result) {
       emit_ascii_literal_execute(*ascii_literal_);
+    } else if (utf8_literal_.has_value() && boolean_result) {
+      emit_utf8_literal_find_from(*utf8_literal_);
+      emit_utf8_kmp_execute();
     } else if (glushkov_.has_value() && boolean_result) {
       emit_glushkov_globals(*glushkov_);
       emit_deterministic_classifier(glushkov_->alphabet);
@@ -4137,10 +4503,28 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i1
           emit_ascii_literal_at(*ascii_literal_);
           emit_ascii_literal_find_from(*ascii_literal_);
         }
+      } else if (utf8_literal_.has_value()) {
+        emit_utf8_literal_find_from(*utf8_literal_);
+      } else if (glushkov_.has_value()) {
+        emit_glushkov_globals(*glushkov_);
+        emit_deterministic_classifier(glushkov_->alphabet);
+        emit_glushkov_reach(*glushkov_);
+        emit_glushkov_follow(*glushkov_);
+        emit_glushkov_find_from(*glushkov_);
       } else if (deterministic_.has_value()) {
+        if (deterministic_->assertion_aware) {
+          auto word_assertions =
+            static_cast<std::uint8_t>(assertion_bit(assertion_kind::WORD_BOUNDARY) |
+                                      assertion_bit(assertion_kind::NOT_WORD_BOUNDARY));
+          if ((deterministic_->assertion_mask & word_assertions) != 0) emit_is_word();
+          emit_previous_position();
+        }
         emit_deterministic_globals(*deterministic_);
         emit_deterministic_classifier(*deterministic_);
-        if (tagged_result) {
+        if (deterministic_->assertion_aware) {
+          emit_deterministic_boundary_classifier(*deterministic_);
+          emit_assertion_deterministic_find_from(*deterministic_);
+        } else if (tagged_result) {
           emit_tagged_deterministic_find_from(*deterministic_);
         } else {
           emit_deterministic_find_from(*deterministic_);
@@ -4157,9 +4541,18 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i1
       if (boolean_result) {
         emit_execute();
       } else {
-        if (!deterministic_.has_value() && !ascii_literal_.has_value()) emit_find_from();
+        if (!deterministic_.has_value() && !glushkov_.has_value() &&
+            !ascii_literal_.has_value() && !utf8_literal_.has_value()) {
+          emit_find_from();
+        }
         switch (ir_.control.result) {
-          case result_shape::MATCH_SPAN: emit_find_execute(); break;
+          case result_shape::MATCH_SPAN:
+            if (ir_.selected_operation.kind == operation_kind::FIND_ALL) {
+              emit_find_all_execute();
+            } else {
+              emit_find_execute();
+            }
+            break;
           case result_shape::MATCH_COUNT: emit_count_execute(); break;
           case result_shape::CAPTURES: emit_capture_execute(); break;
           case result_shape::REPLACEMENT: emit_replace_execute(); break;
@@ -4168,16 +4561,822 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i1
         }
       }
     }
+    emit_anchored_boolean_adapter();
     output_.emit(
       R"NVVM(!nvvmir.version = !{{!0}}
 !0 = !{{i32 2, i32 0}})NVVM");
-    return output_.take();
+    auto executor_states  = deterministic_.has_value()
+                              ? static_cast<std::uint32_t>(deterministic_->state_count)
+                            : glushkov_.has_value() ? glushkov_->position_count
+                                                    : std::uint32_t{0};
+    auto alphabet_classes = deterministic_.has_value() ? deterministic_->class_count
+                            : glushkov_.has_value()    ? glushkov_->alphabet.class_count
+                                                       : std::uint32_t{0};
+    return {output_.take(),
+            ir_.capture_count,
+            executor,
+            executor_states,
+            alphabet_classes,
+            std::move(exact_ascii_literal_metadata_)};
   }
 
  private:
   [[nodiscard]] std::string name(std::string_view suffix) const
   {
     return nvvm_symbol(options_.symbol_prefix, suffix);
+  }
+
+  enum class string_operation_kind : std::uint8_t {
+    BEGINS_WITH,
+    ENDS_WITH,
+    ENDS_LINE,
+    EQUALS,
+    EQUALS_LINE
+  };
+
+  struct string_operation {
+    string_operation_kind kind;
+    std::string literal;
+  };
+
+  [[nodiscard]] std::optional<string_operation> string_operation_plan() const
+  {
+    if (ir_.control.result != result_shape::BOOLEAN || ir_.entry >= ir_.blocks.size() ||
+        ir_.accept >= ir_.blocks.size()) {
+      return std::nullopt;
+    }
+
+    auto begins            = !ir_.control.scan_input;
+    auto ends              = ir_.control.require_end;
+    auto line_end          = false;
+    auto explicit_boundary = false;
+    std::vector<bool> visited(ir_.blocks.size(), false);
+    std::string literal;
+    auto current = ir_.entry;
+    while (current < ir_.blocks.size() && !visited[current]) {
+      visited[current] = true;
+      auto& block      = ir_.blocks[current];
+      if (current == ir_.accept) {
+        auto accepting = block.instructions.size() == 1U &&
+                         std::holds_alternative<emit_accept>(block.instructions.front()) &&
+                         block.successors.empty();
+        if (!accepting || literal.empty() || !explicit_boundary || (!begins && !ends)) {
+          return std::nullopt;
+        }
+        auto kind = begins && ends && line_end ? string_operation_kind::EQUALS_LINE
+                    : begins && ends           ? string_operation_kind::EQUALS
+                    : begins                   ? string_operation_kind::BEGINS_WITH
+                    : line_end                 ? string_operation_kind::ENDS_LINE
+                                               : string_operation_kind::ENDS_WITH;
+        return string_operation{kind, std::move(literal)};
+      }
+      if (block.successors.size() != 1U) return std::nullopt;
+
+      std::u32string consumed;
+      std::optional<std::uint32_t> peek_count;
+      std::optional<std::uint32_t> advance_count;
+      auto reads_character = false;
+      for (auto& item : block.instructions) {
+        if (auto* assertion = std::get_if<test_assertion>(&item)) {
+          if (assertion->kind == assertion_kind::BEGIN_INPUT ||
+              (assertion->kind == assertion_kind::BEGIN_LINE && !ir_.options.multiline)) {
+            if (!literal.empty()) return std::nullopt;
+            begins            = true;
+            explicit_boundary = true;
+          } else if (assertion->kind == assertion_kind::END_INPUT ||
+                     (assertion->kind == assertion_kind::END_LINE && !ir_.options.multiline &&
+                      !ir_.options.extended_newline)) {
+            if (literal.empty()) return std::nullopt;
+            ends              = true;
+            line_end          = assertion->kind == assertion_kind::END_LINE;
+            explicit_boundary = true;
+          } else {
+            return std::nullopt;
+          }
+        } else if (auto* peek = std::get_if<can_peek>(&item)) {
+          if (peek_count.has_value()) return std::nullopt;
+          peek_count = peek->characters;
+        } else if (std::holds_alternative<read_character>(item)) {
+          if (reads_character) return std::nullopt;
+          reads_character = true;
+        } else if (auto* character_match = std::get_if<match_character>(&item)) {
+          if (!consumed.empty() || !character_match->predicate.is_singleton()) {
+            return std::nullopt;
+          }
+          consumed.push_back(character_match->predicate.singleton());
+        } else if (auto* literal_match = std::get_if<match_literal>(&item)) {
+          if (!consumed.empty()) return std::nullopt;
+          consumed = literal_match->value;
+        } else if (auto* advance = std::get_if<advance_cursor>(&item)) {
+          if (advance_count.has_value()) return std::nullopt;
+          advance_count = advance->characters;
+        } else {
+          return std::nullopt;
+        }
+      }
+
+      if (!consumed.empty()) {
+        auto count = static_cast<std::uint32_t>(consumed.size());
+        if (!peek_count.has_value() || *peek_count != count || !advance_count.has_value() ||
+            *advance_count != count || (reads_character && count != 1U)) {
+          return std::nullopt;
+        }
+        for (auto codepoint : consumed) {
+          if (codepoint > 0x7f) return std::nullopt;
+          literal.push_back(static_cast<char>(codepoint));
+        }
+      } else if (!block.instructions.empty() &&
+                 !std::holds_alternative<test_assertion>(block.instructions.front())) {
+        return std::nullopt;
+      }
+      current = block.successors.front().target;
+    }
+    return std::nullopt;
+  }
+
+  void emit_prefix_byte_seek(std::uint8_t byte)
+  {
+    auto repeated = std::uint64_t{0};
+    for (std::size_t index = 0; index < 8U; ++index) {
+      repeated |= static_cast<std::uint64_t>(byte) << (index * 8U);
+    }
+    output_.emit(
+      R"NVVM(declare i64 @llvm.cttz.i64(i64, i1)
+
+define internal i64 @{0}(i8* %data, i64 %size, i64 %start) alwaysinline nounwind readonly {{
+entry:
+  br label %chunks
+chunks:
+  %position = phi i64 [ %start, %entry ], [ %next_chunk, %chunk_continue ]
+  %chunk_end = add i64 %position, 8
+  %full_chunk = icmp ule i64 %chunk_end, %size
+  br i1 %full_chunk, label %load_chunk, label %tail
+load_chunk:
+  %chunk_byte_ptr = getelementptr i8, i8* %data, i64 %position
+  %chunk_ptr = bitcast i8* %chunk_byte_ptr to i64*
+  %chunk = load i64, i64* %chunk_ptr, align 1
+  %candidate_x = xor i64 %chunk, {1}
+  %candidate_minus_ones = sub i64 %candidate_x, 72340172838076673
+  %candidate_not = xor i64 %candidate_x, -1
+  %candidate_zero_bytes = and i64 %candidate_minus_ones, %candidate_not
+  %candidate_mask = and i64 %candidate_zero_bytes, -9187201950435737472
+  %has_candidate = icmp ne i64 %candidate_mask, 0
+  br i1 %has_candidate, label %candidate, label %chunk_continue
+candidate:
+  %remaining_candidates = phi i64 [ %candidate_mask, %load_chunk ], [ %next_candidates, %candidate_continue ]
+  %candidate_bit = call i64 @llvm.cttz.i64(i64 %remaining_candidates, i1 false)
+  %candidate_byte = lshr i64 %candidate_bit, 3
+  %candidate_position = add i64 %position, %candidate_byte
+  %candidate_ptr = getelementptr i8, i8* %data, i64 %candidate_position
+  %candidate_value = call i32 @{2}(i8* %candidate_ptr)
+  %candidate_exact = icmp eq i32 %candidate_value, {3}
+  br i1 %candidate_exact, label %found_candidate, label %candidate_continue
+candidate_continue:
+  %candidate_mask_minus_one = sub i64 %remaining_candidates, 1
+  %next_candidates = and i64 %remaining_candidates, %candidate_mask_minus_one
+  %has_more_candidates = icmp ne i64 %next_candidates, 0
+  br i1 %has_more_candidates, label %candidate, label %chunk_continue
+chunk_continue:
+  %next_chunk = add nuw i64 %position, 8
+  br label %chunks
+tail:
+  %tail_position = phi i64 [ %position, %chunks ], [ %tail_next, %tail_continue ]
+  %tail_in_range = icmp ult i64 %tail_position, %size
+  br i1 %tail_in_range, label %tail_load, label %not_found
+tail_load:
+  %tail_ptr = getelementptr i8, i8* %data, i64 %tail_position
+  %tail_value = call i32 @{2}(i8* %tail_ptr)
+  %tail_match = icmp eq i32 %tail_value, {3}
+  br i1 %tail_match, label %found_tail, label %tail_continue
+tail_continue:
+  %tail_next = add nuw i64 %tail_position, 1
+  br label %tail
+found_candidate:
+  ret i64 %candidate_position
+found_tail:
+  ret i64 %tail_position
+not_found:
+  ret i64 %size
+}})NVVM",
+      name("seek_prefix_byte"),
+      repeated,
+      name("load_byte"),
+      static_cast<std::uint32_t>(byte));
+    output_.blank();
+  }
+
+  void emit_string_operation_execute(string_operation const& operation)
+  {
+    emit_ascii_literal_at(operation.literal);
+    switch (operation.kind) {
+      case string_operation_kind::BEGINS_WITH:
+        output_.emit(
+          "define zeroext i1 @{}(i8* %data, i64 %size) nounwind readonly {{\n"
+          "entry:\n"
+          "  %matched = call i1 @{}(i8* %data, i64 %size, i64 0)\n"
+          "  ret i1 %matched\n"
+          "}}",
+          options_.execute_function,
+          name("ascii_literal_at"));
+        break;
+      case string_operation_kind::ENDS_WITH:
+        output_.emit(
+          "define zeroext i1 @{}(i8* %data, i64 %size) nounwind readonly {{\n"
+          "entry:\n"
+          "  %enough = icmp uge i64 %size, {}\n"
+          "  %position = sub i64 %size, {}\n"
+          "  br i1 %enough, label %compare, label %no\n"
+          "compare:\n"
+          "  %matched = call i1 @{}(i8* %data, i64 %size, i64 %position)\n"
+          "  ret i1 %matched\n"
+          "no:\n"
+          "  ret i1 false\n"
+          "}}",
+          options_.execute_function,
+          operation.literal.size(),
+          operation.literal.size(),
+          name("ascii_literal_at"));
+        break;
+      case string_operation_kind::ENDS_LINE:
+        output_.emit(
+          "define zeroext i1 @{}(i8* %data, i64 %size) nounwind readonly {{\n"
+          "entry:\n"
+          "  %enough = icmp uge i64 %size, {}\n"
+          "  br i1 %enough, label %at_end, label %no\n"
+          "at_end:\n"
+          "  %end_position = sub i64 %size, {}\n"
+          "  %end_match = call i1 @{}(i8* %data, i64 %size, i64 %end_position)\n"
+          "  br i1 %end_match, label %yes, label %before_newline_check\n"
+          "before_newline_check:\n"
+          "  %has_extra = icmp ugt i64 %size, {}\n"
+          "  br i1 %has_extra, label %load_last, label %no\n"
+          "load_last:\n"
+          "  %last_position = sub i64 %size, 1\n"
+          "  %last_ptr = getelementptr i8, i8* %data, i64 %last_position\n"
+          "  %last = call i32 @{}(i8* %last_ptr)\n"
+          "  %is_lf = icmp eq i32 %last, 10\n"
+          "  %line_position = sub i64 %last_position, {}\n"
+          "  br i1 %is_lf, label %before_newline, label %no\n"
+          "before_newline:\n"
+          "  %line_match = call i1 @{}(i8* %data, i64 %size, i64 %line_position)\n"
+          "  ret i1 %line_match\n"
+          "yes:\n"
+          "  ret i1 true\n"
+          "no:\n"
+          "  ret i1 false\n"
+          "}}",
+          options_.execute_function,
+          operation.literal.size(),
+          operation.literal.size(),
+          name("ascii_literal_at"),
+          operation.literal.size(),
+          name("load_byte"),
+          operation.literal.size(),
+          name("ascii_literal_at"));
+        break;
+      case string_operation_kind::EQUALS:
+        output_.emit(
+          "define zeroext i1 @{}(i8* %data, i64 %size) nounwind readonly {{\n"
+          "entry:\n"
+          "  %same_size = icmp eq i64 %size, {}\n"
+          "  br i1 %same_size, label %compare, label %no\n"
+          "compare:\n"
+          "  %matched = call i1 @{}(i8* %data, i64 %size, i64 0)\n"
+          "  ret i1 %matched\n"
+          "no:\n"
+          "  ret i1 false\n"
+          "}}",
+          options_.execute_function,
+          operation.literal.size(),
+          name("ascii_literal_at"));
+        break;
+      case string_operation_kind::EQUALS_LINE:
+        output_.emit(
+          "define zeroext i1 @{}(i8* %data, i64 %size) nounwind readonly {{\n"
+          "entry:\n"
+          "  %exact_size = icmp eq i64 %size, {}\n"
+          "  %line_size = icmp eq i64 %size, {}\n"
+          "  br i1 %exact_size, label %compare, label %line_check\n"
+          "line_check:\n"
+          "  br i1 %line_size, label %load_last, label %no\n"
+          "load_last:\n"
+          "  %last_ptr = getelementptr i8, i8* %data, i64 {}\n"
+          "  %last = call i32 @{}(i8* %last_ptr)\n"
+          "  %is_lf = icmp eq i32 %last, 10\n"
+          "  br i1 %is_lf, label %compare, label %no\n"
+          "compare:\n"
+          "  %matched = call i1 @{}(i8* %data, i64 %size, i64 0)\n"
+          "  ret i1 %matched\n"
+          "no:\n"
+          "  ret i1 false\n"
+          "}}",
+          options_.execute_function,
+          operation.literal.size(),
+          operation.literal.size() + 1U,
+          operation.literal.size(),
+          name("load_byte"),
+          name("ascii_literal_at"));
+        break;
+    }
+    output_.blank();
+  }
+
+  /**
+   * @brief recognizes a case-sensitive ASCII literal followed by `.*$`
+   *
+   * The direct executor is deliberately restricted to the default, non-multiline LF semantics.
+   * In that dialect only the final logical line can match, so scanning every candidate through
+   * the recursive Thompson executor is unnecessary. Regex metacharacters and escapes in the
+   * literal are rejected until the structural IR analysis can prove the same shape.
+   *
+   * @return literal prefix when the operation can use the final-line tail executor
+   */
+  [[nodiscard]] std::optional<std::string> line_tail_literal() const
+  {
+    auto supported_result =
+      ir_.control.result == result_shape::BOOLEAN ||
+      ir_.control.result == result_shape::MATCH_COUNT ||
+      ir_.control.result == result_shape::MATCH_SPAN ||
+      (ir_.control.result == result_shape::CAPTURES && ir_.capture_count == 0U);
+    if (!supported_result || !ir_.control.scan_input || ir_.options.case_insensitive ||
+        ir_.options.multiline || ir_.options.dot_all || ir_.options.extended_newline) {
+      return std::nullopt;
+    }
+
+    constexpr auto suffix = std::string_view{R"(.*$)"};
+    auto pattern          = std::string_view{ir_.pattern};
+    if (!pattern.ends_with(suffix) || pattern.size() == suffix.size()) return std::nullopt;
+    auto literal                  = pattern.substr(0, pattern.size() - suffix.size());
+    constexpr auto metacharacters = std::string_view{R"(\.^$*+?()[]{}|)"};
+    for (auto character : literal) {
+      auto byte = static_cast<std::uint8_t>(character);
+      if (byte > 0x7fU || metacharacters.find(character) != std::string_view::npos) {
+        return std::nullopt;
+      }
+    }
+    return std::string{literal};
+  }
+
+  /**
+   * @brief emits a direct finder for `literal.*$` with default LF semantics
+   *
+   * The matcher first locates the start of the final logical line, then searches only that range
+   * for the literal. A successful match ends at the input end or immediately before its final LF.
+   *
+   * @param literal non-empty case-sensitive ASCII prefix
+   */
+  void emit_line_tail_execute(std::string_view literal)
+  {
+    emit_ascii_literal_at(literal);
+    emit_prefix_byte_seek(static_cast<std::uint8_t>(literal.front()));
+    output_.emit(
+      "{}",
+      std::format(
+        R"NVVM(define internal zeroext i1 @{0}(i8* %data, i64 %size, i64 %search_start, i64* %match_begin, i64* %match_end, i64* %captures) alwaysinline nounwind readonly {{
+entry:
+  %empty = icmp eq i64 %size, 0
+  br i1 %empty, label %no, label %load_last
+load_last:
+  %last_position = sub i64 %size, 1
+  %last_ptr = getelementptr i8, i8* %data, i64 %last_position
+  %last = call i32 @{1}(i8* %last_ptr)
+  %trailing_lf = icmp eq i32 %last, 10
+  %line_end = select i1 %trailing_lf, i64 %last_position, i64 %size
+  br label %reverse
+reverse:
+  %reverse_position = phi i64 [ %line_end, %load_last ], [ %previous_position, %reverse_continue ]
+  %at_begin = icmp eq i64 %reverse_position, 0
+  br i1 %at_begin, label %line_start_zero, label %reverse_load
+reverse_load:
+  %previous_position = sub i64 %reverse_position, 1
+  %previous_ptr = getelementptr i8, i8* %data, i64 %previous_position
+  %previous = call i32 @{1}(i8* %previous_ptr)
+  %previous_lf = icmp eq i32 %previous, 10
+  br i1 %previous_lf, label %line_start_after_lf, label %reverse_continue
+reverse_continue:
+  br label %reverse
+line_start_zero:
+  br label %search_setup
+line_start_after_lf:
+  %after_lf = add nuw i64 %previous_position, 1
+  br label %search_setup
+search_setup:
+  %line_start = phi i64 [ 0, %line_start_zero ], [ %after_lf, %line_start_after_lf ]
+  %start_before_line = icmp ult i64 %search_start, %line_start
+  %effective_start = select i1 %start_before_line, i64 %line_start, i64 %search_start
+  br label %search
+search:
+  %candidate_start = phi i64 [ %effective_start, %search_setup ], [ %next_start, %mismatch ]
+  %candidate = call i64 @{2}(i8* %data, i64 %line_end, i64 %candidate_start)
+  %candidate_end = add i64 %candidate, {3}
+  %in_range = icmp ule i64 %candidate_end, %line_end
+  br i1 %in_range, label %verify, label %no
+verify:
+  %matched = call i1 @{4}(i8* %data, i64 %line_end, i64 %candidate)
+  br i1 %matched, label %yes, label %mismatch
+mismatch:
+  %next_start = add nuw i64 %candidate, 1
+  br label %search
+yes:
+  store i64 %candidate, i64* %match_begin, align 8
+  store i64 %line_end, i64* %match_end, align 8
+  ret i1 true
+no:
+  ret i1 false
+}})NVVM",
+        name("find_from"),
+        name("load_byte"),
+        name("seek_prefix_byte"),
+        literal.size(),
+        name("ascii_literal_at")));
+    output_.blank();
+
+    if (ir_.control.result == result_shape::BOOLEAN) {
+      output_.emit("{}",
+                   std::format(
+                     R"NVVM(define zeroext i1 @{0}(i8* %data, i64 %size) nounwind readonly {{
+entry:
+  %match_begin = alloca i64, align 8
+  %match_end = alloca i64, align 8
+  %matched = call i1 @{1}(i8* %data, i64 %size, i64 0, i64* %match_begin, i64* %match_end, i64* null)
+  ret i1 %matched
+}})NVVM",
+                     options_.execute_function,
+                     name("find_from")));
+      output_.blank();
+    } else if (ir_.control.result == result_shape::MATCH_COUNT) {
+      output_.emit("{}",
+                   std::format(
+                     R"NVVM(define i64 @{0}(i8* %data, i64 %size) nounwind readonly {{
+entry:
+  %match_begin = alloca i64, align 8
+  %match_end = alloca i64, align 8
+  %matched = call i1 @{1}(i8* %data, i64 %size, i64 0, i64* %match_begin, i64* %match_end, i64* null)
+  %count = zext i1 %matched to i64
+  ret i64 %count
+}})NVVM",
+                     options_.execute_function,
+                     name("find_from")));
+      output_.blank();
+    } else if (ir_.control.result == result_shape::CAPTURES) {
+      emit_capture_execute();
+    } else if (ir_.selected_operation.kind == operation_kind::FIND_ALL) {
+      emit_find_all_execute();
+    } else {
+      emit_find_execute();
+    }
+  }
+
+  [[nodiscard]] std::optional<std::uint32_t> word_run_minimum() const
+  {
+    if (ir_.options.characters == character_mode::BYTES && !ir_.options.ascii_classes) {
+      return std::nullopt;
+    }
+    if (ir_.control.result != result_shape::BOOLEAN &&
+        ir_.control.result != result_shape::MATCH_COUNT &&
+        ir_.control.result != result_shape::MATCH_SPAN) {
+      return std::nullopt;
+    }
+    constexpr auto prefix = std::string_view{R"(\b\w{)"};
+    constexpr auto suffix = std::string_view{R"(,}\b)"};
+    auto pattern          = std::string_view{ir_.pattern};
+    if (!pattern.starts_with(prefix) || !pattern.ends_with(suffix) ||
+        pattern.size() <= prefix.size() + suffix.size()) {
+      return std::nullopt;
+    }
+    auto digits = pattern.substr(prefix.size(), pattern.size() - prefix.size() - suffix.size());
+    auto value  = std::uint64_t{0};
+    for (auto character : digits) {
+      if (character < '0' || character > '9') return std::nullopt;
+      value = value * 10U + static_cast<std::uint64_t>(character - '0');
+      if (value > std::numeric_limits<std::uint32_t>::max()) return std::nullopt;
+    }
+    return value == 0 ? std::nullopt
+                      : std::optional<std::uint32_t>{static_cast<std::uint32_t>(value)};
+  }
+
+  void emit_unicode_word_run_matcher(std::uint32_t minimum)
+  {
+    output_.emit(
+      "{}",
+      std::format(
+        R"NVVM(define internal zeroext i1 @{0}(i8* %data, i64 %size, i64 %start, i64* %begin_out, i64* %end_out) alwaysinline nounwind readonly {{
+entry:
+  br label %search
+search:
+  %position = phi i64 [ %start, %entry ], [ %next_position, %advance ], [ %resume, %short ]
+  %in_range = icmp ult i64 %position, %size
+  br i1 %in_range, label %load, label %no
+load:
+  %cp = call i32 @{1}(i8* %data, i64 %size, i64 %position)
+  %width = call i64 @{2}(i8* %data, i64 %size, i64 %position)
+  %word = call i1 @{3}(i32 %cp)
+  br i1 %word, label %run, label %advance
+advance:
+  %next_position = add nuw i64 %position, %width
+  br label %search
+run:
+  br label %scan
+scan:
+  %run_position = phi i64 [ %position, %run ], [ %run_next, %run_continue ]
+  %run_count = phi i64 [ 0, %run ], [ %run_next_count, %run_continue ]
+  %run_at_end = icmp eq i64 %run_position, %size
+  br i1 %run_at_end, label %run_done_end, label %run_load
+run_load:
+  %run_cp = call i32 @{1}(i8* %data, i64 %size, i64 %run_position)
+  %run_width = call i64 @{2}(i8* %data, i64 %size, i64 %run_position)
+  %run_word = call i1 @{3}(i32 %run_cp)
+  br i1 %run_word, label %run_continue, label %run_done_nonword
+run_continue:
+  %run_next = add nuw i64 %run_position, %run_width
+  %run_next_count = add nuw i64 %run_count, 1
+  br label %scan
+run_done_end:
+  br label %evaluate
+run_done_nonword:
+  br label %evaluate
+evaluate:
+  %run_end = phi i64 [ %size, %run_done_end ], [ %run_position, %run_done_nonword ]
+  %word_count = phi i64 [ %run_count, %run_done_end ], [ %run_count, %run_done_nonword ]
+  %delimiter_width = phi i64 [ 0, %run_done_end ], [ %run_width, %run_done_nonword ]
+  %qualifies = icmp uge i64 %word_count, {4}
+  br i1 %qualifies, label %yes, label %short
+short:
+  %resume = add nuw i64 %run_end, %delimiter_width
+  br label %search
+yes:
+  store i64 %position, i64* %begin_out, align 8
+  store i64 %run_end, i64* %end_out, align 8
+  ret i1 true
+no:
+  ret i1 false
+}})NVVM",
+        name("next_word_run"),
+        name("decode_codepoint"),
+        name("decode_width"),
+        name("is_word"),
+        minimum));
+  }
+
+  void emit_word_run_execute(std::uint32_t minimum)
+  {
+    if (!ir_.options.ascii_classes) {
+      emit_unicode_word_run_matcher(minimum);
+    } else {
+      output_.emit(
+        "{}",
+        std::format(
+          R"NVVM(define internal zeroext i1 @{0}(i8* %data, i64 %size, i64 %start, i64* %begin_out, i64* %end_out) alwaysinline nounwind readonly {{
+entry:
+  br label %search
+search:
+  %position = phi i64 [ %start, %entry ], [ %next_position, %advance ], [ %resume, %short ]
+  %in_range = icmp ult i64 %position, %size
+  br i1 %in_range, label %load, label %no
+load:
+  %byte_ptr = getelementptr i8, i8* %data, i64 %position
+  %byte = call i32 @{1}(i8* %byte_ptr)
+  %digit_low = icmp uge i32 %byte, 48
+  %digit_high = icmp ule i32 %byte, 57
+  %digit = and i1 %digit_low, %digit_high
+  %upper_low = icmp uge i32 %byte, 65
+  %upper_high = icmp ule i32 %byte, 90
+  %upper = and i1 %upper_low, %upper_high
+  %lower_low = icmp uge i32 %byte, 97
+  %lower_high = icmp ule i32 %byte, 122
+  %lower = and i1 %lower_low, %lower_high
+  %underscore = icmp eq i32 %byte, 95
+  %alpha = or i1 %upper, %lower
+  %alnum = or i1 %alpha, %digit
+  %word = or i1 %alnum, %underscore
+  br i1 %word, label %run, label %advance
+advance:
+  %next_position = add nuw i64 %position, 1
+  br label %search
+run:
+  br label %scan
+scan:
+  %run_position = phi i64 [ %position, %run ], [ %run_next, %run_continue ]
+  %run_at_end = icmp eq i64 %run_position, %size
+  br i1 %run_at_end, label %run_done_end, label %run_load
+run_load:
+  %run_byte_ptr = getelementptr i8, i8* %data, i64 %run_position
+  %run_byte = call i32 @{1}(i8* %run_byte_ptr)
+  %run_digit_low = icmp uge i32 %run_byte, 48
+  %run_digit_high = icmp ule i32 %run_byte, 57
+  %run_digit = and i1 %run_digit_low, %run_digit_high
+  %run_upper_low = icmp uge i32 %run_byte, 65
+  %run_upper_high = icmp ule i32 %run_byte, 90
+  %run_upper = and i1 %run_upper_low, %run_upper_high
+  %run_lower_low = icmp uge i32 %run_byte, 97
+  %run_lower_high = icmp ule i32 %run_byte, 122
+  %run_lower = and i1 %run_lower_low, %run_lower_high
+  %run_underscore = icmp eq i32 %run_byte, 95
+  %run_alpha = or i1 %run_upper, %run_lower
+  %run_alnum = or i1 %run_alpha, %run_digit
+  %run_word = or i1 %run_alnum, %run_underscore
+  br i1 %run_word, label %run_continue, label %run_done_nonword
+run_continue:
+  %run_next = add nuw i64 %run_position, 1
+  br label %scan
+run_done_end:
+  br label %evaluate
+run_done_nonword:
+  br label %evaluate
+evaluate:
+  %run_end = phi i64 [ %size, %run_done_end ], [ %run_position, %run_done_nonword ]
+  %run_length = sub i64 %run_end, %position
+  %qualifies = icmp uge i64 %run_length, {2}
+  br i1 %qualifies, label %yes, label %short
+short:
+  %short_at_end = icmp eq i64 %run_end, %size
+  %after_delimiter = add i64 %run_end, 1
+  %resume = select i1 %short_at_end, i64 %size, i64 %after_delimiter
+  br label %search
+yes:
+  store i64 %position, i64* %begin_out, align 8
+  store i64 %run_end, i64* %end_out, align 8
+  ret i1 true
+no:
+  ret i1 false
+}})NVVM",
+          name("next_word_run"),
+          name("load_byte"),
+          minimum));
+    }
+    output_.blank();
+
+    switch (ir_.control.result) {
+      case result_shape::BOOLEAN:
+        output_.emit("{}",
+                     std::format(
+                       R"NVVM(define zeroext i1 @{0}(i8* %data, i64 %size) nounwind readonly {{
+entry:
+  %begin = alloca i64, align 8
+  %end = alloca i64, align 8
+  %matched = call i1 @{1}(i8* %data, i64 %size, i64 0, i64* %begin, i64* %end)
+  ret i1 %matched
+}})NVVM",
+                       options_.execute_function,
+                       name("next_word_run")));
+        break;
+      case result_shape::MATCH_SPAN:
+        output_.emit(
+          "{}",
+          std::format(
+            R"NVVM(define zeroext i1 @{0}(i8* %data, i64 %size, i64* %span) nounwind readonly {{
+entry:
+  %begin = getelementptr i64, i64* %span, i64 0
+  %end = getelementptr i64, i64* %span, i64 1
+  %matched = call i1 @{1}(i8* %data, i64 %size, i64 0, i64* %begin, i64* %end)
+  ret i1 %matched
+}})NVVM",
+            options_.execute_function,
+            name("next_word_run")));
+        break;
+      case result_shape::MATCH_COUNT:
+        output_.emit("{}",
+                     std::format(
+                       R"NVVM(define i64 @{0}(i8* %data, i64 %size) nounwind readonly {{
+entry:
+  %begin = alloca i64, align 8
+  %end = alloca i64, align 8
+  br label %loop
+loop:
+  %cursor = phi i64 [ 0, %entry ], [ %matched_end, %found ]
+  %count = phi i64 [ 0, %entry ], [ %next_count, %found ]
+  %matched = call i1 @{1}(i8* %data, i64 %size, i64 %cursor, i64* %begin, i64* %end)
+  br i1 %matched, label %found, label %done
+found:
+  %matched_end = load i64, i64* %end, align 8
+  %next_count = add i64 %count, 1
+  br label %loop
+done:
+  ret i64 %count
+}})NVVM",
+                       options_.execute_function,
+                       name("next_word_run")));
+        break;
+      default: throw std::invalid_argument("unsupported word-run result shape");
+    }
+    output_.blank();
+  }
+
+  struct utf8_literal {
+    std::u32string codepoints;
+    std::size_t byte_count;
+  };
+
+  [[nodiscard]] static std::string encode_utf8_literal(std::u32string_view codepoints)
+  {
+    auto bytes = std::string{};
+    for (auto codepoint : codepoints) {
+      if (codepoint <= 0x7fU) {
+        bytes.push_back(static_cast<char>(codepoint));
+      } else if (codepoint <= 0x7ffU) {
+        bytes.push_back(static_cast<char>(0xc0U | (codepoint >> 6U)));
+        bytes.push_back(static_cast<char>(0x80U | (codepoint & 0x3fU)));
+      } else if (codepoint <= 0xffffU) {
+        bytes.push_back(static_cast<char>(0xe0U | (codepoint >> 12U)));
+        bytes.push_back(static_cast<char>(0x80U | ((codepoint >> 6U) & 0x3fU)));
+        bytes.push_back(static_cast<char>(0x80U | (codepoint & 0x3fU)));
+      } else {
+        bytes.push_back(static_cast<char>(0xf0U | (codepoint >> 18U)));
+        bytes.push_back(static_cast<char>(0x80U | ((codepoint >> 12U) & 0x3fU)));
+        bytes.push_back(static_cast<char>(0x80U | ((codepoint >> 6U) & 0x3fU)));
+        bytes.push_back(static_cast<char>(0x80U | (codepoint & 0x3fU)));
+      }
+    }
+    return bytes;
+  }
+
+  [[nodiscard]] static std::optional<std::size_t> utf8_literal_pivot(utf8_literal const& literal)
+  {
+    auto bytes = encode_utf8_literal(literal.codepoints);
+    if (bytes.size() < sizeof(std::uint64_t)) return std::nullopt;
+    for (std::size_t index = 0; index < bytes.size(); ++index) {
+      auto byte  = static_cast<std::uint8_t>(bytes[index]);
+      auto digit = byte >= static_cast<std::uint8_t>('0') && byte <= static_cast<std::uint8_t>('9');
+      auto upper = byte >= static_cast<std::uint8_t>('A') && byte <= static_cast<std::uint8_t>('Z');
+      auto lower = byte >= static_cast<std::uint8_t>('a') && byte <= static_cast<std::uint8_t>('z');
+      if (byte < 0x80U && !digit && !upper && !lower) return index;
+    }
+    return std::nullopt;
+  }
+
+  [[nodiscard]] std::optional<utf8_literal> exact_utf8_literal() const
+  {
+    if (ir_.options.characters == character_mode::BYTES || ir_.entry >= ir_.blocks.size() ||
+        ir_.accept >= ir_.blocks.size()) {
+      return std::nullopt;
+    }
+
+    std::vector<bool> visited(ir_.blocks.size(), false);
+    std::u32string literal;
+    auto byte_count    = std::size_t{0};
+    auto has_non_ascii = false;
+    auto current       = ir_.entry;
+    while (current < ir_.blocks.size() && !visited[current]) {
+      visited[current] = true;
+      auto& block      = ir_.blocks[current];
+      if (current == ir_.accept) {
+        auto accepting = block.instructions.size() == 1U &&
+                         std::holds_alternative<emit_accept>(block.instructions.front()) &&
+                         block.successors.empty();
+        if (!accepting || literal.empty() || !has_non_ascii) { return std::nullopt; }
+        return utf8_literal{std::move(literal), byte_count};
+      }
+      if (block.successors.size() != 1U) return std::nullopt;
+
+      std::u32string consumed;
+      std::optional<std::uint32_t> peek_count;
+      std::optional<std::uint32_t> advance_count;
+      auto reads_character = false;
+      for (auto& item : block.instructions) {
+        if (auto* peek = std::get_if<can_peek>(&item)) {
+          if (peek_count.has_value()) return std::nullopt;
+          peek_count = peek->characters;
+        } else if (std::holds_alternative<read_character>(item)) {
+          if (reads_character) return std::nullopt;
+          reads_character = true;
+        } else if (auto* character_match = std::get_if<match_character>(&item)) {
+          if (!consumed.empty() || !character_match->predicate.is_singleton()) {
+            return std::nullopt;
+          }
+          consumed.push_back(character_match->predicate.singleton());
+        } else if (auto* literal_match = std::get_if<match_literal>(&item)) {
+          if (!consumed.empty()) return std::nullopt;
+          consumed = literal_match->value;
+        } else if (auto* advance = std::get_if<advance_cursor>(&item)) {
+          if (advance_count.has_value()) return std::nullopt;
+          advance_count = advance->characters;
+        } else {
+          return std::nullopt;
+        }
+      }
+
+      if (!block.instructions.empty()) {
+        auto count = static_cast<std::uint32_t>(consumed.size());
+        if (count == 0U || !peek_count.has_value() || *peek_count != count ||
+            !advance_count.has_value() || *advance_count != count ||
+            (reads_character && count != 1U)) {
+          return std::nullopt;
+        }
+        for (auto codepoint : consumed) {
+          if (codepoint > 0x10ffffU || (codepoint >= 0xd800U && codepoint <= 0xdfffU)) {
+            return std::nullopt;
+          }
+          has_non_ascii = has_non_ascii || codepoint > 0x7fU;
+          byte_count += codepoint <= 0x7fU     ? 1U
+                        : codepoint <= 0x7ffU  ? 2U
+                        : codepoint <= 0xffffU ? 3U
+                                               : 4U;
+          literal.push_back(codepoint);
+        }
+      }
+      current = block.successors.front().target;
+    }
+    return std::nullopt;
   }
 
   [[nodiscard]] std::optional<std::string> exact_ascii_literal() const
@@ -4260,9 +5459,7 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i1
 
   [[nodiscard]] std::optional<std::uint8_t> required_ascii_prefix() const
   {
-    if (!ir_.control.scan_input || ir_.entry >= ir_.blocks.size()) {
-      return std::nullopt;
-    }
+    if (!ir_.control.scan_input || ir_.entry >= ir_.blocks.size()) { return std::nullopt; }
     for (auto& instruction : ir_.blocks[ir_.entry].instructions) {
       if (auto* literal = std::get_if<match_literal>(&instruction)) {
         if (!literal->value.empty() && literal->value.front() <= 0x7f) {
@@ -4351,7 +5548,15 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i1
   {
     std::vector<bool> live(static_cast<std::size_t>(ir_.capture_count + 1U) * 2U, false);
     if (ir_.control.result == result_shape::CAPTURES) {
-      std::fill(live.begin(), live.end(), true);
+      for (std::uint32_t capture = 1; capture <= ir_.capture_count; ++capture) {
+        if (std::find(whole_match_captures_.begin(), whole_match_captures_.end(), capture) !=
+            whole_match_captures_.end()) {
+          continue;
+        }
+        auto slot       = static_cast<std::size_t>(capture) * 2U;
+        live[slot]      = true;
+        live[slot + 1U] = true;
+      }
     } else if (ir_.control.result == result_shape::REPLACEMENT) {
       for (auto& token : ir_.replacement) {
         if (token.type == replacement_token::kind::CAPTURE && token.capture_index != 0 &&
@@ -4369,6 +5574,24 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i1
     return result;
   }
 
+  /**
+   * @brief identifies explicit captures whose span is necessarily the whole match
+   *
+   * These captures can be copied from the whole-match span in the public capture adapter instead
+   * of forcing the matcher to carry capture state through every transition.
+   *
+   * @return explicit capture indices equivalent to the whole match
+   */
+  [[nodiscard]] std::vector<std::uint32_t> whole_match_captures() const
+  {
+    if (ir_.control.result != result_shape::CAPTURES) return {};
+    auto result = std::vector<std::uint32_t>{};
+    for (std::uint32_t capture = 1; capture <= ir_.capture_count; ++capture) {
+      if (is_whole_match_capture(capture)) result.push_back(capture);
+    }
+    return result;
+  }
+
   [[nodiscard]] bool uses_capture_buffer() const { return !capture_slots_.empty(); }
 
   [[nodiscard]] bool is_whole_match_capture(std::uint32_t capture_index) const
@@ -4379,6 +5602,21 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i1
              std::get<write_capture>(block.instructions.front()).capture_index == capture_index &&
              std::get<write_capture>(block.instructions.front()).action == action;
     };
+
+    auto begin_writes = std::size_t{0};
+    auto end_writes   = std::size_t{0};
+    for (auto& candidate : ir_.blocks) {
+      for (auto& item : candidate.instructions) {
+        auto* capture = std::get_if<write_capture>(&item);
+        if (capture == nullptr || capture->capture_index != capture_index) continue;
+        if (capture->action == capture_action::BEGIN) {
+          ++begin_writes;
+        } else {
+          ++end_writes;
+        }
+      }
+    }
+    if (begin_writes != 1U || end_writes != 1U) return false;
 
     std::vector<bool> visited(ir_.blocks.size(), false);
     auto block           = ir_.entry;
@@ -4430,6 +5668,17 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i1
     for (std::size_t index = 0; index < values.size(); ++index) {
       if (index != 0) result += ", ";
       std::format_to(std::back_inserter(result), "i16 {}", llvm_i16(values[index]));
+    }
+    return result;
+  }
+
+  static std::string format_i32_array(std::vector<std::uint32_t> const& values)
+  {
+    std::string result;
+    result.reserve(values.size() * 14U);
+    for (std::size_t index = 0; index < values.size(); ++index) {
+      if (index != 0) result += ", ";
+      std::format_to(std::back_inserter(result), "i32 {}", values[index]);
     }
     return result;
   }
@@ -4486,6 +5735,26 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i1
                      name("glushkov_reach_masks"),
                      machine.reach_masks.size(),
                      format_i64_array(machine.reach_masks));
+    }
+    if (machine.alphabet.unicode_intervals.size() > 8U) {
+      std::vector<std::uint32_t> unicode_ends;
+      std::vector<std::uint16_t> unicode_classes;
+      unicode_ends.reserve(machine.alphabet.unicode_intervals.size());
+      unicode_classes.reserve(machine.alphabet.unicode_intervals.size());
+      for (auto interval : machine.alphabet.unicode_intervals) {
+        unicode_ends.push_back(interval.last);
+        unicode_classes.push_back(interval.class_id);
+      }
+      std::format_to(std::back_inserter(globals),
+                     "\n@{} = internal addrspace(4) constant [{} x i32] [{}], align 4",
+                     name("dfa_unicode_ends"),
+                     unicode_ends.size(),
+                     format_i32_array(unicode_ends));
+      std::format_to(std::back_inserter(globals),
+                     "\n@{} = internal addrspace(4) constant [{} x i16] [{}], align 2",
+                     name("dfa_unicode_classes"),
+                     unicode_classes.size(),
+                     format_i16_array(unicode_classes));
     }
     output_.emit("{}", globals);
     output_.blank();
@@ -4638,6 +5907,24 @@ entry:
     } else {
       output_.emit("{}", common);
     }
+    if (machine.unicode_intervals.size() > 8U) {
+      std::vector<std::uint32_t> unicode_ends;
+      std::vector<std::uint16_t> unicode_classes;
+      unicode_ends.reserve(machine.unicode_intervals.size());
+      unicode_classes.reserve(machine.unicode_intervals.size());
+      for (auto interval : machine.unicode_intervals) {
+        unicode_ends.push_back(interval.last);
+        unicode_classes.push_back(interval.class_id);
+      }
+      output_.emit("@{} = internal addrspace(4) constant [{} x i32] [{}], align 4",
+                   name("dfa_unicode_ends"),
+                   unicode_ends.size(),
+                   format_i32_array(unicode_ends));
+      output_.emit("@{} = internal addrspace(4) constant [{} x i16] [{}], align 2",
+                   name("dfa_unicode_classes"),
+                   unicode_classes.size(),
+                   format_i16_array(unicode_classes));
+    }
     output_.blank();
   }
 
@@ -4727,7 +6014,7 @@ unicode:)NVVM",
       output_.emit("  ret i32 0");
     } else if (machine.unicode_intervals.size() == 1) {
       output_.emit("  ret i32 {}", machine.unicode_intervals.front().class_id);
-    } else {
+    } else if (machine.unicode_intervals.size() <= 8U) {
       auto result = std::format("{}", machine.unicode_intervals.back().class_id);
       for (std::size_t reverse = machine.unicode_intervals.size() - 1; reverse > 0; --reverse) {
         auto index     = reverse - 1;
@@ -4742,6 +6029,37 @@ unicode:)NVVM",
         result = std::format("%unicode_class_{}", index);
       }
       output_.emit("  ret i32 {}", result);
+    } else {
+      output_.emit(
+        R"NVVM(  br label %unicode_search
+unicode_search:
+  %unicode_low = phi i32 [ 0, %unicode ], [ %unicode_next_low, %unicode_step ]
+  %unicode_high = phi i32 [ {0}, %unicode ], [ %unicode_next_high, %unicode_step ]
+  %unicode_more = icmp ult i32 %unicode_low, %unicode_high
+  br i1 %unicode_more, label %unicode_probe, label %unicode_found
+unicode_probe:
+  %unicode_span = sub i32 %unicode_high, %unicode_low
+  %unicode_half = lshr i32 %unicode_span, 1
+  %unicode_mid = add i32 %unicode_low, %unicode_half
+  %unicode_mid_i64 = zext i32 %unicode_mid to i64
+  %unicode_end_ptr = getelementptr [{0} x i32], [{0} x i32] addrspace(4)* @{1}, i64 0, i64 %unicode_mid_i64
+  %unicode_end = load i32, i32 addrspace(4)* %unicode_end_ptr, align 4
+  %unicode_before_end = icmp ule i32 %cp, %unicode_end
+  %unicode_after_mid = add i32 %unicode_mid, 1
+  %unicode_next_low = select i1 %unicode_before_end, i32 %unicode_low, i32 %unicode_after_mid
+  %unicode_next_high = select i1 %unicode_before_end, i32 %unicode_mid, i32 %unicode_high
+  br label %unicode_step
+unicode_step:
+  br label %unicode_search
+unicode_found:
+  %unicode_index_i64 = zext i32 %unicode_low to i64
+  %unicode_class_ptr = getelementptr [{0} x i16], [{0} x i16] addrspace(4)* @{2}, i64 0, i64 %unicode_index_i64
+  %unicode_class_i16 = load i16, i16 addrspace(4)* %unicode_class_ptr, align 2
+  %unicode_class = zext i16 %unicode_class_i16 to i32
+  ret i32 %unicode_class)NVVM",
+        machine.unicode_intervals.size(),
+        name("dfa_unicode_ends"),
+        name("dfa_unicode_classes"));
     }
     output_.emit("}}");
     output_.blank();
@@ -5015,6 +6333,211 @@ yes:
   }
 
   /**
+   * @brief emits a streaming leftmost-prioritized Glushkov span finder
+   *
+   * The first pass advances all candidate starts together until it finds the greedy match end.
+   * The second pass recovers the earliest start that reaches an accepting position. This avoids
+   * restarting the complete automaton at every input position while preserving the span ABI used
+   * by count, replacement, and split.
+   *
+   * @param machine bit-parallel machine to execute
+   */
+  void emit_glushkov_find_from(glushkov_machine const& machine)
+  {
+    auto accept_at_end = machine.accept_at_end ? "%phase1_at_input_end" : "true";
+    auto rescan_accept_at_end = machine.accept_at_end ? "%rescan_at_input_end" : "true";
+    if (!prefix_seek_byte_.has_value()) {
+      output_.emit("declare i64 @llvm.cttz.i64(i64, i1)");
+      output_.blank();
+    }
+    output_.emit(
+      "{}",
+      std::format(
+        R"NVVM(define internal i64 @{0}(i64 %state) alwaysinline nounwind readnone {{
+entry:
+  %accept_bits = and i64 %state, {9}
+  %accepted = icmp ne i64 %accept_bits, 0
+  br i1 %accepted, label %trim, label %done
+trim:
+  %first_accept = call i64 @llvm.cttz.i64(i64 %accept_bits, i1 false)
+  %last_bit = icmp eq i64 %first_accept, 63
+  %next_bit = add nuw nsw i64 %first_accept, 1
+  %safe_shift = select i1 %last_bit, i64 63, i64 %next_bit
+  %one_past = shl i64 1, %safe_shift
+  %priority_mask = sub i64 %one_past, 1
+  %trimmed = and i64 %state, %priority_mask
+  %priority_state = select i1 %last_bit, i64 %state, i64 %trimmed
+  br label %done
+done:
+  %result = phi i64 [ %state, %entry ], [ %priority_state, %trim ]
+  ret i64 %result
+}}
+
+define internal i1 @{1}(i8* %data, i64 %size, i64 %search_start, i64* %match_begin, i64* %match_end, i64* %captures) nounwind {{
+entry:
+  %has_input = icmp ult i64 %search_start, %size
+  br i1 %has_input, label %phase1_loop, label %no
+
+phase1_loop:
+  %phase1_position = phi i64 [ %search_start, %entry ], [ %phase1_next_position, %phase1_continue ]
+  %phase1_state = phi i64 [ 0, %entry ], [ %phase1_next_state, %phase1_continue ]
+  %phase1_match_end = phi i64 [ -1, %entry ], [ %phase1_next_match_end, %phase1_continue ]
+  %phase1_inject_start = phi i64 [ %search_start, %entry ], [ %phase1_next_inject_start, %phase1_continue ]
+  %phase1_ptr = getelementptr i8, i8* %data, i64 %phase1_position
+  %phase1_first = call i32 @{2}(i8* %phase1_ptr)
+  %phase1_ascii = icmp ult i32 %phase1_first, 128
+  br i1 %phase1_ascii, label %phase1_ascii_path, label %phase1_unicode_path
+
+phase1_ascii_path:
+  %phase1_ascii_class = call i32 @{5}(i32 %phase1_first)
+  br label %phase1_transition
+
+phase1_unicode_path:
+  %phase1_codepoint = call i32 @{3}(i8* %data, i64 %size, i64 %phase1_position)
+  %phase1_unicode_width = call i64 @{4}(i8* %data, i64 %size, i64 %phase1_position)
+  %phase1_unicode_class = call i32 @{5}(i32 %phase1_codepoint)
+  br label %phase1_transition
+
+phase1_transition:
+  %phase1_class = phi i32 [ %phase1_ascii_class, %phase1_ascii_path ], [ %phase1_unicode_class, %phase1_unicode_path ]
+  %phase1_width = phi i64 [ 1, %phase1_ascii_path ], [ %phase1_unicode_width, %phase1_unicode_path ]
+  %phase1_reach = call i64 @{6}(i32 %phase1_class)
+  %phase1_follow = call i64 @{7}(i64 %phase1_state)
+  %phase1_no_match = icmp eq i64 %phase1_match_end, -1
+  %phase1_seed = select i1 %phase1_no_match, i64 {8}, i64 0
+  %phase1_candidates = or i64 %phase1_follow, %phase1_seed
+  %phase1_raw_state = and i64 %phase1_candidates, %phase1_reach
+  %phase1_next_position = add nuw i64 %phase1_position, %phase1_width
+  %phase1_accept_bits = and i64 %phase1_raw_state, {9}
+  %phase1_accept_bits_nonzero = icmp ne i64 %phase1_accept_bits, 0
+  %phase1_at_input_end = icmp eq i64 %phase1_next_position, %size
+  %phase1_accepted = and i1 %phase1_accept_bits_nonzero, {10}
+  %phase1_next_match_end = select i1 %phase1_accepted, i64 %phase1_next_position, i64 %phase1_match_end
+  %phase1_state_empty = icmp eq i64 %phase1_state, 0
+  %phase1_new_window = and i1 %phase1_state_empty, %phase1_no_match
+  %phase1_next_inject_start = select i1 %phase1_new_window, i64 %phase1_position, i64 %phase1_inject_start
+  %phase1_next_state = call i64 @{0}(i64 %phase1_raw_state)
+  %phase1_dead = icmp eq i64 %phase1_next_state, 0
+  %phase1_has_match = icmp ne i64 %phase1_next_match_end, -1
+  %phase1_greedy_done = and i1 %phase1_dead, %phase1_has_match
+  %phase1_done = or i1 %phase1_greedy_done, %phase1_at_input_end
+  br i1 %phase1_done, label %phase1_finish, label %phase1_continue
+
+phase1_continue:
+  br label %phase1_loop
+
+phase1_finish:
+  br i1 %phase1_has_match, label %rescan_search, label %no
+
+rescan_search:
+  %candidate_start = phi i64 [ %phase1_next_inject_start, %phase1_finish ], [ %next_candidate, %rescan_advance ]
+  %candidate_in_range = icmp ult i64 %candidate_start, %phase1_next_match_end
+  br i1 %candidate_in_range, label %rescan_seed, label %no
+
+rescan_seed:
+  %rescan_ptr = getelementptr i8, i8* %data, i64 %candidate_start
+  %rescan_first = call i32 @{2}(i8* %rescan_ptr)
+  %rescan_ascii = icmp ult i32 %rescan_first, 128
+  br i1 %rescan_ascii, label %rescan_ascii_path, label %rescan_unicode_path
+
+rescan_ascii_path:
+  %rescan_ascii_class = call i32 @{5}(i32 %rescan_first)
+  br label %rescan_seed_transition
+
+rescan_unicode_path:
+  %rescan_codepoint = call i32 @{3}(i8* %data, i64 %size, i64 %candidate_start)
+  %rescan_unicode_width = call i64 @{4}(i8* %data, i64 %size, i64 %candidate_start)
+  %rescan_unicode_class = call i32 @{5}(i32 %rescan_codepoint)
+  br label %rescan_seed_transition
+
+rescan_seed_transition:
+  %rescan_class = phi i32 [ %rescan_ascii_class, %rescan_ascii_path ], [ %rescan_unicode_class, %rescan_unicode_path ]
+  %rescan_width = phi i64 [ 1, %rescan_ascii_path ], [ %rescan_unicode_width, %rescan_unicode_path ]
+  %rescan_reach = call i64 @{6}(i32 %rescan_class)
+  %rescan_seed_state = and i64 %rescan_reach, {8}
+  %rescan_next_position = add nuw i64 %candidate_start, %rescan_width
+  %rescan_accept_bits = and i64 %rescan_seed_state, {9}
+  %rescan_accept_bits_nonzero = icmp ne i64 %rescan_accept_bits, 0
+  %rescan_at_input_end = icmp eq i64 %rescan_next_position, %size
+  %rescan_accepted = and i1 %rescan_accept_bits_nonzero, {11}
+  %rescan_initial_end = select i1 %rescan_accepted, i64 %rescan_next_position, i64 -1
+  %rescan_initial_state = call i64 @{0}(i64 %rescan_seed_state)
+  br label %rescan_loop
+
+rescan_loop:
+  %rescan_position = phi i64 [ %rescan_next_position, %rescan_seed_transition ], [ %rescan_advanced_position, %rescan_transition ]
+  %rescan_state = phi i64 [ %rescan_initial_state, %rescan_seed_transition ], [ %rescan_advanced_state, %rescan_transition ]
+  %rescan_match_end = phi i64 [ %rescan_initial_end, %rescan_seed_transition ], [ %rescan_advanced_match_end, %rescan_transition ]
+  %rescan_dead = icmp eq i64 %rescan_state, 0
+  %rescan_end = icmp eq i64 %rescan_position, %size
+  %rescan_stop = or i1 %rescan_dead, %rescan_end
+  br i1 %rescan_stop, label %rescan_candidate_done, label %rescan_load
+
+rescan_load:
+  %rescan_loop_ptr = getelementptr i8, i8* %data, i64 %rescan_position
+  %rescan_loop_first = call i32 @{2}(i8* %rescan_loop_ptr)
+  %rescan_loop_ascii = icmp ult i32 %rescan_loop_first, 128
+  br i1 %rescan_loop_ascii, label %rescan_loop_ascii_path, label %rescan_loop_unicode_path
+
+rescan_loop_ascii_path:
+  %rescan_loop_ascii_class = call i32 @{5}(i32 %rescan_loop_first)
+  br label %rescan_transition
+
+rescan_loop_unicode_path:
+  %rescan_loop_codepoint = call i32 @{3}(i8* %data, i64 %size, i64 %rescan_position)
+  %rescan_loop_unicode_width = call i64 @{4}(i8* %data, i64 %size, i64 %rescan_position)
+  %rescan_loop_unicode_class = call i32 @{5}(i32 %rescan_loop_codepoint)
+  br label %rescan_transition
+
+rescan_transition:
+  %rescan_loop_class = phi i32 [ %rescan_loop_ascii_class, %rescan_loop_ascii_path ], [ %rescan_loop_unicode_class, %rescan_loop_unicode_path ]
+  %rescan_loop_width = phi i64 [ 1, %rescan_loop_ascii_path ], [ %rescan_loop_unicode_width, %rescan_loop_unicode_path ]
+  %rescan_loop_reach = call i64 @{6}(i32 %rescan_loop_class)
+  %rescan_loop_follow = call i64 @{7}(i64 %rescan_state)
+  %rescan_raw_state = and i64 %rescan_loop_follow, %rescan_loop_reach
+  %rescan_advanced_position = add nuw i64 %rescan_position, %rescan_loop_width
+  %rescan_loop_accept_bits = and i64 %rescan_raw_state, {9}
+  %rescan_loop_accept_bits_nonzero = icmp ne i64 %rescan_loop_accept_bits, 0
+  %rescan_loop_at_input_end = icmp eq i64 %rescan_advanced_position, %size
+  %rescan_loop_accepted = and i1 %rescan_loop_accept_bits_nonzero, {12}
+  %rescan_advanced_match_end = select i1 %rescan_loop_accepted, i64 %rescan_advanced_position, i64 %rescan_match_end
+  %rescan_advanced_state = call i64 @{0}(i64 %rescan_raw_state)
+  br label %rescan_loop
+
+rescan_candidate_done:
+  %candidate_matched = icmp ne i64 %rescan_match_end, -1
+  br i1 %candidate_matched, label %yes, label %rescan_advance
+
+rescan_advance:
+  %next_candidate = call i64 @{13}(i8* %data, i64 %size, i64 %candidate_start, i64 1)
+  br label %rescan_search
+
+yes:
+  store i64 %candidate_start, i64* %match_begin, align 8
+  store i64 %rescan_match_end, i64* %match_end, align 8
+  ret i1 true
+
+no:
+  ret i1 false
+}})NVVM",
+        name("glushkov_priority_kill"),
+        name("find_from"),
+        name("load_byte"),
+        name("decode_codepoint"),
+        name("decode_width"),
+        name("dfa_classify"),
+        name("glushkov_reach"),
+        name("glushkov_follow"),
+        llvm_i64(machine.first_set),
+        llvm_i64(machine.accept_mask),
+        accept_at_end,
+        rescan_accept_at_end,
+        machine.accept_at_end ? "%rescan_loop_at_input_end" : "true",
+        name("advance")));
+    output_.blank();
+  }
+
+  /**
    * @brief emits the single-pass deterministic contains or matches executor
    *
    * @param machine deterministic machine to execute
@@ -5048,7 +6571,7 @@ entry:
   br label %transition)NVVM",
       classify);
     auto ascii_predecessor = std::string{"%ascii"};
-    auto prefix            = machine.scan_input ? required_ascii_prefix() : std::nullopt;
+    auto prefix            = machine.scan_input ? prefix_seek_byte_ : std::nullopt;
     if (prefix.has_value()) {
       prefix_loop_position = ", [ %prefix_next_position, %prefix_skip ]";
       prefix_loop_state    = ", [ " + std::to_string(machine.initial_state) + ", %prefix_skip ]";
@@ -5065,12 +6588,14 @@ ascii_classify:
   %ascii_class = call i32 @{3}(i32 %first)
   br label %transition
 prefix_skip:
-  %prefix_next_position = add nuw i64 %position, 1
+  %prefix_seek_start = add nuw i64 %position, 1
+  %prefix_next_position = call i64 @{4}(i8* %data, i64 %size, i64 %prefix_seek_start)
   br label %loop)NVVM",
         machine.state_mask,
         machine.initial_state & machine.state_mask,
         static_cast<std::uint32_t>(*prefix),
-        classify);
+        classify,
+        name("seek_prefix_byte"));
     }
     if (!machine.scan_input && machine.dead_state <= machine.state_mask) {
       dead_guard = std::format(
@@ -5569,33 +7094,80 @@ no:
   {
     auto function = name("is_word");
     if (uses_unicode_word_boundaries()) {
-      output_.emit(
-        R"NVVM(define internal i1 @{}(i32 %cp) alwaysinline nounwind readnone {{
-entry:)NVVM",
-        function);
-      std::string combined;
-      for (std::size_t index = 0; index < std::size(unicode_word_ranges); ++index) {
-        unicode_data_range range = unicode_word_ranges[index];
-        output_.emit("{}",
-                     std::format(R"NVVM(  %word_ge_{0} = icmp uge i32 %cp, {1}
-  %word_le_{0} = icmp ule i32 %cp, {2}
-  %word_in_{0} = and i1 %word_ge_{0}, %word_le_{0})NVVM",
-                                 index,
-                                 range.first,
-                                 range.last));
-        if (index == 0) {
-          combined = "%word_in_0";
-        } else {
-          output_.emit("  %word_combined_{} = or i1 {}, %word_in_{}", index, combined, index);
-          combined = std::format("%word_combined_{}", index);
-        }
+      constexpr auto ascii_range_count = std::size_t{3};
+      auto unicode_firsts              = std::vector<std::uint32_t>{};
+      auto unicode_ends                = std::vector<std::uint32_t>{};
+      unicode_firsts.reserve(std::size(unicode_word_ranges) - ascii_range_count);
+      unicode_ends.reserve(std::size(unicode_word_ranges) - ascii_range_count);
+      for (auto index = ascii_range_count; index < std::size(unicode_word_ranges); ++index) {
+        unicode_firsts.push_back(unicode_word_ranges[index].first);
+        unicode_ends.push_back(unicode_word_ranges[index].last);
       }
-      output_.emit("{}",
-                   std::format(R"NVVM(  %word_underscore = icmp eq i32 %cp, 95
-  %word_result = or i1 {0}, %word_underscore
-  ret i1 %word_result
+      output_.emit("@{} = internal addrspace(4) constant [{} x i32] [{}], align 4",
+                   name("word_range_firsts"),
+                   unicode_firsts.size(),
+                   format_i32_array(unicode_firsts));
+      output_.emit("@{} = internal addrspace(4) constant [{} x i32] [{}], align 4",
+                   name("word_range_ends"),
+                   unicode_ends.size(),
+                   format_i32_array(unicode_ends));
+      output_.blank();
+      output_.emit(
+        R"NVVM(define internal i1 @{0}(i32 %cp) alwaysinline nounwind readonly {{
+entry:
+  %is_ascii = icmp ult i32 %cp, 128
+  br i1 %is_ascii, label %ascii, label %unicode_bounds
+ascii:
+  %digit_low = icmp uge i32 %cp, 48
+  %digit_high = icmp ule i32 %cp, 57
+  %digit = and i1 %digit_low, %digit_high
+  %upper_low = icmp uge i32 %cp, 65
+  %upper_high = icmp ule i32 %cp, 90
+  %upper = and i1 %upper_low, %upper_high
+  %lower_low = icmp uge i32 %cp, 97
+  %lower_high = icmp ule i32 %cp, 122
+  %lower = and i1 %lower_low, %lower_high
+  %underscore = icmp eq i32 %cp, 95
+  %alpha = or i1 %upper, %lower
+  %alnum = or i1 %alpha, %digit
+  %ascii_result = or i1 %alnum, %underscore
+  ret i1 %ascii_result
+unicode_bounds:
+  %in_table = icmp ule i32 %cp, {1}
+  br i1 %in_table, label %unicode_search, label %no
+unicode_search:
+  %low = phi i32 [ 0, %unicode_bounds ], [ %next_low, %search_step ]
+  %high = phi i32 [ {2}, %unicode_bounds ], [ %next_high, %search_step ]
+  %more = icmp ult i32 %low, %high
+  br i1 %more, label %probe, label %found
+probe:
+  %span = sub i32 %high, %low
+  %half = lshr i32 %span, 1
+  %mid = add i32 %low, %half
+  %mid_i64 = zext i32 %mid to i64
+  %end_ptr = getelementptr [{2} x i32], [{2} x i32] addrspace(4)* @{3}, i64 0, i64 %mid_i64
+  %range_end = load i32, i32 addrspace(4)* %end_ptr, align 4
+  %before_end = icmp ule i32 %cp, %range_end
+  %after_mid = add i32 %mid, 1
+  %next_low = select i1 %before_end, i32 %low, i32 %after_mid
+  %next_high = select i1 %before_end, i32 %mid, i32 %high
+  br label %search_step
+search_step:
+  br label %unicode_search
+found:
+  %index_i64 = zext i32 %low to i64
+  %first_ptr = getelementptr [{2} x i32], [{2} x i32] addrspace(4)* @{4}, i64 0, i64 %index_i64
+  %range_first = load i32, i32 addrspace(4)* %first_ptr, align 4
+  %word = icmp uge i32 %cp, %range_first
+  ret i1 %word
+no:
+  ret i1 false
 }})NVVM",
-                               combined));
+        function,
+        unicode_ends.back(),
+        unicode_ends.size(),
+        name("word_range_ends"),
+        name("word_range_firsts"));
       output_.blank();
       return;
     }
@@ -6283,9 +7855,10 @@ entry:
       return;
     }
 
-    auto prefix = required_ascii_prefix();
+    auto prefix = prefix_seek_byte_;
     if (prefix.has_value()) {
-      auto hint = std::string{R"NVVM(  %candidate_likely = call i1 @llvm.expect.i1(i1 %candidate, i1 false)
+      auto hint =
+        std::string{R"NVVM(  %candidate_likely = call i1 @llvm.expect.i1(i1 %candidate, i1 false)
 )NVVM"};
       output_.emit("{}",
                    std::format(
@@ -6309,13 +7882,13 @@ attempt:
 check_end:
   br i1 %at_end, label %no, label %continue_ascii
 continue_ascii:
-  %ascii_next = add i64 %start, 1
+  %prefix_seek_start = add nuw i64 %start, 1
+  %ascii_next = call i64 @{6}(i8* %data, i64 %size, i64 %prefix_seek_start)
   br label %next
 continue_utf8:
-  %utf8_next = call i64 @{6}(i8* %data, i64 %size, i64 %start, i64 1)
-  br label %next
+  br label %continue_ascii
 next:
-  %next_start = phi i64 [ %ascii_next, %continue_ascii ], [ %utf8_next, %continue_utf8 ]
+  %next_start = phi i64 [ %ascii_next, %continue_ascii ]
   br label %search
 yes:
   ret i1 true
@@ -6328,7 +7901,7 @@ no:
                      "%candidate_likely",
                      run_block,
                      ir_.entry,
-                     advance,
+                     name("seek_prefix_byte"),
                      initial_predecessor));
       output_.blank();
       return;
@@ -6475,11 +8048,17 @@ no:
     }
 
     auto miss_target  = direct_advance ? "start_filter_advance" : "advance_start";
-    auto direct_block = direct_advance ? std::string{R"NVVM(start_filter_advance:
+    auto direct_block = !direct_advance                 ? std::string{}
+                        : prefix_seek_byte_.has_value() ? std::format(R"NVVM(start_filter_advance:
+  %start_filter_seek_start = add nuw i64 %start, 1
+  %start_filter_next = call i64 @{}(i8* %data, i64 %size, i64 %start_filter_seek_start)
+  br label %search
+)NVVM",
+                                                                      name("seek_prefix_byte"))
+                                                        : std::string{R"NVVM(start_filter_advance:
   %start_filter_next = add nuw i64 %start, 1
   br label %search
-)NVVM"}
-                                       : std::string{};
+)NVVM"};
     return std::format(
       R"NVVM(start_filter:
   %filter_at_end = icmp eq i64 %start, %size
@@ -6527,9 +8106,21 @@ start_filter_ascii_byte:
             string{R"NVVM(  %restart_advance_base = phi i64 [ %restart_base, %candidate_fail ], [ %start, %start_filter_ascii_byte ]
 )NVVM"}
         : std::string{};
-    auto advance_base = machine.restart_state <= machine.state_mask
-                          ? (machine.start_byte_filter ? "%restart_advance_base" : "%restart_base")
-                          : "%start";
+    auto advance_base      = machine.restart_state <= machine.state_mask
+                               ? (machine.start_byte_filter ? "%restart_advance_base" : "%restart_base")
+                               : "%start";
+    auto advance_candidate = prefix_seek_byte_.has_value()
+                               ? std::format(
+                                   "  %prefix_seek_start = add nuw i64 {}, 1\n"
+                                   "  %next_start = call i64 @{}(i8* %data, i64 %size, i64 "
+                                   "%prefix_seek_start)",
+                                   advance_base,
+                                   name("seek_prefix_byte"))
+                               : std::format(
+                                   "  %next_start = call i64 @{}(i8* %data, i64 %size, i64 {}, "
+                                   "i64 1)",
+                                   name("advance"),
+                                   advance_base);
     output_.emit(
       "{}",
       std::format(
@@ -6617,7 +8208,7 @@ capture_accept:)NVVM");
 {0}  %at_input_end = icmp eq i64 %start, %size
   br i1 %at_input_end, label %no, label %advance_start
 advance_start:
-{1}  %next_start = call i64 @{2}(i8* %data, i64 %size, i64 {3}, i64 1)
+{1}{2}
   br label %search
 yes:
   store i64 %next_position, i64* %match_end, align 8
@@ -6627,8 +8218,7 @@ no:
 }})NVVM",
                    restart,
                    advance_phi,
-                   name("advance"),
-                   advance_base));
+                   advance_candidate));
     output_.blank();
   }
 
@@ -6897,6 +8487,214 @@ no:
   }
 
   /**
+   * @brief emits a selective-pivot seeker with packed verification for an exact UTF-8 literal
+   *
+   * @param literal Exact UTF-8 literal plan
+   * @param pivot Offset of a selective ASCII byte within the encoded literal
+   */
+  void emit_utf8_pivot_find_from(utf8_literal const& literal,
+                                 std::size_t pivot,
+                                 std::string_view function)
+  {
+    auto encoded      = encode_utf8_literal(literal.codepoints);
+    auto guard_offset = std::min(pivot, encoded.size() - sizeof(std::uint64_t));
+    auto guard_value  = std::uint64_t{0};
+    for (std::size_t byte = 0; byte < sizeof(std::uint64_t); ++byte) {
+      guard_value |=
+        static_cast<std::uint64_t>(static_cast<std::uint8_t>(encoded[guard_offset + byte]))
+        << (byte * 8U);
+    }
+    emit_ascii_literal_at(encoded);
+    emit_prefix_byte_seek(static_cast<std::uint8_t>(encoded[pivot]));
+    output_.emit(
+      "{}",
+      std::format(
+        R"NVVM(define internal i1 @{0}(i8* %data, i64 %size, i64 %search_start, i64* %match_begin, i64* %match_end, i64* %captures) alwaysinline nounwind readonly {{
+entry:
+  %initial_pivot = add i64 %search_start, {1}
+  br label %search
+search:
+  %pivot_start = phi i64 [ %initial_pivot, %entry ], [ %next_pivot, %mismatch ]
+  %pivot_position = call i64 @{2}(i8* %data, i64 %size, i64 %pivot_start)
+  %pivot_found = icmp ult i64 %pivot_position, %size
+  br i1 %pivot_found, label %candidate, label %no
+candidate:
+  %begin = sub nuw i64 %pivot_position, {1}
+  %end = add i64 %begin, {3}
+  %in_range = icmp ule i64 %end, %size
+  br i1 %in_range, label %guard, label %no
+guard:
+  %guard_position = add i64 %begin, {5}
+  %guard_byte_ptr = getelementptr i8, i8* %data, i64 %guard_position
+  %guard_ptr = bitcast i8* %guard_byte_ptr to i64*
+  %guard_value = load i64, i64* %guard_ptr, align 1
+  %guard_matches = icmp eq i64 %guard_value, {6}
+  br i1 %guard_matches, label %verify, label %mismatch
+verify:
+  %matched = call i1 @{4}(i8* %data, i64 %size, i64 %begin)
+  br i1 %matched, label %yes, label %mismatch
+mismatch:
+  %next_pivot = add nuw i64 %pivot_position, 1
+  br label %search
+yes:
+  store i64 %begin, i64* %match_begin, align 8
+  store i64 %end, i64* %match_end, align 8
+  ret i1 true
+no:
+  ret i1 false
+}})NVVM",
+        function,
+        pivot,
+        name("seek_prefix_byte"),
+        encoded.size(),
+        name("ascii_literal_at"),
+        guard_offset,
+        llvm_i64(guard_value)));
+    output_.blank();
+  }
+
+  void emit_utf8_literal_find_from(utf8_literal const& literal)
+  {
+    if (!utf8_literal_pivot_.has_value()) {
+      emit_utf8_kmp_find_from(literal, name("find_from"));
+      return;
+    }
+    if (ir_.control.result == result_shape::MATCH_COUNT) {
+      emit_utf8_pivot_find_from(literal, *utf8_literal_pivot_, name("find_from"));
+      return;
+    }
+
+    auto pivot = name("utf8_pivot_find_from");
+    auto kmp   = name("utf8_kmp_find_from");
+    emit_utf8_pivot_find_from(literal, *utf8_literal_pivot_, pivot);
+    emit_utf8_kmp_find_from(literal, kmp);
+    output_.emit(
+      "{}",
+      std::format(
+        R"NVVM(define internal i1 @{0}(i8* %data, i64 %size, i64 %search_start, i64* %match_begin, i64* %match_end, i64* %captures) alwaysinline nounwind readonly {{
+entry:
+  %long_row = icmp uge i64 %size, 256
+  br i1 %long_row, label %kmp, label %pivot
+pivot:
+  %pivot_result = call i1 @{1}(i8* %data, i64 %size, i64 %search_start, i64* %match_begin, i64* %match_end, i64* %captures)
+  ret i1 %pivot_result
+kmp:
+  %kmp_result = call i1 @{2}(i8* %data, i64 %size, i64 %search_start, i64* %match_begin, i64* %match_end, i64* %captures)
+  ret i1 %kmp_result
+}})NVVM",
+        name("find_from"),
+        pivot,
+        kmp));
+    output_.blank();
+  }
+
+  /**
+   * @brief Emits a byte-domain KMP seeker for an exact UTF-8 literal.
+   *
+   * Every non-ASCII literal begins with a UTF-8 lead byte, so a byte-domain match cannot begin at a
+   * continuation byte. Comparing the complete encoded sequence therefore preserves code-point
+   * matching while eliminating decoder work. Input positions and returned spans use byte offsets.
+   *
+   * @param literal Exact UTF-8 literal plan
+   */
+  void emit_utf8_kmp_find_from(utf8_literal const& literal, std::string_view function)
+  {
+    auto encoded = encode_utf8_literal(literal.codepoints);
+    auto bytes   = std::vector<std::uint8_t>(encoded.begin(), encoded.end());
+    auto failure = std::vector<std::uint32_t>(bytes.size());
+    for (std::size_t index = 1, prefix = 0; index < bytes.size();) {
+      if (bytes[index] == bytes[prefix]) {
+        failure[index++] = static_cast<std::uint32_t>(++prefix);
+      } else if (prefix != 0U) {
+        prefix = failure[prefix - 1U];
+      } else {
+        failure[index++] = 0U;
+      }
+    }
+    output_.emit("@{} = internal addrspace(4) constant [{} x i8] [{}], align 1",
+                 name("utf8_kmp_literal"),
+                 bytes.size(),
+                 format_i8_array(bytes));
+    output_.emit("@{} = internal addrspace(4) constant [{} x i32] [{}], align 4",
+                 name("utf8_kmp_failure"),
+                 failure.size(),
+                 format_i32_array(failure));
+    output_.blank();
+    output_.emit(
+      "{}",
+      std::format(
+        R"NVVM(define internal i1 @{0}(i8* %data, i64 %size, i64 %search_start, i64* %match_begin, i64* %match_end, i64* %captures) alwaysinline nounwind {{
+entry:
+  br label %search
+search:
+  %position = phi i64 [ %search_start, %entry ], [ %position, %fallback ], [ %next_position, %matched_continue ], [ %mismatch_next, %mismatch_zero ]
+  %matched = phi i32 [ 0, %entry ], [ %fallback_matched, %fallback ], [ %next_matched, %matched_continue ], [ 0, %mismatch_zero ]
+  %in_range = icmp ult i64 %position, %size
+  br i1 %in_range, label %compare, label %no
+compare:
+  %input_ptr = getelementptr i8, i8* %data, i64 %position
+  %input = call i32 @{1}(i8* %input_ptr)
+  %literal_index = zext i32 %matched to i64
+  %literal_ptr = getelementptr [{2} x i8], [{2} x i8] addrspace(4)* @{3}, i64 0, i64 %literal_index
+  %expected_i8 = load i8, i8 addrspace(4)* %literal_ptr, align 1
+  %expected = zext i8 %expected_i8 to i32
+  %equal = icmp eq i32 %input, %expected
+  br i1 %equal, label %matched_byte, label %mismatch
+matched_byte:
+  %next_position = add nuw i64 %position, 1
+  %next_matched = add nuw i32 %matched, 1
+  %complete = icmp eq i32 %next_matched, {2}
+  br i1 %complete, label %yes, label %matched_continue
+matched_continue:
+  br label %search
+mismatch:
+  %has_prefix = icmp ne i32 %matched, 0
+  br i1 %has_prefix, label %fallback, label %mismatch_zero
+fallback:
+  %fallback_index = sub nuw i32 %matched, 1
+  %fallback_index_i64 = zext i32 %fallback_index to i64
+  %failure_ptr = getelementptr [{2} x i32], [{2} x i32] addrspace(4)* @{4}, i64 0, i64 %fallback_index_i64
+  %fallback_matched = load i32, i32 addrspace(4)* %failure_ptr, align 4
+  br label %search
+mismatch_zero:
+  %mismatch_next = add nuw i64 %position, 1
+  br label %search
+yes:
+  %begin = sub nuw i64 %next_position, {2}
+  store i64 %begin, i64* %match_begin, align 8
+  store i64 %next_position, i64* %match_end, align 8
+  ret i1 true
+no:
+  ret i1 false
+}})NVVM",
+        function,
+        name("load_byte"),
+        bytes.size(),
+        name("utf8_kmp_literal"),
+        name("utf8_kmp_failure")));
+    output_.blank();
+  }
+
+  /**
+   * @brief Emits the boolean executor ABI around the UTF-8 KMP seeker.
+   */
+  void emit_utf8_kmp_execute()
+  {
+    output_.emit("{}",
+                 std::format(
+                   R"NVVM(define zeroext i1 @{0}(i8* %data, i64 %size) nounwind readonly {{
+entry:
+  %match_begin = alloca i64, align 8
+  %match_end = alloca i64, align 8
+  %matched = call i1 @{1}(i8* %data, i64 %size, i64 0, i64* %match_begin, i64* %match_end, i64* null)
+  ret i1 %matched
+}})NVVM",
+                   options_.execute_function,
+                   name("find_from")));
+    output_.blank();
+  }
+
+  /**
    * @brief emits a packed ASCII-literal finder for span-producing operations
    *
    * @param literal non-empty multi-byte ASCII literal to search
@@ -6979,6 +8777,151 @@ no:
     output_.blank();
   }
 
+  void emit_assertion_deterministic_find_from(deterministic_machine const& machine)
+  {
+    auto search_target     = machine.start_byte_filter ? "start_filter" : "attempt";
+    auto start_filter      = render_start_byte_filter(machine, "attempt", false);
+    auto advance_candidate = prefix_seek_byte_.has_value()
+                               ? std::format(
+                                   "  %prefix_seek_start = add nuw i64 %start, 1\n"
+                                   "  %next_start = call i64 @{}(i8* %data, i64 %size, i64 "
+                                   "%prefix_seek_start)",
+                                   name("seek_prefix_byte"))
+                               : std::format(
+                                   "  %next_start = call i64 @{}(i8* %data, i64 %size, i64 "
+                                   "%start, i64 1)",
+                                   name("advance"));
+    output_.emit(
+      "{}",
+      std::format(
+        R"NVVM(define internal i1 @{0}(i8* %data, i64 %size, i64 %start, i64* %match_end) nounwind readonly {{
+entry:
+  %at_input_begin = icmp eq i64 %start, 0
+  br i1 %at_input_begin, label %begin, label %load_previous
+load_previous:
+  %previous_position = call i64 @{1}(i8* %data, i64 %size, i64 %start)
+  %decoded_previous = call i32 @{2}(i8* %data, i64 %size, i64 %previous_position)
+  br label %begin
+begin:
+  %initial_previous = phi i32 [ 0, %entry ], [ %decoded_previous, %load_previous ]
+  br label %loop
+loop:
+  %position = phi i64 [ %start, %begin ], [ %next_position, %continue ]
+  %state = phi i32 [ {3}, %begin ], [ %next_state, %continue ]
+  %previous_cp = phi i32 [ %initial_previous, %begin ], [ %current_cp, %continue ]
+  %last_accept = phi i64 [ -1, %begin ], [ %next_accept, %continue ]
+  %at_end = icmp eq i64 %position, %size
+  br i1 %at_end, label %finish, label %load
+load:
+  %input_ptr = getelementptr i8, i8* %data, i64 %position
+  %first = call i32 @{4}(i8* %input_ptr)
+  %is_ascii = icmp ult i32 %first, 128
+  br i1 %is_ascii, label %ascii, label %unicode
+ascii:
+  %ascii_class = call i32 @{5}(i32 %first)
+  br label %boundary
+unicode:
+  %codepoint = call i32 @{2}(i8* %data, i64 %size, i64 %position)
+  %unicode_width = call i64 @{6}(i8* %data, i64 %size, i64 %position)
+  %unicode_class = call i32 @{5}(i32 %codepoint)
+  br label %boundary
+boundary:
+  %current_cp = phi i32 [ %first, %ascii ], [ %codepoint, %unicode ]
+  %character_class = phi i32 [ %ascii_class, %ascii ], [ %unicode_class, %unicode ]
+  %character_width = phi i64 [ 1, %ascii ], [ %unicode_width, %unicode ]
+  %boundary_class = call i32 @{7}(i8* %data, i64 %size, i64 %position, i32 %previous_cp, i32 %current_cp, i64 %character_width)
+  %state_offset = mul nuw i32 %state, {8}
+  %context_index = add nuw i32 %state_offset, %boundary_class
+  %context_offset = mul nuw i32 %context_index, {9}
+  %transition_index = add nuw i32 %context_offset, %character_class
+  %transition_index_i64 = zext i32 %transition_index to i64
+  %transition_ptr = getelementptr [{10} x i16], [{10} x i16] addrspace({11})* @{12}, i64 0, i64 %transition_index_i64
+  %encoded_i16 = load i16, i16 addrspace({11})* %transition_ptr, align 2
+  %encoded = zext i16 %encoded_i16 to i32
+  %accept_bits = and i32 %encoded, 32768
+  %accepted = icmp ne i32 %accept_bits, 0
+  %next_accept = select i1 %accepted, i64 %position, i64 %last_accept
+  %next_state = and i32 %encoded, 32767
+  %next_position = add i64 %position, %character_width
+  %dead = icmp eq i32 %next_state, {13}
+  br i1 %dead, label %candidate_done, label %continue
+continue:
+  br label %loop
+candidate_done:
+  %candidate_matched = icmp ne i64 %next_accept, -1
+  br i1 %candidate_matched, label %candidate_yes, label %no
+finish:
+  %finish_boundary_class = call i32 @{7}(i8* %data, i64 %size, i64 %position, i32 %previous_cp, i32 0, i64 0)
+  %finish_state_offset = mul nuw i32 %state, {8}
+  %finish_accept_index = add nuw i32 %finish_state_offset, %finish_boundary_class
+  %finish_accept_index_i64 = zext i32 %finish_accept_index to i64
+  %finish_accept_ptr = getelementptr [{14} x i8], [{14} x i8] addrspace(4)* @{15}, i64 0, i64 %finish_accept_index_i64
+  %finish_accept_i8 = load i8, i8 addrspace(4)* %finish_accept_ptr, align 1
+  %finish_accepted = icmp ne i8 %finish_accept_i8, 0
+  %finish_end = select i1 %finish_accepted, i64 %size, i64 %last_accept
+  %finish_matched = icmp ne i64 %finish_end, -1
+  br i1 %finish_matched, label %finish_yes, label %no
+candidate_yes:
+  store i64 %next_accept, i64* %match_end, align 8
+  ret i1 true
+finish_yes:
+  store i64 %finish_end, i64* %match_end, align 8
+  ret i1 true
+no:
+  ret i1 false
+}})NVVM",
+        name("assertion_candidate"),
+        name("previous_position"),
+        name("decode_codepoint"),
+        machine.initial_state,
+        name("load_byte"),
+        name("dfa_classify"),
+        name("decode_width"),
+        name("dfa_boundary_classify"),
+        machine.boundary_class_count,
+        machine.class_count,
+        machine.transitions.size(),
+        machine.transition_address_space,
+        name("dfa_transitions"),
+        machine.dead_state,
+        machine.boundary_accepts.size(),
+        name("dfa_boundary_accepts")));
+    output_.blank();
+
+    output_.emit(
+      "{}",
+      std::format(
+        R"NVVM(define internal i1 @{0}(i8* %data, i64 %size, i64 %search_start, i64* %match_begin, i64* %match_end, i64* %captures) nounwind readonly {{
+entry:
+  br label %search
+search:
+  %start = phi i64 [ %search_start, %entry ], [ %next_start, %advance_start ]
+  %in_range = icmp ule i64 %start, %size
+  br i1 %in_range, label %{3}, label %no
+{4}
+attempt:
+  %matched = call i1 @{1}(i8* %data, i64 %size, i64 %start, i64* %match_end)
+  br i1 %matched, label %yes, label %check_end
+check_end:
+  %at_end = icmp eq i64 %start, %size
+  br i1 %at_end, label %no, label %advance_start
+advance_start:
+{2}
+  br label %search
+yes:
+  store i64 %start, i64* %match_begin, align 8
+  ret i1 true
+no:
+  ret i1 false
+}})NVVM",
+        name("find_from"),
+        name("assertion_candidate"),
+        advance_candidate,
+        search_target,
+        start_filter));
+    output_.blank();
+  }
+
   /**
    * @brief emits a non-recursive leftmost-match primitive for an ordered deterministic automaton
    *
@@ -7017,6 +8960,18 @@ no:
         ? (machine.start_byte_filter && !direct_filter_advance ? "%restart_advance_base"
                                                                : "%restart_base")
         : "%start";
+    auto advance_candidate = prefix_seek_byte_.has_value()
+                               ? std::format(
+                                   "  %prefix_seek_start = add nuw i64 {}, 1\n"
+                                   "  %next_start = call i64 @{}(i8* %data, i64 %size, i64 "
+                                   "%prefix_seek_start)",
+                                   advance_base,
+                                   name("seek_prefix_byte"))
+                               : std::format(
+                                   "  %next_start = call i64 @{}(i8* %data, i64 %size, i64 {}, "
+                                   "i64 1)",
+                                   name("advance"),
+                                   advance_base);
     output_.emit(
       "{}",
       std::format(
@@ -7082,7 +9037,7 @@ candidate_fail:
 {15}  %at_input_end = icmp eq i64 %start, %size
   br i1 %at_input_end, label %no, label %advance_start
 advance_start:
-{16}  %next_start = call i64 @{17}(i8* %data, i64 %size, i64 {18}, i64 1)
+{16}{17}
   br label %search
 yes:
   store i64 %start, i64* %match_begin, align 8
@@ -7108,8 +9063,7 @@ no:
         machine.dead_state,
         restart,
         advance_phi,
-        name("advance"),
-        advance_base));
+        advance_candidate));
     output_.blank();
   }
 
@@ -7154,7 +9108,8 @@ entry:
 
     auto prefix = required_ascii_prefix();
     if (prefix.has_value()) {
-      auto hint = std::string{R"NVVM(  %prefix_likely = call i1 @llvm.expect.i1(i1 %prefix_candidate, i1 false)
+      auto hint = std::string{
+        R"NVVM(  %prefix_likely = call i1 @llvm.expect.i1(i1 %prefix_candidate, i1 false)
 )NVVM"};
       output_.emit("{}",
                    std::format(R"NVVM(  br i1 %in_range, label %prefix_end, label %no
@@ -7175,6 +9130,11 @@ prefix_filter:
     }
 
     output_.emit("initialize:");
+    if (ir_.control.result == result_shape::CAPTURES) {
+      output_.emit(
+        R"NVVM(  %find_capture_ptr_0 = getelementptr i64, i64* %captures, i64 0
+  %find_capture_ptr_1 = getelementptr i64, i64* %captures, i64 1)NVVM");
+    }
     for (auto slot : capture_slots_) {
       output_.emit("{}",
                    std::format(
@@ -7200,15 +9160,25 @@ check_end:)NVVM",
       output_.emit(R"NVVM(  %at_end = icmp eq i64 %start, %size
   br i1 %at_end, label %no, label %continue)NVVM");
     }
+    auto next_candidate = prefix_seek_byte_.has_value()
+                            ? std::format(
+                                "  %prefix_seek_start = add nuw i64 %start, 1\n"
+                                "  %next_start = call i64 @{}(i8* %data, i64 %size, i64 "
+                                "%prefix_seek_start)",
+                                name("seek_prefix_byte"))
+                            : std::format(
+                                "  %next_start = call i64 @{}(i8* %data, i64 %size, i64 %start, "
+                                "i64 1)",
+                                advance);
     output_.emit("{}",
                  std::format(R"NVVM(continue:
-  %next_start = call i64 @{0}(i8* %data, i64 %size, i64 %start, i64 1)
+{0}
   br label %search
 yes:
   %accepted_end = load i64, i64* %position, align 8
   store i64 %start, i64* %match_begin, align 8
   store i64 %accepted_end, i64* %match_end, align 8)NVVM",
-                             advance));
+                             next_candidate));
     if (ir_.control.result == result_shape::CAPTURES) {
       output_.emit("  store i64 %accepted_end, i64* %find_capture_ptr_1, align 8");
     }
@@ -7216,6 +9186,45 @@ yes:
 no:
   ret i1 false
 }})NVVM");
+    output_.blank();
+  }
+
+  /**
+   * @brief adapts an input-anchored boolean executor to a cardinality or match-start ABI
+   */
+  void emit_anchored_boolean_adapter()
+  {
+    if (!anchored_boolean_result_.has_value()) return;
+    if (*anchored_boolean_result_ == result_shape::MATCH_COUNT) {
+      output_.emit(
+        "{}",
+        std::format(R"NVVM(define i64 @{0}(i8* %data, i64 %size) alwaysinline nounwind readonly {{
+entry:
+  %matched = call i1 @{1}(i8* %data, i64 %size)
+  %count = zext i1 %matched to i64
+  ret i64 %count
+}}
+)NVVM",
+                    public_execute_function_,
+                    options_.execute_function));
+    } else {
+      output_.emit(
+        "{}",
+        std::format(
+          R"NVVM(define zeroext i1 @{0}(i8* %data, i64 %size, i64* %span) alwaysinline nounwind {{
+entry:
+  %matched = call i1 @{1}(i8* %data, i64 %size)
+  br i1 %matched, label %store, label %done
+store:
+  store i64 0, i64* %span, align 8
+  br label %done
+done:
+  ret i1 %matched
+}}
+)NVVM",
+          public_execute_function_,
+          options_.execute_function));
+    }
     output_.blank();
   }
 
@@ -7239,10 +9248,54 @@ entry:
   }
 
   /**
+   * @brief emits the search-offset whole-match ABI used by findall wrappers
+   */
+  void emit_find_all_execute()
+  {
+    output_.emit(
+      "{}",
+      std::format(
+        R"NVVM(define zeroext i1 @{0}(i8* %data, i64 %size, i64 %search_start, i64* %span) nounwind {{
+entry:
+  %match_begin = getelementptr i64, i64* %span, i64 0
+  %match_end = getelementptr i64, i64* %span, i64 1
+  %matched = call i1 @{1}(i8* %data, i64 %size, i64 %search_start, i64* %match_begin, i64* %match_end, i64* null)
+  ret i1 %matched
+}})NVVM",
+        options_.execute_function,
+        name("find_from")));
+    output_.blank();
+  }
+
+  /**
    * @brief emits the first-match capture ABI used by extract and enumeration wrappers
    */
   void emit_capture_execute()
   {
+    auto aliases = std::string{};
+    if (!whole_match_captures_.empty()) {
+      aliases = R"NVVM(  br i1 %matched, label %alias_whole_match, label %done
+alias_whole_match:
+  %whole_begin = load i64, i64* %match_begin, align 8
+  %whole_end = load i64, i64* %match_end, align 8
+)NVVM";
+      for (auto capture : whole_match_captures_) {
+        auto slot = static_cast<std::size_t>(capture) * 2U;
+        std::format_to(
+          std::back_inserter(aliases),
+          R"NVVM(  %whole_capture_begin_ptr_{0} = getelementptr i64, i64* %captures, i64 {1}
+  %whole_capture_end_ptr_{0} = getelementptr i64, i64* %captures, i64 {2}
+  store i64 %whole_begin, i64* %whole_capture_begin_ptr_{0}, align 8
+  store i64 %whole_end, i64* %whole_capture_end_ptr_{0}, align 8
+)NVVM",
+          capture,
+          slot,
+          slot + 1U);
+      }
+      aliases += R"NVVM(  br label %done
+done:
+)NVVM";
+    }
     output_.emit(
       "{}",
       std::format(
@@ -7251,10 +9304,12 @@ entry:
   %match_begin = getelementptr i64, i64* %captures, i64 0
   %match_end = getelementptr i64, i64* %captures, i64 1
   %matched = call i1 @{1}(i8* %data, i64 %size, i64 %search_start, i64* %match_begin, i64* %match_end, i64* %captures)
+{2}
   ret i1 %matched
 }})NVVM",
         options_.execute_function,
-        name("find_from")));
+        name("find_from"),
+        aliases));
     output_.blank();
   }
 
@@ -7543,14 +9598,24 @@ entry:
     output_.blank();
   }
 
-  instruction_ir const& ir_;
-  nvvm_ir_codegen_options const& options_;
-  std::optional<deterministic_machine> deterministic_ = std::nullopt;
-  std::optional<glushkov_machine> glushkov_           = std::nullopt;
-  std::optional<std::string> ascii_literal_           = std::nullopt;
-  std::optional<std::string> mandatory_ascii_literal_ = std::nullopt;
-  std::vector<std::size_t> capture_slots_             = std::vector<std::size_t>{};
-  source_buffer output_                               = source_buffer{};
+  instruction_ir ir_;
+  nvvm_ir_codegen_options options_;
+  std::string public_execute_function_;
+  std::optional<result_shape> anchored_boolean_result_     = std::nullopt;
+  std::optional<std::string> exact_ascii_literal_metadata_ = std::nullopt;
+  std::optional<deterministic_machine> deterministic_      = std::nullopt;
+  std::optional<glushkov_machine> glushkov_                = std::nullopt;
+  std::optional<string_operation> string_operations_       = std::nullopt;
+  std::optional<std::string> line_tail_literal_            = std::nullopt;
+  std::optional<std::uint32_t> word_run_minimum_           = std::nullopt;
+  std::optional<std::string> ascii_literal_                = std::nullopt;
+  std::optional<utf8_literal> utf8_literal_                = std::nullopt;
+  std::optional<std::size_t> utf8_literal_pivot_           = std::nullopt;
+  std::optional<std::string> mandatory_ascii_literal_      = std::nullopt;
+  std::optional<std::uint8_t> prefix_seek_byte_            = std::nullopt;
+  std::vector<std::uint32_t> whole_match_captures_         = std::vector<std::uint32_t>{};
+  std::vector<std::size_t> capture_slots_                  = std::vector<std::size_t>{};
+  source_buffer output_                                    = source_buffer{};
 };
 
 std::string_view module_body(std::string_view module)
@@ -7587,8 +9652,8 @@ std::string_view module_without_metadata(std::string_view module)
   return module.substr(0, end);
 }
 
-std::optional<std::string> render_large_boolean_alternation(instruction_ir const& ir,
-                                                            nvvm_ir_codegen_options const& options)
+std::optional<compile_result> render_large_boolean_alternation(
+  instruction_ir const& ir, nvvm_ir_codegen_options const& options)
 {
   if (ir.control.result != result_shape::BOOLEAN || ir.blocks.size() < 80U ||
       ir.entry >= ir.blocks.size()) {
@@ -7615,15 +9680,15 @@ std::optional<std::string> render_large_boolean_alternation(instruction_ir const
     branch_options.symbol_prefix += std::format("_alternative_{}", index);
     branch_options.execute_function += std::format("_alternative_{}", index);
     functions.push_back(branch_options.execute_function);
-    auto nested = render_large_boolean_alternation(alternatives[index], branch_options);
-    auto module = nested.has_value()
-                    ? std::move(*nested)
-                    : nvvm_ir_renderer(alternatives[index], branch_options).render();
+    auto nested    = render_large_boolean_alternation(alternatives[index], branch_options);
+    auto generated = nested.has_value()
+                       ? std::move(*nested)
+                       : nvvm_ir_renderer(alternatives[index], branch_options).render();
     if (index == 0) {
-      result = module_without_metadata(module);
+      result = module_without_metadata(generated.nvvm_ir);
     } else {
       result += '\n';
-      append_module_body(result, module_body(module));
+      append_module_body(result, module_body(generated.nvvm_ir));
     }
   }
 
@@ -7649,12 +9714,17 @@ define zeroext i1 @{}(i8* %data, i64 %size) nounwind readonly {{
     options.execute_function,
     branches);
   result += "\n!nvvmir.version = !{!0}\n!0 = !{i32 2, i32 0}\n";
-  return result;
+  return compile_result{std::move(result),
+                        ir.capture_count,
+                        executor_kind::BOOLEAN_ALTERNATION,
+                        0,
+                        0,
+                        std::nullopt};
 }
 
 }  // namespace
 
-std::string generate_nvvm_ir(instruction_ir const& ir, nvvm_ir_codegen_options const& options)
+compile_result generate_nvvm_ir(instruction_ir const& ir, nvvm_ir_codegen_options const& options)
 {
   if (auto alternatives = render_large_boolean_alternation(ir, options)) {
     return std::move(*alternatives);
@@ -7677,6 +9747,7 @@ compile_result compile(std::string_view pattern,
     case operation_kind::COUNT:
     case operation_kind::EXTRACT:
     case operation_kind::FIND:
+    case operation_kind::FIND_ALL:
     case operation_kind::SPLIT:
       if (replacement.has_value()) {
         throw std::invalid_argument("replacement is only valid for the REPLACE operation");
@@ -7698,36 +9769,7 @@ compile_result compile(std::string_view pattern,
     throw std::invalid_argument(std::format(
       "regex compilation failed at byte {}: {}", diagnostic.span.offset, diagnostic.message));
   }
-  auto capture_count = compiled.value->capture_count;
-  auto nvvm_ir       = generate_nvvm_ir(*compiled.value);
-  auto executor      = executor_kind::RECURSIVE_THOMPSON;
-  if (nvvm_ir.find("; executor: single-byte literal scan") != std::string::npos) {
-    executor = executor_kind::SINGLE_BYTE_LITERAL;
-  } else if (nvvm_ir.find("; executor: packed ASCII literal scan") != std::string::npos) {
-    executor = executor_kind::PACKED_ASCII_LITERAL;
-  } else if (nvvm_ir.find("; executor: bit-parallel Glushkov NFA") != std::string::npos) {
-    executor = executor_kind::GLUSHKOV;
-  } else if (nvvm_ir.find("; executor: assertion-aware deterministic table") != std::string::npos) {
-    executor = executor_kind::ASSERTION_AWARE_DETERMINISTIC;
-  } else if (nvvm_ir.find("; executor: tagged prioritized deterministic table") !=
-             std::string::npos) {
-    executor = executor_kind::TAGGED_PRIORITIZED_DETERMINISTIC;
-  } else if (nvvm_ir.find("; executor: prioritized deterministic table") != std::string::npos) {
-    executor = executor_kind::PRIORITIZED_DETERMINISTIC;
-  } else if (nvvm_ir.find("; executor: deterministic table") != std::string::npos) {
-    executor = executor_kind::DETERMINISTIC;
-  }
-  auto states  = std::uint32_t{0};
-  auto classes = std::uint32_t{0};
-  if (auto position = nvvm_ir.find("; dfa states: "); position != std::string::npos) {
-    position += std::string_view{"; dfa states: "}.size();
-    states = static_cast<std::uint32_t>(std::stoul(nvvm_ir.substr(position)));
-    if (auto comma = nvvm_ir.find(", alphabet classes: ", position); comma != std::string::npos) {
-      comma += std::string_view{", alphabet classes: "}.size();
-      classes = static_cast<std::uint32_t>(std::stoul(nvvm_ir.substr(comma)));
-    }
-  }
-  return {std::move(nvvm_ir), capture_count, executor, states, classes};
+  return generate_nvvm_ir(*compiled.value);
 }
 
 }  // namespace regex_ir

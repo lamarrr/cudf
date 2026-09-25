@@ -7,7 +7,7 @@ implementation, not a promise that every pattern takes the fastest path.
 
 The core library compiles one pattern and one regex API operation at a time. It
 does not own a CUDA context, a cuDF column, module caching, allocation, or kernel
-launch policy. The benchmark and test adapters provide those integration
+launch policy. The cuDF integration and benchmark/test adapters provide those
 pieces. Consequently, performance has three distinct layers:
 
 1. compile-time IR simplification and executor selection;
@@ -32,7 +32,7 @@ pattern
   -> executor analysis and DFA/position construction
   -> operation-specific textual NVVM IR
   -> libNVVM LTO IR at -opt=3 -gen-lto
-  -> nvJitLink device LTO at -O3
+  -> RTCX/nvJitLink device LTO
   -> linked CUDA cubin
 ```
 
@@ -65,16 +65,20 @@ The NVVM renderer analyzes the optimized IR and selects the first safe path in
 the following conceptual order:
 
 ```text
-exact ASCII expression?
-  yes -> direct compare, byte finder, packed finder, or long-literal scan
-  no  -> assertion-free, non-nullable boolean graph with at most 64 positions?
-           yes -> compare a bit-parallel Glushkov plan with the existential DFA
-           no  -> continue to deterministic construction
-         deterministic construction succeeds?
-           boolean -> existential or assertion-aware DFA
-           span/global result without live captures -> ordered DFA
-           extract with an unambiguous one-pass capture history -> tagged DFA
-           otherwise -> ordered recursive Thompson fallback
+generated string-operation or word-run plan?
+  yes -> emit the specialized operation
+  no  -> exact ASCII expression?
+           yes -> direct compare, byte finder, packed finder, or long-literal scan
+           no  -> exact non-ASCII UTF-8 expression?
+                    yes -> guarded-pivot packed finder and/or byte-domain KMP finder
+                    no  -> assertion-free, non-nullable boolean graph with at most 64 positions?
+                             yes -> compare a bit-parallel Glushkov plan with the existential DFA
+                             no  -> continue to deterministic construction
+                           deterministic construction succeeds?
+                             boolean -> existential or assertion-aware DFA
+                             capture-free span/global result -> streaming prioritized Glushkov or ordered DFA
+                             extract with an unambiguous one-pass capture history -> tagged DFA
+                             otherwise -> ordered recursive Thompson fallback
 ```
 
 The generated module comments identify the selected executor and, for a
@@ -82,14 +86,66 @@ deterministic machine, its state and alphabet-class counts. Glushkov modules
 report position, alphabet-class, shift, and exception counts. This is useful
 when correlating a benchmark case with PTX, SASS, or an Nsight report.
 
+### Generated string-operation plans
+
+Before constructing an automaton, the renderer recognizes linear boolean ASCII
+expressions whose explicit anchors make them equivalent to a fixed string
+operation. It emits a dedicated function for:
+
+- `begins_with(literal)`;
+- `ends_with(literal)`;
+- equality with `literal`;
+- end-of-line matching against `literal` at end of input or immediately before
+  the final LF accepted by the non-extended `$` semantics; and
+- the corresponding anchored equality with that final-LF rule.
+
+These functions perform only the necessary size checks, fixed-position
+8/4/2/1-byte literal comparisons, and final-LF check. They do not call cuDF
+string APIs and do not allocate or traverse DFA/Thompson state. The recognition
+is deliberately restricted to boolean result shapes, linear singleton/literal
+IR, ASCII text, and anchor modes whose exact behavior the generated operation
+implements. Other cases continue through normal executor selection.
+
+The non-multiline, case-sensitive ASCII form `literal.*$` also has a generated
+final-line finder for boolean, count, and find. Default `$` semantics restrict
+the only possible match to the final logical line. The generated function
+walks backward to that line, seeks the literal there, and returns the span
+ending at input end or immediately before the final LF. It does not construct
+or call a general regex automaton.
+
+### Boundary-delimited word runs
+
+The exact source form `\b\w{N,}\b`, for positive decimal `N`, has a dedicated
+maximal-word-run scanner for boolean, count, and find. ASCII-class mode uses
+inline digit/letter/underscore tests and byte positions. Unicode-class mode
+decodes code points and calls a generated predicate with an ASCII fast path
+and constant-memory binary search over Unicode word ranges. This replaces the
+former hundreds-of-comparisons linear range chain. A short run is skipped as a
+unit, so the executor does not restart the regex machine at each character
+inside a run. Other spellings or more complex word-boundary expressions are
+not rewritten into this plan.
+
 ### Bit-parallel Glushkov NFA
 
-Boolean `contains` can use a Glushkov position automaton when the optimized
-graph has no assertions, is non-nullable, and has at most 64 consuming
-positions. The canonical public IR remains ordered Thompson IR; the Glushkov
-machine is a private NVVM code-generation plan derived with iterative epsilon
-closure. It therefore adds no public dialect and cannot introduce recursive
-compiler traversal.
+Assertion-free, non-nullable graphs with at most 64 consuming positions can
+use a Glushkov position automaton. Boolean `contains` uses the existential
+form. Capture-free count, find/findall, replacement, and split use a streaming
+prioritized form that advances all candidate starts together, records the
+greedy accepted end, then performs a bounded rescan to recover the earliest
+winning start. Lazy quantifiers remain on the ordered DFA/Thompson paths. The
+canonical public IR remains ordered Thompson IR; the Glushkov machine is a
+private NVVM code-generation plan derived with iterative epsilon closure.
+
+Span/global selection also retains the ordered executor when a mandatory
+ASCII start prefix is available, because its generated restart seeker skips
+non-candidates more cheaply than continuously injecting starts. Replacement
+templates that reference captures retain one-pass capture propagation rather
+than paying for span recovery. Alternation is tracked structurally in the IR:
+small alternatives that fit the 64-position representation may stream, while
+larger alternatives rebuild the fallback DFA with priority preservation. This
+avoids both treating an escaped `\|` as alternation and retaining the
+speculative unordered DFA when Glushkov construction exceeds its position
+limit.
 
 One `uint64_t` is the complete per-row regex state. Bit `i` means that position
 `i` matched the preceding logical character. For the next character `c`, the
@@ -183,6 +239,11 @@ The repair was checked by replaying all 43,358 span-producing cases from the
 fixed-seed 45-minute GPU differential campaign across two RTX A6000 devices;
 the replay produced zero CPU-oracle mismatches.
 
+A later nullable fix prevents scan-mode construction from injecting a new
+start state on a stop-before transition. For a nullable expression that
+injection would turn the deferred empty match into an accepting consuming
+transition.
+
 The ordered finder normally retries from successive logical-character
 boundaries when a candidate fails. Unlike boolean `contains`, it cannot fold
 all possible start positions into an existential state because it must retain
@@ -229,8 +290,7 @@ The fallback retains several optimizations:
 
 - an entry singleton or fused literal can supply a required first ASCII byte;
 - candidate starts whose first byte does not match are skipped;
-- `llvm.expect` marks a required-prefix hit as unlikely when branch hints are
-  enabled;
+- `llvm.expect` marks a required-prefix hit as unlikely;
 - literal predicates receive specialized helpers;
 - leaf helpers carry `alwaysinline`, `readonly`, `readnone`, and `nounwind`
   attributes where valid; and
@@ -246,6 +306,39 @@ separate alternative blocks are not yet recovered. Historical SASS and Nsight
 analysis found recursive call frames, local-memory traffic, repeated decoding,
 and divergent backtracking to be the dominant costs, so deterministic paths
 are preferred whenever semantics and table bounds permit.
+
+### Candidate seeking, restart, and row rejection
+
+The current implementation has four related but distinct literal filters:
+
+1. If a scanning expression's entry IR requires one ASCII byte, the generated
+   `seek_prefix_byte` helper searches eight input bytes per load using the
+   standard zero-byte mask and `cttz`, verifies candidate bytes, and handles
+   the tail bytewise. Recursive and ordered finders jump directly to those
+   candidate positions instead of attempting every UTF-8 boundary. This is the
+   start-prefix byte seeker; it is not a whole-literal match and is disabled
+   when another specialized executor already owns the scan.
+2. A deterministic machine can instead receive an inline sparse start-byte
+   predicate when at most 16 byte values in at most two ASCII ranges leave the
+   initial state alive. This avoids initializing the ordered matcher for clear
+   non-candidates. COUNT advances an ASCII miss directly because its width is
+   already known; larger span/materializing control-flow graphs retain the
+   shared advance path based on profiling.
+3. An ordered DFA can prove that all initial consuming classes enter one
+   non-accepting, self-looping prefix state with no other incoming edge. On a
+   failed attempt, its restart logic carries that state across the run and
+   skips candidate starts that would reach the identical failure state. The
+   proof excludes acceptance, stop-before transitions, and ambiguous prefix
+   states.
+4. Independently, the recursive fallback finds the longest fused ASCII literal
+   whose block dominates acceptance. A packed whole-row presence test rejects
+   impossible rows before recursive candidate retries. Because dominance is
+   required, this filter does not yet recover literals that occur separately
+   in every alternative.
+
+The first two mechanisms filter possible starts, the third removes equivalent
+ordered restarts, and the fourth rejects an entire row. They should not be
+described interchangeably as "prefix filtering."
 
 ### Large boolean alternations
 
@@ -299,21 +392,168 @@ Several local analyses avoid general regex machinery:
   superior on early high-selectivity matches. Literals of at least 16 bytes
   scan eight possible first bytes per load with a byte-equality mask and invoke
   the packed verifier only for candidates.
+- A complete linear exact expression containing non-ASCII code points operates
+  on its canonical UTF-8 bytes. A leading match byte cannot be a continuation
+  byte, so complete encoded equality preserves code-point boundaries. Literals
+  with a selective ASCII punctuation/space byte use that byte as a fixed-offset
+  pivot, reject candidates with an 8-byte guard, and verify the survivor with
+  packed 8/4/2/1-byte loads. Count uses this path directly. Other APIs dispatch
+  to byte-domain KMP for rows of at least 256 bytes, retaining linear behavior
+  on repeated-prefix inputs, and use the guarded pivot below that threshold.
+  Returned spans remain byte offsets and use the normal find-from ABI.
+- The cuDF integration compiles an additional warp-per-string kernel when
+  libregex_ir reports that the optimized expression is an exact ASCII literal.
+  cuDF does not re-parse the source pattern. The launch follows the existing
+  cuDF scalar-search policy and selects that kernel only above 64 average bytes
+  per non-null row.
+  A warp first probes 32 contiguous candidate positions, then processes four
+  consecutive candidates per lane in 128-position rounds. Literal verification
+  first compares the leading byte and only then issues the remaining packed
+  8/4/2/1-byte loads. This prevents near-universal wide loads when the first
+  byte is rare. The first probe avoids the early-hit regression of an
+  unconditional four-candidate inner loop.
 - Beginning anchors on boolean expressions become non-scanning control flow.
 - Non-scanning deterministic machines stop at their dead state.
 - Fused literals reduce helper and cursor operations in the fallback.
-- A replacement reference to a capture proven to cover the whole match reuses
-  the match span instead of allocating and maintaining a separate capture.
+- A replacement reference or extract capture proven to cover the whole match
+  reuses the match span instead of allocating and maintaining separate capture
+  state. Extract aliases require exactly one begin and one end write and copy
+  the completed whole-match span in the operation adapter.
 
-The exact planner does not yet generate a failure-function KMP or Two-Way
-search. General recursive expressions use dominator-proven fused literals as
+The failure-function executor is deliberately limited to complete non-ASCII
+literal expressions and is paired with the selective-pivot plan above. Exact
+ASCII search retains its packed and warp-parallel paths because an earlier
+general KMP experiment did not improve that workload.
+General recursive expressions use dominator-proven fused literals as
 variable-offset rejection filters, but do not yet derive a common literal from
-separate alternatives.
+separate alternatives or use a failure function for an extracted filter.
+
+`compile_result::exact_ascii_literal` carries the semantic exact-literal proof
+from libregex_ir to the integration layer. This keeps launch specialization
+independent of raw regex spelling: escaped literals and compiler normalization
+need not be rediscovered by cuDF.
+
+The warp-per-string choice follows established precompiled cuDF string kernels,
+not a regex-only scheduling model. Existing examples include character counts,
+case-conversion sizing, URL decoding, `LIKE`, scalar `find`/`rfind` and
+`contains`, `contains_multiple`, `find_instance`, long-string slicing, and the
+string-parallel gather/copy path. Most use an average-width threshold; URL
+decode and `find_instance` use their warp mapping directly. These kernels are
+compiled into libcudf, whereas the regex literal kernel is emitted and linked
+for one compiled pattern.
+
+### 2026-09-25 literal-search follow-up
+
+Both literal paths were gated on an RTX A6000 with a controlled same-session,
+same-GPU cuDF baseline, Release compilation, 30-sample NVBench runs, focused
+cross-backend tests, and the complete strings test binary.
+
+- The final ASCII literal matrix covered 64/128/256-byte rows, 262,144 and
+  2,097,152 rows, and 50%/100% hit rates. Warp-selected cases improved by a
+  1.527x geometric mean, with a 0.996x–3.094x range and no greater-than-5%
+  regression. The 64-byte controls retain the existing row-per-thread kernel.
+- The UTF-8 KMP gate covered contains, count, and find at 128 and 512 bytes.
+  The six exact-literal cases improved by a 1.263x geometric mean, ranging from
+  1.036x to 1.505x. Overlapping-prefix tests additionally cover replacement
+  and split and verify that find returns character rather than byte indices.
+- Delaying the remaining packed loads until after the first-byte comparison
+  improved the targeted exact-ASCII matrix by a further 1.172x geometric mean
+  against the frozen complete-corpus baseline. The 512-byte rare-literal case
+  improved by 1.987x; all targeted states remained within the 5% regression
+  gate.
+- Extending the general start seeker to verify the complete fused prefix was
+  rejected. It improved `find` on `fn (?:is|as)_(\w+)` by 3.7--7.6%, but
+  regressed 128-byte `count` by 6.5% and improved the six-state geometric mean
+  by only 1.010x. The retained general seeker therefore performs an eight-byte
+  vectorized search for the structurally proven first byte and leaves complete
+  verification to the selected executor.
+
+The final 1,488-state, 20-sample replay covered all legacy regex benchmarks and
+all added corpora for both backends. JIT retained a 2.719x geometric-mean
+speedup over the interpreter: 643 of 744 pairs were more than 5% faster, 23
+were neutral, and 78 were more than 5% slower. Against the frozen pre-campaign
+JIT run, the full-matrix geometric mean was 0.997x while the interpreter control
+was 0.992x, indicating session-level drift rather than a broad JIT regression.
+The intended exact-ASCII `contains` cases improved materially: 512-byte rare
+literal improved 1.828x, 512-byte subtitle literal 1.732x, 128-byte subtitle
+literal 1.662x, and 128-byte rare literal 1.423x.
+
+### 2026-09-25 residual-loss executor campaign
+
+The remaining large interpreter wins were traced to repeated candidate starts,
+linear Unicode classification, whole-match capture bookkeeping, and direct
+literal strategy rather than a single launch-policy defect. Controlled
+20-sample RTX A6000 runs produced these end-to-end changes:
+
+- streaming prioritized Glushkov reduced `pcre2/ff-off-range` count from about
+  43.8 ms to 8.7 ms at 512-byte rows and changed `findall` from 24.5 ms to
+  2.0 ms at 128-byte rows;
+- aliasing a sole outer capture reduced `extract_all_record` from 29.6 ms to
+  2.1 ms at 128-byte rows and from 426.8 ms to 31.5 ms at 2,097,152 by
+  256-byte rows;
+- the generated final-line `literal.*$` executor reduced comment-tail count
+  from 7.45 ms to 0.16 ms at 128-byte rows and from 20.29 ms to 0.58 ms at
+  512-byte rows;
+- constant-memory Unicode word-range search reduced `pcre2/long-word`
+  contains from 5.85 ms to 0.40 ms and from 20.53 ms to 1.34 ms for 128- and
+  512-byte rows; and
+- guarded-pivot/KMP UTF-8 literal execution made all six Russian-literal
+  contains/count/find states faster than the same-run interpreter, ranging
+  from 1.02x for contains to 3.52x for find.
+
+Streaming split retains the selective bounded-span cache policy. On the legacy
+late-match pattern, that combination was 1.74x and 1.90x faster than streaming
+without caching for the two 256-byte split states. Nullable graphs that cannot
+use the streaming position executor now rebuild the comparison DFA with
+priority preservation. Together with suppressing start-state injection on a
+stop-before transition, this restores empty-match counting, zero-range
+counting, zero-length/zero-range replacement, and zero-length limited split.
+The broad regex correctness sweep passes 234 of 235 interpreter/JIT typed
+tests; the configured deep-nesting limit is the sole remaining known failure.
+The formerly failing alternation and large-replacement cases also pass.
+
+The first complete replay exposed two overly broad streaming choices that the
+targeted cases did not cover: whole-match backreference replacement had lost
+its capture-aware executor, and prefix-accelerated or oversized-alternation
+patterns retained a speculative unordered fallback after the position plan
+failed. The final selector excludes capture-substitution replacement and
+mandatory-prefix searches, records alternation structurally, and rebuilds a
+priority-preserving DFA when an alternation exceeds 64 positions. Focused
+replays restored backreference replacement to 5.5--7.0x faster than the
+interpreter, `hyperscan/user-agent` to 11--23x, and the large subtitle
+alternation to 28--42x while preserving enumeration and prefix-free streaming
+wins.
+
+The refined 1,488-state, 20-sample replay measured a 3.169x geometric-mean JIT
+speedup over the interpreter. Of 744 paired configurations, 704 were more than
+5% faster, 20 were within 5%, and 20 were more than 5% slower; 19 of the slow
+pairs exceeded the combined-noise screen. This reduces the pre-campaign 83
+slow pairs to 20. Against the frozen pre-campaign run, JIT improved by a 1.154x
+geometric mean while the interpreter control measured 0.986x, so the aggregate
+gain is not explained by session drift. The residual losses are concentrated
+in pre-existing short/common-literal searches, `rebar/rust-functions`, a few
+small replacement cases, and 64-byte launch-overhead states rather than the
+new streaming, Unicode-word, final-line, enumeration, or UTF-8-literal paths.
 
 ## API specialization
 
 Only the selected API is emitted into a module. There is no runtime regex
 opcode switch and no generic result union.
+
+libregex_ir proves from optimized Instruction IR when every accepted match must
+begin at input position zero. Such COUNT operations have cardinality at most
+one, so the renderer emits a boolean executor and a generated adapter that
+zero-extends the result to the COUNT ABI. FIND can use the same lowering when
+its caller declares that the match end is unobservable; the adapter then writes
+the known begin offset and deliberately omits the end offset. The default FIND
+contract still writes a complete begin/end span.
+
+The proof, executor selection, internal symbol naming, and adapter generation
+therefore live in libregex_ir and honor custom codegen symbol options. cuDF only
+sets the start-only FIND contract that matches its public API and retains the
+column/offset wrappers, kernel compilation and retention, launch geometry,
+memory-resource policy, and result-column construction. It does not parse raw
+regex syntax or rewrite textual NVVM IR to select this optimization.
 
 | API | Per-row generated behavior | Important cost consideration |
 |:---|:---|:---|
@@ -331,21 +571,38 @@ device function by accepting a null output pointer.
 
 At the cuDF-column integration layer, variable-size replace and split use a
 sizing kernel, a device prefix scan/allocation, and an emission kernel. The
-current emission pass matches the rows again. This avoids pessimistic
-over-allocation but can nearly double matcher work when matching is more
-expensive than output construction. Persisting compressed match spans is a
-possible time-for-memory tradeoff.
+direct emission path matches rows again, avoiding pessimistic output
+allocation. Enumeration, replacement, and split can instead select the bounded
+span cache described below: sizing retains a small number of matches or fields
+per row, emission consumes cached records, and only overflow rows rematch. The
+program's `AUTO`, `OFF`, or `FORCE` cache policy, sampled match density,
+executor cost, and the 64-MiB temporary-memory cap decide which path runs.
+
+Split avoids several former integration costs. Forward limited split passes
+`maxsplit` into the generated enumerator and stops once the limit is reached.
+Unlimited and forward-limited paths use one count/offset sequence; only reverse
+limited split builds the additional full-count offsets and enumerates the final
+matches it needs. Record split materializes one final list column from field
+pairs. Table split reuses those pairs to construct each output string column
+directly, without first building a temporary list-of-strings column and then
+extracting every list position.
 
 ## Compiler and linker optimization
 
 The core API returns textual NVVM IR and does not invoke CUDA tools itself. The
-test and benchmark integrations use:
+cuDF integration uses:
 
 - libNVVM verification for the selected compute architecture;
-- libNVVM compilation with `-opt=3 -gen-lto`;
-- an NVCC-built kernel-wrapper LTO fatbin;
-- nvJitLink with `-lto -O3`; and
+- libNVVM compilation of the assembled matcher and generated column wrapper
+  with `-opt=3 -gen-lto`;
+- the resulting in-memory LTO IR fragment as input to RTCX/nvJitLink with
+  device LTO and `cudf_kernel_entry` retention; and
 - module loading of the linked cubin.
+
+The context RTCX cache keys both the NVVM fragment and linked cubin by source,
+architecture, toolkit/runtime inputs, and JIT bundle identity. No CUDA C++
+frontend is needed for the pattern-specific module: Regex IR already emits the
+typed low-level control flow, constants, and wrapper ABI that libNVVM accepts.
 
 Every Regex IR benchmark state also reports an uncached JIT-ready interval.
 It starts at the source regex, disables nvJitLink's cache, and stops after the
@@ -361,26 +618,47 @@ not expected to beat a precompiled interpreter's setup latency.
 
 ## Current launch and column policy
 
-The GPU benchmark adapters consume cuDF STRING columns and produce owning cuDF
-columns. They map one CUDA thread to one input row. The large cuDF API matrix
-uses 256-thread blocks, while the smaller imported-corpus grids use 128-thread
-blocks; both choices come from register/occupancy profiling. Consecutive rows
-remain in their original order and are addressed through the cuDF offsets
-column.
+The cuDF integration consumes STRING columns and produces owning cuDF columns.
+General generated kernels map one CUDA thread to one input row. Complex ordered
+count, replacement, and split executors use 256-thread blocks; boolean,
+extract/find, and direct literal executors use 1,024-thread blocks. The separate
+exact-ASCII `contains` kernel uses 256 threads as eight warps, one warp per row,
+when average bytes per non-null row exceed 64. The imported-corpus benchmark
+adapter uses 128-thread blocks for its smaller grids. These gates come from the
+profile campaigns below. Consecutive rows otherwise retain input order and are
+addressed through the cuDF offsets column.
+
+Column-level policy currently uses two inexpensive summaries. Exact-ASCII
+`contains` uses total character bytes and non-null row count for its warp gate.
+Selective span caching samples at most 2,048 rows to estimate average bytes,
+matches, and overflow. Executor selection itself remains compile-time and does
+not depend on input-column statistics.
 
 The current integration does not:
 
 - sort or bucket rows by length;
 - transpose strings into a pivoted layout;
-- assign multiple lanes to a long row;
 - use a persistent work queue for long-tail rows;
-- collect input-byte or match-selectivity statistics for executor selection;
+- assign multiple lanes to general non-literal regex executors;
+- use input statistics to change the compiled executor;
 - vector-load input in the general matcher; or
 - combine several regex programs into one multi-pattern automaton.
 
 These omissions are policy choices and future opportunities, not claims that
 the techniques are universally unhelpful. Their preprocessing and temporary
 storage must be included in end-to-end measurements.
+
+### Offset and long-string support
+
+The integration retains compiled wrapper variants for both 32-bit and 64-bit
+input string offsets and selects from the actual offsets child at execution.
+Generated matcher cursors, match spans, cached spans, and byte counts use
+64-bit values. Variable-width output construction uses cuDF's offsets-child
+helper, then selects a 32-bit or 64-bit emission wrapper from the returned
+offset type. Replacement sizing separately reports a per-row overflow before
+allocation. Thus columns whose total character storage requires large-string
+offsets do not truncate addresses inside the generated regex code, while
+ordinary fixed-width API outputs retain cuDF `size_type` semantics.
 
 ## Profile-guided findings
 
@@ -443,7 +721,13 @@ automaton.
 | Proposal | Current status | Assessment |
 |:---|:---|:---|
 | JIT/operation specialization | implemented | core design; warm execution benefits, while linked cubins should be cached |
-| bit-parallel Glushkov NFA | implemented for gated boolean plans | valuable for sparse follow graphs and DFA state growth; the forced all-pattern experiment regressed exception-heavy cases, so it is not the canonical IR or a universal replacement |
+| fixed string-operation lowering | implemented for safe linear boolean forms | emits begins-with, ends-with, equality, and final-LF-aware variants without automaton state |
+| boundary-delimited word runs | implemented for exact `\b\w{N,}\b` syntax | scans maximal ASCII or Unicode word runs for contains, count, and find instead of retrying within a run |
+| exact UTF-8 literal search | implemented for complete non-ASCII literal expressions | guarded fixed-offset pivots handle short/common rows; byte-domain KMP handles long or repeated-prefix rows; complete encoded equality and lead-byte starts preserve UTF-8 boundaries |
+| warp-per-string ASCII literal scan | implemented in the cuDF integration | selected above 64 average bytes per non-null row; a contiguous first probe plus four candidates per lane balances early-hit latency and long-miss throughput |
+| bit-parallel Glushkov NFA | implemented for gated boolean and capture-free span/global plans | existential boolean execution and two-phase prioritized span recovery avoid candidate restarts; lazy, assertion-heavy, capture-bearing, and exception-heavy cases retain other executors |
+| start-prefix seeking and ordered restart removal | implemented behind structural proofs | eight-byte ASCII seeking skips impossible starts; sparse DFA start ranges and self-loop restart proofs remove additional retries without changing leftmost-first results |
+| selective bounded span caching | implemented for enumeration, replacement, and split | samples large inputs, caches up to four bounded records per row within 64 MiB, and rematches only overflow rows |
 | profile occupancy, memory use, and divergence | implemented as a development practice | current complex DFA cases are more instruction/lane limited than DRAM limited; direct-byte cases are bandwidth limited |
 | Aho-Corasick | not implemented | useful for many exact literals or a bank of extracted literals, not a general regex replacement; dense transition storage, not automaton state count alone, is the main GPU memory risk |
 | cheap filter then full regex | partially implemented | the recursive fallback has entry-byte filtering and a fused row-level filter for dominator-proven ASCII literals; alternative-intersection and selectivity-aware planning remain gaps |
@@ -748,6 +1032,18 @@ ASCII literal executors retain 1,024 threads. The executor gate uses the
 generated module's executor annotation, so regex syntax is not parsed a second
 time in the cuDF integration.
 
+The selected thread count is a policy ceiling, not an unchecked launch
+requirement. After linking, cuDF queries
+`CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK` for the generated kernel and clamps
+the launch to that device-reported limit, rounded down to a full warp. This is
+normally a no-op, but prevents register-heavy generated extract kernels from
+failing with `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES` while preserving the faster
+1,024-thread geometry for kernels that support it.
+
+The later exact-ASCII `contains` warp kernel is a separate 256-thread launch
+selected by column width; it does not change this row-per-thread block-size
+gate.
+
 The final replay covered every affected parameterized state:
 
 | Suite | States | Before geomean | After geomean | Speedup | >5% wins / neutral / >5% regressions |
@@ -778,25 +1074,27 @@ the final replay.
 | 1 | Inline tiny DFA transitions as selects or immediate logic | The late-failure JIT spends about 3.11 million warp-times on per-byte address arithmetic and `LDC.U16`; its machine has only a few states and classes. Gate by generated code size because larger machines need compact tables. |
 | 2 | Build an ordered streaming or bit-parallel plan for capture-free span/global operations | The branch executes 24% fewer instructions and more than doubles active lanes for `.+[0-9]`. Any plan must still reproduce the exact leftmost start, greedy/lazy end, zero-length progress, and non-overlapping restart semantics used by count, replace, and split. |
 | 3 | Bin or persistently schedule skewed rows | Only 6.87 lanes are active in the JIT count loop. A coarse offset-derived length histogram or work queue could reduce tail effects, but its construction, indirect row access, and result scatter must be included in timing. |
-| 4 | Cache bounded match spans selectively between sizing and emission | Replacement and split benefit from the launch change but still rematch. Store spans only for expensive, sparse late-failure cases and retain an overflow/rematch path; unconditional staging has already lost to direct rematching. |
+| 4 | Cache bounded match spans selectively between sizing and emission | Subsequently implemented for enumeration, replacement, and split with sampling, a four-record bound, 64-MiB cap, and overflow-only rematching. Unconditional staging remains rejected. |
 | 5 | Add diagnostic line information without changing release cubins | Runtime-linked LTO cubins prevented NCU PTX/source correlation. A profiling-only cache option that retains line information would make future SASS attribution easier without burdening production code or cache keys. |
 
-## Prioritized opportunities
+## Current optimization status and prioritized opportunities
 
-The following work is ordered by likely value for the current implementation.
-Each item needs end-to-end benchmarks over API, row count, row width, length
-variance, hit rate, regex complexity, and reuse count.
+The following sections retain the original priority order while recording work
+that has since landed, particularly literal planning and bounded span caching.
+Remaining ideas still need end-to-end benchmarks over API, row count, row
+width, length variance, hit rate, regex complexity, and reuse count.
 
 ### 1. Extend the literal planner
 
-Exact ASCII expressions, sparse first-byte ranges, and dominator-proven fused
-ASCII literals in general recursive expressions are implemented. Remaining
-work includes a regular long-literal algorithm for adversarial repeated
-prefixes and intersection of mandatory substrings across separate alternatives.
+Exact ASCII expressions, exact non-ASCII UTF-8 KMP, sparse first-byte ranges,
+and dominator-proven fused ASCII literals in general recursive expressions are
+implemented. Remaining work includes deciding whether long ASCII literals need
+a failure-function or Two-Way path and intersecting mandatory substrings across
+separate alternatives.
 Useful specializations still include:
 
-- anchored exact compare for `matches`;
-- KMP or another regular linear search for longer literal-only expressions;
+- a benchmark-justified regular linear search for adversarial long ASCII
+  literals;
 - common-substring extraction across alternatives; and
 - selectivity estimates that can decide when the row filter repays its extra
   input pass.
@@ -821,11 +1119,16 @@ inside the end-to-end path.
 
 ### 3. Generalize ordered restart removal
 
-Sparse starts and self-looping prefix runs now avoid many retries. Other
-span/global machines still retry candidates. A prioritized streaming or
-tagged-search automaton could carry the earliest live start and only the
-capture state required by the selected API, but it must reproduce
-leftmost-first and greedy/lazy results exactly.
+Sparse starts and self-looping prefix runs avoid many retries. Capture-free,
+assertion-free span/global machines now use the streaming prioritized Glushkov
+executor: one pass advances all starts to the selected greedy end and a second
+bounded pass recovers the earliest start. Whole-match-only captures are aliased
+to that span and can use the same path for capture results. Capture-substitution
+replacement, mandatory-prefix searches, lazy quantifiers, zero-width
+assertions, and captures whose histories are genuinely observable retain an
+ordered DFA, tagged DFA, or Thompson executor. Large alternations that do not
+fit the position representation also return to a priority-preserving ordered
+DFA.
 
 ### 4. Reuse match work in materializing APIs
 
@@ -870,7 +1173,8 @@ Inline byte-class ranges are implemented. Remaining comparisons include:
 - replacing tiny DFA transition-table loads with bounded selects or immediate
   logic when the state/class product is small;
 - specialized all-ASCII loops when column metadata or sampling justifies it;
-- processing 4, 8, or 16 input bytes per load for literal scans;
+- processing multiple input characters per iteration in general deterministic
+  loops; exact-literal and prefix-seek paths already use packed/wide loads;
 - loop unrolling only when it does not worsen register pressure;
 - DFA minimization for existential boolean machines;
 - hot-state numbering and transition-row layout; and
