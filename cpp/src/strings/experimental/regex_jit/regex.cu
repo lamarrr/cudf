@@ -15,11 +15,7 @@
 #include <cudf/reduction.hpp>
 #include <cudf/strings/detail/strings_children.cuh>
 #include <cudf/strings/detail/strings_column_factories.cuh>
-#include <cudf/strings/experimental/contains.hpp>
-#include <cudf/strings/experimental/extract.hpp>
-#include <cudf/strings/experimental/findall.hpp>
-#include <cudf/strings/experimental/replace_re.hpp>
-#include <cudf/strings/experimental/split_re.hpp>
+#include <cudf/strings/experimental/regex.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/utilities/error.hpp>
 
@@ -31,15 +27,12 @@
 #include <thrust/for_each.h>
 #include <thrust/iterator/counting_iterator.h>
 
-#include <cudf_fragments.hpp>
-
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <format>
 #include <limits>
 #include <optional>
-#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -270,13 +263,6 @@ void ensure_stack_size()
   }
 }
 
-std::span<std::uint8_t const> layout_adapter_fragment()
-{
-  auto file_index = cudf_fragments::regex_jit_layout_adapter;
-  auto range      = cudf_fragments::file_ranges[file_index];
-  return cudf_fragments::files.subspan(range[0], range[1]);
-}
-
 retained_kernel compile_kernel(std::string const& matcher,
                                regex_ir::operation_kind operation,
                                regex_ir::executor_kind executor,
@@ -287,11 +273,9 @@ retained_kernel compile_kernel(std::string const& matcher,
   auto matcher_fragment             = get_nvvm_fragment("cudf.experimental.regex.matcher", matcher);
   auto wrapper_module               = detail::regex_jit::make_module(std::move(wrapper));
   auto wrapper_fragment             = get_nvvm_fragment(std::string{name}, wrapper_module);
-  auto adapter                      = layout_adapter_fragment();
   rtcx::memory_fragment fragments[] = {
     {.data = matcher_fragment->view(), .type = rtcx::binary_type::LTO_IR, .name = nullptr},
-    {.data = wrapper_fragment->view(), .type = rtcx::binary_type::LTO_IR, .name = nullptr},
-    {.data = adapter, .type = rtcx::binary_type::FATBIN, .name = nullptr}};
+    {.data = wrapper_fragment->view(), .type = rtcx::binary_type::LTO_IR, .name = nullptr}};
   auto compiled   = get_lto_linked_kernel(std::string{name}, {}, fragments);
   auto attributes = cudaFuncAttributes{};
   CUDF_CUDA_TRY(cudaFuncGetAttributes(&attributes, compiled.get().get()));

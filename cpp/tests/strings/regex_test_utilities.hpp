@@ -5,11 +5,7 @@
 #pragma once
 
 #include <cudf/strings/contains.hpp>
-#include <cudf/strings/experimental/contains.hpp>
-#include <cudf/strings/experimental/extract.hpp>
-#include <cudf/strings/experimental/findall.hpp>
-#include <cudf/strings/experimental/replace_re.hpp>
-#include <cudf/strings/experimental/split_re.hpp>
+#include <cudf/strings/experimental/regex.hpp>
 #include <cudf/strings/extract.hpp>
 #include <cudf/strings/findall.hpp>
 #include <cudf/strings/regex/regex_program.hpp>

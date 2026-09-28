@@ -9,7 +9,7 @@
 #include <cudf_test/column_wrapper.hpp>
 
 #include <cudf/strings/contains.hpp>
-#include <cudf/strings/experimental/contains.hpp>
+#include <cudf/strings/experimental/regex.hpp>
 #include <cudf/strings/regex/regex_program.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/default_stream.hpp>

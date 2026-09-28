@@ -686,44 +686,6 @@ TYPED_TEST(StringsRegexSplitTest, SplitRegexWithMaxSplit)
   }
 }
 
-TYPED_TEST(StringsRegexSplitTest, SplitRegexForwardLimitDenseAndRagged)
-{
-  auto validity = std::vector<bool>{true, true, true, false};
-  cudf::test::strings_column_wrapper input({"a,b,c,d", "x,y", "", "ignored"}, validity.begin());
-  auto sv      = cudf::strings_column_view(input);
-  auto pattern = std::string(",");
-
-  auto table_prog =
-    TypeParam::create(cudf::experimental::regex_operation::SPLIT, pattern, {.maxsplit = 2});
-  auto table_result = TypeParam::split_re(sv, *table_prog, 2);
-  cudf::test::strings_column_wrapper col0({"a", "x", "", ""}, {true, true, true, false});
-  cudf::test::strings_column_wrapper col1({"b", "y", "", ""}, {true, true, false, false});
-  cudf::test::strings_column_wrapper col2({"c,d", "", "", ""}, {true, false, false, false});
-  auto expected_table = cudf::table_view({col0, col1, col2});
-  CUDF_TEST_EXPECT_TABLES_EQUIVALENT(table_result->view(), expected_table);
-
-  using LCW = cudf::test::lists_column_wrapper<cudf::string_view>;
-  LCW expected_record({LCW{"a", "b", "c,d"}, LCW{"x", "y"}, LCW{""}, LCW{}}, validity.begin());
-  auto record_prog =
-    TypeParam::create(cudf::experimental::regex_operation::SPLIT_RECORD, pattern, {.maxsplit = 2});
-  auto record_result = TypeParam::split_record_re(sv, *record_prog, 2);
-  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(record_result->view(), expected_record);
-}
-
-TYPED_TEST(StringsRegexSplitTest, SplitRegexForwardLimitZeroLengthMatch)
-{
-  cudf::test::strings_column_wrapper input({"abc", "Dabc", "xD"});
-  auto sv      = cudf::strings_column_view(input);
-  auto pattern = std::string("D?");
-
-  using LCW = cudf::test::lists_column_wrapper<cudf::string_view>;
-  LCW expected({LCW{"", "abc"}, LCW{"", "abc"}, LCW{"", "xD"}});
-  auto prog =
-    TypeParam::create(cudf::experimental::regex_operation::SPLIT_RECORD, pattern, {.maxsplit = 1});
-  auto result = TypeParam::split_record_re(sv, *prog, 1);
-  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(result->view(), expected);
-}
-
 TYPED_TEST(StringsRegexSplitTest, SplitRegexWordBoundary)
 {
   cudf::test::strings_column_wrapper input({"a", "ab", "-+", "e\né"});

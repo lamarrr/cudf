@@ -11,8 +11,7 @@
 
 #include <cudf/copying.hpp>
 #include <cudf/strings/contains.hpp>
-#include <cudf/strings/experimental/contains.hpp>
-#include <cudf/strings/experimental/replace_re.hpp>
+#include <cudf/strings/experimental/regex.hpp>
 #include <cudf/strings/regex/regex_program.hpp>
 #include <cudf/strings/replace_re.hpp>
 #include <cudf/strings/strings_column_view.hpp>

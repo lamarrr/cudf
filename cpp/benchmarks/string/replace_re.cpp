@@ -7,7 +7,7 @@
 #include <benchmarks/common/memory_stats.hpp>
 
 #include <cudf/strings/regex/regex_program.hpp>
-#include <cudf/strings/experimental/replace_re.hpp>
+#include <cudf/strings/experimental/regex.hpp>
 #include <cudf/strings/replace_re.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/default_stream.hpp>

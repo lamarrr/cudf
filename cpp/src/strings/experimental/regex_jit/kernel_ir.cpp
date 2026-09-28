@@ -34,14 +34,39 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x() nounwind readnone
 declare i32 @llvm.nvvm.read.ptx.sreg.ntid.x() nounwind readnone
 declare i32 @llvm.nvvm.read.ptx.sreg.ctaid.x() nounwind readnone
 
-declare i32 @cudf_regex_row_index() nounwind readnone
-declare i1 @cudf_regex_is_valid(i32*, i32) nounwind readonly
-declare i64 @cudf_regex_load_offset_i32(i8*, i32) nounwind readonly
-declare i64 @cudf_regex_load_offset_i64(i8*, i32) nounwind readonly
+define internal i32 @libregex_ir_row_index() alwaysinline nounwind readnone {
+entry:
+  %thread = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %width = call i32 @llvm.nvvm.read.ptx.sreg.ntid.x()
+  %block = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
+  %base = mul i32 %block, %width
+  %row = add i32 %base, %thread
+  ret i32 %row
+}
+
+define internal i1 @libregex_ir_is_valid(i32* %mask, i32 %row) alwaysinline nounwind readonly {
+entry:
+  %all_valid = icmp eq i32* %mask, null
+  br i1 %all_valid, label %yes, label %check
+check:
+  %word_index = lshr i32 %row, 5
+  %word_ptr = getelementptr i32, i32* %mask, i32 %word_index
+  %word = load i32, i32* %word_ptr, align 4
+  %bit_index = and i32 %row, 31
+  %shifted = lshr i32 %word, %bit_index
+  %bit = and i32 %shifted, 1
+  %valid = icmp ne i32 %bit, 0
+  ret i1 %valid
+yes:
+  ret i1 true
+}
 
 define internal i64 @libregex_ir_load_offset(i8* %offsets, i32 %index) alwaysinline nounwind readonly {
 entry:
-  %value = call i64 @@LOAD_OFFSET@(i8* %offsets, i32 %index)
+  %typed = bitcast i8* %offsets to @OFFSET_TYPE@*
+  %ptr = getelementptr @OFFSET_TYPE@, @OFFSET_TYPE@* %typed, i32 %index
+  %raw = load @OFFSET_TYPE@, @OFFSET_TYPE@* %ptr, align @OFFSET_ALIGN@
+  %value = @OFFSET_EXTEND@ @OFFSET_TYPE@ %raw to i64
   ret i64 %value
 }
 
@@ -92,16 +117,31 @@ done:
         "nounwind\n";
       break;
   }
-  replace_all(result,
-              "@LOAD_OFFSET@",
-              offset64 ? "cudf_regex_load_offset_i64" : "cudf_regex_load_offset_i32");
+  replace_all(result, "@OFFSET_TYPE@", offset64 ? "i64" : "i32");
+  replace_all(result, "@OFFSET_ALIGN@", offset64 ? "8" : "4");
+  replace_all(result, "@OFFSET_EXTEND@", offset64 ? "add i64 0," : "sext");
+  if (offset64) {
+    replace_all(result, "%value = add i64 0, i64 %raw to i64", "%value = add i64 %raw, 0");
+  }
   if (pairs) {
     result += R"NVVM(
-declare void @cudf_regex_write_pair(i8*, i64, i8*, i8*, i64, i64, i1) nounwind
+%libregex_ir_pair = type { i8*, i32 }
 
 define internal void @libregex_ir_write_pair(i8* %output, i64 %index, i8* %data, i8* %empty, i64 %begin, i64 %end, i1 %present) alwaysinline nounwind {
 entry:
-  call void @cudf_regex_write_pair(i8* %output, i64 %index, i8* %data, i8* %empty, i64 %begin, i64 %end, i1 %present)
+  %size64 = sub i64 %end, %begin
+  %size = trunc i64 %size64 to i32
+  %data_ptr = getelementptr i8, i8* %data, i64 %begin
+  %is_empty = icmp eq i64 %size64, 0
+  %empty_ptr = select i1 %is_empty, i8* %empty, i8* %data_ptr
+  %pointer = select i1 %present, i8* %empty_ptr, i8* null
+  %stored_size = select i1 %present, i32 %size, i32 0
+  %typed_output = bitcast i8* %output to %libregex_ir_pair*
+  %pair_ptr = getelementptr %libregex_ir_pair, %libregex_ir_pair* %typed_output, i64 %index
+  %pointer_ptr = getelementptr %libregex_ir_pair, %libregex_ir_pair* %pair_ptr, i32 0, i32 0
+  %size_ptr = getelementptr %libregex_ir_pair, %libregex_ir_pair* %pair_ptr, i32 0, i32 1
+  store i8* %pointer, i8** %pointer_ptr, align 8
+  store i32 %stored_size, i32* %size_ptr, align 4
   ret void
 }
 )NVVM";
@@ -250,7 +290,7 @@ entry:
   br i1 %in_bounds, label %work, label %done
 work:
   %physical = add i32 %row_offset, %row
-  %valid = call i1 @cudf_regex_is_valid(i32* %validity, i32 %physical)
+  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
   %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
   %next = add i32 %physical, 1
   %end = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %next)
@@ -331,12 +371,12 @@ std::string make_fixed_kernel(bool offset64,
     result += R"NVVM(
 define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output) nounwind {
 entry:
-  %row = call i32 @cudf_regex_row_index()
+  %row = call i32 @libregex_ir_row_index()
   %in_bounds = icmp slt i32 %row, %rows
   br i1 %in_bounds, label %work, label %done
 work:
   %physical = add i32 %row_offset, %row
-  %valid = call i1 @cudf_regex_is_valid(i32* %validity, i32 %physical)
+  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
   br i1 %valid, label %match, label %store_false
 match:
   %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
@@ -362,12 +402,12 @@ done:
     result += R"NVVM(
 define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output) nounwind {
 entry:
-  %row = call i32 @cudf_regex_row_index()
+  %row = call i32 @libregex_ir_row_index()
   %in_bounds = icmp slt i32 %row, %rows
   br i1 %in_bounds, label %work, label %done
 work:
   %physical = add i32 %row_offset, %row
-  %valid = call i1 @cudf_regex_is_valid(i32* %validity, i32 %physical)
+  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
   br i1 %valid, label %count, label %store_zero
 count:
   %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
@@ -395,12 +435,12 @@ done:
 define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output) nounwind {
 entry:
   %span = alloca [2 x i64], align 8
-  %row = call i32 @cudf_regex_row_index()
+  %row = call i32 @libregex_ir_row_index()
   %in_bounds = icmp slt i32 %row, %rows
   br i1 %in_bounds, label %work, label %done
 work:
   %physical = add i32 %row_offset, %row
-  %valid = call i1 @cudf_regex_is_valid(i32* %validity, i32 %physical)
+  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
   br i1 %valid, label %find, label %store_missing
 find:
   %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
@@ -451,12 +491,12 @@ std::string make_capture_kernel(bool offset64,
 define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output) nounwind {
 entry:
   %captures = alloca [@CAPTURE_SLOTS@ x i64], align 8
-  %row = call i32 @cudf_regex_row_index()
+  %row = call i32 @libregex_ir_row_index()
   %in_bounds = icmp slt i32 %row, %rows
   br i1 %in_bounds, label %work, label %done
 work:
   %physical = add i32 %row_offset, %row
-  %valid = call i1 @cudf_regex_is_valid(i32* %validity, i32 %physical)
+  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
   br i1 %valid, label %match, label %output_begin
 match:
   %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
@@ -538,12 +578,12 @@ std::string make_enumeration_size_kernel(bool offset64,
 define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output, i8* %output_validity) nounwind {
 entry:
   %captures = alloca [@CAPTURE_SLOTS@ x i64], align 8
-  %row = call i32 @cudf_regex_row_index()
+  %row = call i32 @libregex_ir_row_index()
   %in_bounds = icmp slt i32 %row, %rows
   br i1 %in_bounds, label %work, label %done
 work:
   %physical = add i32 %row_offset, %row
-  %valid = call i1 @cudf_regex_is_valid(i32* %validity, i32 %physical)
+  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
   br i1 %valid, label %setup, label %store_invalid
 setup:
   %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
@@ -634,12 +674,12 @@ std::string make_enumeration_emit_kernel(bool offset64,
 define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output, i8* %output_offsets) nounwind {
 entry:
   %captures = alloca [@CAPTURE_SLOTS@ x i64], align 8
-  %row = call i32 @cudf_regex_row_index()
+  %row = call i32 @libregex_ir_row_index()
   %in_bounds = icmp slt i32 %row, %rows
   br i1 %in_bounds, label %work, label %done
 work:
   %physical = add i32 %row_offset, %row
-  %valid = call i1 @cudf_regex_is_valid(i32* %validity, i32 %physical)
+  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
   br i1 %valid, label %setup, label %done
 setup:
   %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
@@ -686,9 +726,9 @@ done:
                 "i8* %output, i8* %output_offsets, i8* %overflow) nounwind {");
     replace_all(
       result,
-      "  %valid = call i1 @cudf_regex_is_valid(i32* %validity, i32 %physical)\n  br i1 %valid, "
+      "  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)\n  br i1 %valid, "
       "label %setup, label %done",
-      "  %valid = call i1 @cudf_regex_is_valid(i32* %validity, i32 %physical)\n  %overflow_ptr = "
+      "  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)\n  %overflow_ptr = "
       "getelementptr i8, i8* %overflow, i32 %row\n  %overflow_value = load i8, i8* %overflow_ptr, "
       "align 1\n  %did_overflow = icmp ne i8 %overflow_value, 0\n  %selected = and i1 %valid, "
       "%did_overflow\n  br i1 %selected, label %setup, label %done");
@@ -1000,12 +1040,12 @@ finish:
   result += emit ? R"NVVM(
 define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output, i8* %output_offsets) nounwind {
 entry:
-  %row = call i32 @cudf_regex_row_index()
+  %row = call i32 @libregex_ir_row_index()
   %in_bounds = icmp slt i32 %row, %rows
   br i1 %in_bounds, label %work, label %done
 work:
   %physical = add i32 %row_offset, %row
-  %valid = call i1 @cudf_regex_is_valid(i32* %validity, i32 %physical)
+  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
   br i1 %valid, label %replace, label %done
 replace:
   %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
@@ -1027,12 +1067,12 @@ done:
                  : R"NVVM(
 define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output, i32* %size_overflow) nounwind {
 entry:
-  %row = call i32 @cudf_regex_row_index()
+  %row = call i32 @libregex_ir_row_index()
   %in_bounds = icmp slt i32 %row, %rows
   br i1 %in_bounds, label %work, label %done
 work:
   %physical = add i32 %row_offset, %row
-  %valid = call i1 @cudf_regex_is_valid(i32* %validity, i32 %physical)
+  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
   br i1 %valid, label %replace, label %store_zero
 replace:
   %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
@@ -1069,12 +1109,12 @@ done:
         ? R"NVVM(define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output, i8* %output_offsets, i8* %cache_buffer, i32 %capacity, i8* %overflow, i8* %match_counts) nounwind {
 entry:
   %dummy_count = alloca i32, align 4
-  %row = call i32 @cudf_regex_row_index()
+  %row = call i32 @libregex_ir_row_index()
   %in_bounds = icmp slt i32 %row, %rows
   br i1 %in_bounds, label %work, label %done
 work:
   %physical = add i32 %row_offset, %row
-  %valid = call i1 @cudf_regex_is_valid(i32* %validity, i32 %physical)
+  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
   br i1 %valid, label %replace, label %done
 replace:
   %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
@@ -1108,12 +1148,12 @@ done:
         : R"NVVM(define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output, i8* %cache_buffer, i32 %capacity, i8* %overflow, i8* %match_counts, i32* %size_overflow) nounwind {
 entry:
   %typed_counts = bitcast i8* %match_counts to i32*
-  %row = call i32 @cudf_regex_row_index()
+  %row = call i32 @libregex_ir_row_index()
   %in_bounds = icmp slt i32 %row, %rows
   br i1 %in_bounds, label %work, label %done
 work:
   %physical = add i32 %row_offset, %row
-  %valid = call i1 @cudf_regex_is_valid(i32* %validity, i32 %physical)
+  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
   br i1 %valid, label %replace, label %store_zero
 replace:
   %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
@@ -1184,12 +1224,12 @@ std::string make_replace_kernel(bool offset64,
   result += emit ? R"NVVM(
 define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output, i8* %output_offsets) nounwind {
 entry:
-  %row = call i32 @cudf_regex_row_index()
+  %row = call i32 @libregex_ir_row_index()
   %in_bounds = icmp slt i32 %row, %rows
   br i1 %in_bounds, label %work, label %done
 work:
   %physical = add i32 %row_offset, %row
-  %valid = call i1 @cudf_regex_is_valid(i32* %validity, i32 %physical)
+  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
   br i1 %valid, label %replace, label %done
 replace:
   %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
@@ -1211,12 +1251,12 @@ done:
                  : R"NVVM(
 define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output) nounwind {
 entry:
-  %row = call i32 @cudf_regex_row_index()
+  %row = call i32 @libregex_ir_row_index()
   %in_bounds = icmp slt i32 %row, %rows
   br i1 %in_bounds, label %work, label %done
 work:
   %physical = add i32 %row_offset, %row
-  %valid = call i1 @cudf_regex_is_valid(i32* %validity, i32 %physical)
+  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
   br i1 %valid, label %replace, label %store_zero
 replace:
   %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
@@ -1264,12 +1304,12 @@ std::string make_split_size_kernel(bool offset64,
   result += R"NVVM(
 define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output) nounwind {
 entry:
-  %row = call i32 @cudf_regex_row_index()
+  %row = call i32 @libregex_ir_row_index()
   %in_bounds = icmp slt i32 %row, %rows
   br i1 %in_bounds, label %work, label %done
 work:
   %physical = add i32 %row_offset, %row
-  %valid = call i1 @cudf_regex_is_valid(i32* %validity, i32 %physical)
+  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
   br i1 %valid, label %split, label %store_zero
 split:
   %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
@@ -1325,12 +1365,12 @@ std::string make_split_emit_kernel(bool offset64,
   result += R"NVVM(
 define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output, i8* %effective_offsets, i8* %full_offsets, i64* %spans) nounwind {
 entry:
-  %row = call i32 @cudf_regex_row_index()
+  %row = call i32 @libregex_ir_row_index()
   %in_bounds = icmp slt i32 %row, %rows
   br i1 %in_bounds, label %work, label %done
 work:
   %physical = add i32 %row_offset, %row
-  %valid = call i1 @cudf_regex_is_valid(i32* %validity, i32 %physical)
+  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
   br i1 %valid, label %setup, label %done
 setup:
   %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
@@ -1388,9 +1428,9 @@ done:
       "i8* %effective_offsets, i8* %full_offsets, i64* %spans, i8* %overflow) nounwind {");
     replace_all(
       result,
-      "  %valid = call i1 @cudf_regex_is_valid(i32* %validity, i32 %physical)\n  br i1 %valid, "
+      "  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)\n  br i1 %valid, "
       "label %setup, label %done",
-      "  %valid = call i1 @cudf_regex_is_valid(i32* %validity, i32 %physical)\n  %overflow_ptr = "
+      "  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)\n  %overflow_ptr = "
       "getelementptr i8, i8* %overflow, i32 %row\n  %overflow_value = load i8, i8* "
       "%overflow_ptr, align 1\n  %did_overflow = icmp ne i8 %overflow_value, 0\n  %selected = "
       "and i1 %valid, %did_overflow\n  br i1 %selected, label %setup, label %done");
@@ -1441,7 +1481,7 @@ std::string make_span_cache_sample_kernel(bool offset64,
   result += split ? R"NVVM(
 define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i32 %samples, i32 %capacity, i8* %statistics) nounwind {
 entry:
-  %sample = call i32 @cudf_regex_row_index()
+  %sample = call i32 @libregex_ir_row_index()
   %in_bounds = icmp slt i32 %sample, %samples
   br i1 %in_bounds, label %select, label %done
 select:
@@ -1452,7 +1492,7 @@ select:
   %selected64 = udiv i64 %scaled, %samples64
   %selected = trunc i64 %selected64 to i32
   %physical = add i32 %row_offset, %selected
-  %valid = call i1 @cudf_regex_is_valid(i32* %validity, i32 %physical)
+  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
   br i1 %valid, label %sample_row, label %done
 sample_row:
   %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
@@ -1487,7 +1527,7 @@ done:
 define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i32 %samples, i32 %capacity, i8* %statistics) nounwind {
 entry:
   %captures = alloca [@CAPTURE_SLOTS@ x i64], align 8
-  %sample = call i32 @cudf_regex_row_index()
+  %sample = call i32 @libregex_ir_row_index()
   %in_bounds = icmp slt i32 %sample, %samples
   br i1 %in_bounds, label %select, label %done
 select:
@@ -1498,7 +1538,7 @@ select:
   %selected64 = udiv i64 %scaled, %samples64
   %selected = trunc i64 %selected64 to i32
   %physical = add i32 %row_offset, %selected
-  %valid = call i1 @cudf_regex_is_valid(i32* %validity, i32 %physical)
+  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
   br i1 %valid, label %sample_row, label %done
 sample_row:
   %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
