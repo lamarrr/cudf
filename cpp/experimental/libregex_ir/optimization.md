@@ -593,16 +593,37 @@ The core API returns textual NVVM IR and does not invoke CUDA tools itself. The
 cuDF integration uses:
 
 - libNVVM verification for the selected compute architecture;
-- libNVVM compilation of the assembled matcher and generated column wrapper
-  with `-opt=3 -gen-lto`;
-- the resulting in-memory LTO IR fragment as input to RTCX/nvJitLink with
-  device LTO and `cudf_kernel_entry` retention; and
+- separate libNVVM compilation of the pattern-specific matcher and each
+  generated libcudf kernel wrapper with `-opt=3 -gen-lto`, so one compiled
+  matcher fragment is reused by sizing, emission, offset-width, and cache
+  variants;
+- a build-time CUDA C++ LTO adapter containing the canonical cuDF row-index,
+  null-mask, string-offset, and `string_index_pair` layout operations;
+- those three in-memory fragments as input to RTCX/nvJitLink with device LTO
+  and `cudf_kernel_entry` retention; and
 - module loading of the linked cubin.
 
 The context RTCX cache keys both the NVVM fragment and linked cubin by source,
 architecture, toolkit/runtime inputs, and JIT bundle identity. No CUDA C++
-frontend is needed for the pattern-specific module: Regex IR already emits the
-typed low-level control flow, constants, and wrapper ABI that libNVVM accepts.
+frontend is needed at runtime: Regex IR and the private libcudf wrapper generator
+already emit typed low-level control flow, constants, and explicit device ABIs
+that libNVVM accepts. CUDA C++ is not an equivalent runtime input format here:
+using it would require shipping and invoking NVRTC plus embedded headers, while
+libNVVM directly validates and optimizes the generated LLVM-derived IR. The
+only CUDA C++ component is the stable adapter compiled while libcudf is built;
+it insulates runtime-generated code from C++ type layout and bitmask rules.
+
+The device-link ABI is intentionally C-like. Matcher entry points receive raw
+UTF-8 byte pointers, byte counts, scalar search positions, and raw `int64_t`
+span buffers. Kernel entry points similarly receive raw column buffers and
+fixed-width scalar values. Host-side `std::string_view`, `std::span`,
+`cudf::device_span`, `cuda::stream_ref`, and RTCX fragment types never cross
+that boundary and therefore require no device adapter. The one libcudf C++
+layout consumed by generated output is `string_index_pair` (currently
+`cuda::std::pair<char const*, size_type>`); generated code passes its values as
+primitive arguments to the build-time adapter, which alone constructs the C++
+object. Static layout assertions make an incompatible cuDF change fail while
+building libcudf instead of silently corrupting runtime-generated output.
 
 Every Regex IR benchmark state also reports an uncached JIT-ready interval.
 It starts at the source regex, disables nvJitLink's cache, and stops after the
@@ -610,7 +631,7 @@ linked module is loaded and every required kernel function is resolved. Input
 construction, output allocation, and the first launch are excluded.
 
 Symbol prefixes isolate generated internals, and the public execute-function
-name lets the stable wrapper call the specialized matcher. Production
+name lets the private libcudf wrapper call the specialized matcher. Production
 integrations should cache linked cubins by at least pattern, operation,
 compile/codegen options, GPU architecture, and CUDA toolkit version. JIT
 specialization targets repeated workloads; uncached one-shot compilation is
@@ -653,12 +674,15 @@ storage must be included in end-to-end measurements.
 The integration retains compiled wrapper variants for both 32-bit and 64-bit
 input string offsets and selects from the actual offsets child at execution.
 Generated matcher cursors, match spans, cached spans, and byte counts use
-64-bit values. Variable-width output construction uses cuDF's offsets-child
-helper, then selects a 32-bit or 64-bit emission wrapper from the returned
-offset type. Replacement sizing separately reports a per-row overflow before
-allocation. Thus columns whose total character storage requires large-string
-offsets do not truncate addresses inside the generated regex code, while
-ordinary fixed-width API outputs retain cuDF `size_type` semantics.
+64-bit values. The build-time adapter instantiates canonical 32-bit and 64-bit
+cuDF offset loads; wrappers select the correct device helper without duplicating
+the offsets-child representation in textual IR. Variable-width output
+construction uses cuDF's offsets-child helper, then selects a 32-bit or 64-bit
+emission wrapper from the returned offset type. Replacement sizing separately
+reports a per-row overflow before allocation. Thus columns whose total
+character storage requires large-string offsets do not truncate addresses
+inside generated regex code, while row counts, list offsets, capture lengths,
+and other ordinary fixed-width API outputs retain cuDF `size_type` semantics.
 
 ## Profile-guided findings
 
@@ -963,7 +987,7 @@ case and a JIT-winning negative control:
 
 Nsight embedded the final SASS but could not associate PTX or source with the
 runtime-linked JIT cubin. The JIT PTX was therefore captured separately by
-passing the same assembled NVVM module through libNVVM with
+passing the same matcher and wrapper NVVM modules through libNVVM with
 `-arch=compute_86 -opt=3`, omitting only `-gen-lto`. The branch PTX was
 extracted from its SM 8.6 fatbin. This gives an exact view before their
 different link paths, while the NCU SASS and dynamic counters remain the

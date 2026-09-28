@@ -496,6 +496,14 @@ rtcx_embed(cudf_cuda_embed COMPRESSION zstd OUTPUT_DIRECTORY "${CMAKE_CURRENT_BI
 
 rtcx_add_embed(cudf_fragments)
 
+add_fragment(
+  cudf_fragments
+  FRAGMENT
+  regex_jit_layout_adapter
+  SOURCE
+  src/strings/experimental/regex_jit/layout_adapter.cu
+)
+
 # This function precompiles the unary and binary transform kernel fragments for all fixed-width
 # types. This helps amortize the cost of JIT compilation for kernels that have matching signatures
 # and reduces the amount of time spent on source-based runtime JIT compilation for LTO-based JIT.
@@ -1135,11 +1143,12 @@ add_library(
   src/strings/padding.cu
   src/strings/positions.cu
   experimental/libregex_ir/regex_ir.cpp
+  src/strings/experimental/regex_jit/kernel_ir.cpp
+  src/strings/experimental/regex_jit/regex.cu
   src/strings/regex/gkexec.cpp
   src/strings/regex/glushkov_regcomp.cpp
   src/strings/regex/regcomp.cpp
   src/strings/regex/regexec.cpp
-  src/strings/regex/jit/regex.cu
   src/strings/regex/regex_program.cpp
   src/strings/repeat_strings.cu
   src/strings/replace/backref_re.cu

@@ -5,12 +5,14 @@
 
 #include <benchmarks/common/generate_input.hpp>
 #include <benchmarks/common/memory_stats.hpp>
+#include <benchmarks/string/regex/benchmark_utils.hpp>
 
 #include <cudf_test/column_wrapper.hpp>
 
 #include <cudf/copying.hpp>
-#include <cudf/experimental/strings/regex.hpp>
 #include <cudf/strings/contains.hpp>
+#include <cudf/strings/experimental/contains.hpp>
+#include <cudf/strings/experimental/findall.hpp>
 #include <cudf/strings/findall.hpp>
 #include <cudf/strings/regex/regex_program.hpp>
 #include <cudf/strings/strings_column_view.hpp>
@@ -29,6 +31,12 @@
 #include <vector>
 
 namespace {
+
+using cudf::benchmark::regex::case_names;
+using cudf::benchmark::regex::find_case;
+using cudf::benchmark::regex::inject;
+using cudf::benchmark::regex::make_sampled_input;
+using cudf::benchmark::regex::random_value;
 
 enum class corpus_source : std::uint8_t {
   REBAR,
@@ -164,40 +172,6 @@ constexpr std::array search_cases{
              corpus_source::SNORT,
              cudf::strings::regex_flags::IGNORECASE},
 };
-
-template <std::size_t N>
-std::vector<std::string> case_names(std::array<regex_case, N> const& cases)
-{
-  std::vector<std::string> result;
-  result.reserve(cases.size());
-  std::transform(cases.begin(), cases.end(), std::back_inserter(result), [](auto& item) {
-    return std::string{item.name};
-  });
-  return result;
-}
-
-template <std::size_t N>
-regex_case const* find_case(std::array<regex_case, N> const& cases, std::string_view name)
-{
-  auto found =
-    std::find_if(cases.begin(), cases.end(), [name](auto& item) { return item.name == name; });
-  return found == cases.end() ? nullptr : &*found;
-}
-
-std::uint64_t random_value(std::uint64_t& state)
-{
-  state ^= state >> 12U;
-  state ^= state << 25U;
-  state ^= state >> 27U;
-  return state * 0x2545f4914f6cdd1dULL;
-}
-
-void inject(std::string& row, std::string_view needle, std::size_t position)
-{
-  if (needle.size() <= row.size()) {
-    row.replace(std::min(position, row.size() - needle.size()), needle.size(), needle);
-  }
-}
 
 std::string make_rebar_row(cudf::size_type width, std::size_t sample)
 {
@@ -368,37 +342,19 @@ std::unique_ptr<cudf::table> make_input(regex_case const& definition,
                                         cudf::size_type num_rows,
                                         cudf::size_type row_width)
 {
-  constexpr std::size_t sample_count = 64;
-  std::vector<std::string> samples;
-  samples.reserve(sample_count);
-  for (std::size_t sample = 0; sample < sample_count; ++sample) {
+  return make_sampled_input(num_rows, [&](std::size_t sample) {
     switch (definition.source) {
-      case corpus_source::REBAR: samples.push_back(make_rebar_row(row_width, sample)); break;
-      case corpus_source::RE2: samples.push_back(make_re2_row(row_width, sample)); break;
-      case corpus_source::PCRE2: samples.push_back(make_pcre2_row(row_width, sample)); break;
-      case corpus_source::HYPERSCAN:
-        samples.push_back(make_hyperscan_row(row_width, sample));
-        break;
-      case corpus_source::RIPGREP_EN:
-        samples.push_back(make_ripgrep_english_row(row_width, sample));
-        break;
-      case corpus_source::RIPGREP_RU:
-        samples.push_back(make_ripgrep_russian_row(row_width, sample));
-        break;
-      case corpus_source::LINGUA_FRANCA:
-        samples.push_back(make_lingua_franca_row(row_width, sample));
-        break;
-      case corpus_source::SNORT: samples.push_back(make_snort_row(row_width, sample)); break;
+      case corpus_source::REBAR: return make_rebar_row(row_width, sample);
+      case corpus_source::RE2: return make_re2_row(row_width, sample);
+      case corpus_source::PCRE2: return make_pcre2_row(row_width, sample);
+      case corpus_source::HYPERSCAN: return make_hyperscan_row(row_width, sample);
+      case corpus_source::RIPGREP_EN: return make_ripgrep_english_row(row_width, sample);
+      case corpus_source::RIPGREP_RU: return make_ripgrep_russian_row(row_width, sample);
+      case corpus_source::LINGUA_FRANCA: return make_lingua_franca_row(row_width, sample);
+      case corpus_source::SNORT: return make_snort_row(row_width, sample);
     }
-  }
-
-  cudf::test::strings_column_wrapper samples_column(samples.begin(), samples.end());
-  auto profile = data_profile_builder().no_validity().distribution(
-    cudf::type_to_id<cudf::size_type>(), distribution_id::UNIFORM, 0ul, sample_count - 1);
-  auto map =
-    create_random_column(cudf::type_to_id<cudf::size_type>(), row_count{num_rows}, profile);
-  return cudf::gather(
-    cudf::table_view{{samples_column}}, map->view(), cudf::out_of_bounds_policy::DONT_CHECK);
+    return std::string{};
+  });
 }
 
 constexpr std::array validation_cases{
@@ -446,21 +402,9 @@ std::vector<std::string> validation_samples(std::string_view name)
 std::unique_ptr<cudf::table> make_validation_input(regex_case const& definition,
                                                    cudf::size_type num_rows)
 {
-  auto base                          = validation_samples(definition.name);
-  constexpr std::size_t sample_count = 64;
-  std::vector<std::string> samples;
-  samples.reserve(sample_count);
-  for (std::size_t index = 0; index < sample_count; ++index) {
-    samples.push_back(base[index % base.size()]);
-  }
-
-  cudf::test::strings_column_wrapper samples_column(samples.begin(), samples.end());
-  auto profile = data_profile_builder().no_validity().distribution(
-    cudf::type_to_id<cudf::size_type>(), distribution_id::UNIFORM, 0ul, sample_count - 1);
-  auto map =
-    create_random_column(cudf::type_to_id<cudf::size_type>(), row_count{num_rows}, profile);
-  return cudf::gather(
-    cudf::table_view{{samples_column}}, map->view(), cudf::out_of_bounds_policy::DONT_CHECK);
+  auto base = validation_samples(definition.name);
+  return make_sampled_input(num_rows,
+                            [&](std::size_t sample) { return base[sample % base.size()]; });
 }
 
 void bench_corpus_search(nvbench::state& state)

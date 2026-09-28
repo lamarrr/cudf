@@ -4,6 +4,7 @@
  */
 
 #include "jit/cache.hpp"
+#include "kernel_ir.hpp"
 #include "regex_ir.hpp"
 
 #include <cudf/aggregation.hpp>
@@ -11,10 +12,14 @@
 #include <cudf/detail/device_scalar.hpp>
 #include <cudf/detail/iterator.cuh>
 #include <cudf/detail/null_mask.hpp>
-#include <cudf/experimental/strings/regex.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/strings/detail/strings_children.cuh>
 #include <cudf/strings/detail/strings_column_factories.cuh>
+#include <cudf/strings/experimental/contains.hpp>
+#include <cudf/strings/experimental/extract.hpp>
+#include <cudf/strings/experimental/findall.hpp>
+#include <cudf/strings/experimental/replace_re.hpp>
+#include <cudf/strings/experimental/split_re.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/utilities/error.hpp>
 
@@ -26,12 +31,15 @@
 #include <thrust/for_each.h>
 #include <thrust/iterator/counting_iterator.h>
 
+#include <cudf_fragments.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <format>
 #include <limits>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -47,13 +55,27 @@ struct retained_kernel {
   std::uint32_t threads;
 };
 
+enum class kernel_role : std::uint8_t {
+  PRIMARY,
+  EMIT,
+  CACHE_SIZE,
+  CACHE_EMIT,
+  SAMPLE,
+  WARP_LITERAL,
+  COUNT
+};
+
+constexpr auto kernel_slot_count = static_cast<std::size_t>(kernel_role::COUNT) * 4U;
+
+constexpr std::size_t kernel_slot(kernel_role role, bool offset64, bool output_offset64 = false)
+{
+  return static_cast<std::size_t>(role) * 4U + static_cast<std::size_t>(offset64) * 2U +
+         static_cast<std::size_t>(output_offset64);
+}
+
 struct regex_jit_program::regex_jit_program_impl {
   size_type capture_count;
-  std::vector<retained_kernel> kernels;
-  std::vector<retained_kernel> cache_size_kernels;
-  std::vector<retained_kernel> cache_emit_kernels;
-  std::vector<retained_kernel> sample_kernels;
-  std::vector<retained_kernel> warp_literal_kernels;
+  std::array<std::optional<retained_kernel>, kernel_slot_count> kernels;
   regex_ir::executor_kind executor;
   size_type cache_values;
   std::optional<std::string> validation_error;
@@ -61,37 +83,31 @@ struct regex_jit_program::regex_jit_program_impl {
 
 struct regex_jit_program_accessor {
   static retained_kernel const& kernel(regex_jit_program const& prog,
+                                       kernel_role role,
                                        bool offset64,
-                                       bool emit            = false,
                                        bool output_offset64 = false);
 
   static retained_kernel const& cache_size_kernel(regex_jit_program const& prog, bool offset64)
   {
-    return prog._impl->cache_size_kernels.at(static_cast<std::size_t>(offset64));
+    return kernel(prog, kernel_role::CACHE_SIZE, offset64);
   }
 
   static retained_kernel const& cache_emit_kernel(regex_jit_program const& prog,
                                                   bool offset64,
                                                   bool output_offset64 = false)
   {
-    auto replace = prog.operation() == regex_operation::REPLACE ||
-                   prog.operation() == regex_operation::REPLACE_WITH_BACKREFS;
-    auto index =
-      replace ? static_cast<std::size_t>(offset64) * 2U + static_cast<std::size_t>(output_offset64)
-              : static_cast<std::size_t>(offset64);
-    return prog._impl->cache_emit_kernels.at(index);
+    return kernel(prog, kernel_role::CACHE_EMIT, offset64, output_offset64);
   }
 
   static retained_kernel const& sample_kernel(regex_jit_program const& prog, bool offset64)
   {
-    return prog._impl->sample_kernels.at(static_cast<std::size_t>(offset64));
+    return kernel(prog, kernel_role::SAMPLE, offset64);
   }
 
   static retained_kernel const* warp_literal_kernel(regex_jit_program const& prog, bool offset64)
   {
-    return prog._impl->warp_literal_kernels.empty()
-             ? nullptr
-             : &prog._impl->warp_literal_kernels.at(static_cast<std::size_t>(offset64));
+    auto& prepared = prog._impl->kernels[kernel_slot(kernel_role::WARP_LITERAL, offset64)];
+    return prepared.has_value() ? &*prepared : nullptr;
   }
 
   static regex_ir::executor_kind executor(regex_jit_program const& prog)
@@ -103,7 +119,7 @@ struct regex_jit_program_accessor {
 
   static bool has_span_cache(regex_jit_program const& prog)
   {
-    return !prog._impl->sample_kernels.empty();
+    return prog._impl->kernels[kernel_slot(kernel_role::SAMPLE, false)].has_value();
   }
 
   static regex_jit_program_options const& options(regex_jit_program const& prog)
@@ -119,12 +135,9 @@ struct regex_jit_program_accessor {
 
 namespace {
 
-using pair_t = cuda::std::pair<char const*, size_type>;
+using pair_t = strings::detail::string_index_pair;
 
 inline constexpr std::string_view KERNEL_ENTRY = "cudf_kernel_entry";
-
-static_assert(sizeof(pair_t) == 16);
-static_assert(alignof(pair_t) == alignof(char const*));
 
 constexpr std::size_t required_stack_size = 64U * 1024U;
 
@@ -215,8 +228,8 @@ regex_ir::compile_options make_compile_options(strings::regex_flags flags)
 regex_ir::operation_kind internal_operation(regex_operation operation)
 {
   switch (operation) {
-    case regex_operation::CONTAINS:
-    case regex_operation::MATCHES: return regex_ir::operation_kind::CONTAINS;
+    case regex_operation::CONTAINS: return regex_ir::operation_kind::CONTAINS;
+    case regex_operation::MATCHES: return regex_ir::operation_kind::MATCHES;
     case regex_operation::COUNT: return regex_ir::operation_kind::COUNT;
     case regex_operation::FIND: return regex_ir::operation_kind::FIND;
     case regex_operation::EXTRACT:
@@ -257,6 +270,13 @@ void ensure_stack_size()
   }
 }
 
+std::span<std::uint8_t const> layout_adapter_fragment()
+{
+  auto file_index = cudf_fragments::regex_jit_layout_adapter;
+  auto range      = cudf_fragments::file_ranges[file_index];
+  return cudf_fragments::files.subspan(range[0], range[1]);
+}
+
 retained_kernel compile_kernel(std::string const& matcher,
                                regex_ir::operation_kind operation,
                                regex_ir::executor_kind executor,
@@ -264,10 +284,14 @@ retained_kernel compile_kernel(std::string const& matcher,
                                std::string_view name)
 {
   auto threads                      = block_size(operation, executor);
-  auto module                       = regex_ir::nvvm::assemble(matcher, std::move(wrapper));
-  auto fragment                     = get_nvvm_fragment(std::string{name}, module);
+  auto matcher_fragment             = get_nvvm_fragment("cudf.experimental.regex.matcher", matcher);
+  auto wrapper_module               = detail::regex_jit::make_module(std::move(wrapper));
+  auto wrapper_fragment             = get_nvvm_fragment(std::string{name}, wrapper_module);
+  auto adapter                      = layout_adapter_fragment();
   rtcx::memory_fragment fragments[] = {
-    {.data = fragment->view(), .type = rtcx::binary_type::LTO_IR, .name = nullptr}};
+    {.data = matcher_fragment->view(), .type = rtcx::binary_type::LTO_IR, .name = nullptr},
+    {.data = wrapper_fragment->view(), .type = rtcx::binary_type::LTO_IR, .name = nullptr},
+    {.data = adapter, .type = rtcx::binary_type::FATBIN, .name = nullptr}};
   auto compiled   = get_lto_linked_kernel(std::string{name}, {}, fragments);
   auto attributes = cudaFuncAttributes{};
   CUDF_CUDA_TRY(cudaFuncGetAttributes(&attributes, compiled.get().get()));
@@ -515,7 +539,7 @@ std::unique_ptr<column> fixed_result(strings_column_view const& input,
   if (warp != nullptr && warp_parallel) {
     launch_warp_per_row(*warp, data, stream, result->mutable_view().head<void>());
   } else {
-    auto& prepared = regex_jit_program_accessor::kernel(prog, data.offset64);
+    auto& prepared = regex_jit_program_accessor::kernel(prog, kernel_role::PRIMARY, data.offset64);
     launch(prepared, data, stream, result->mutable_view().head<void>());
   }
   return result;
@@ -549,7 +573,7 @@ std::unique_ptr<table> extract_impl(strings_column_view const& input,
   auto pair_count = static_cast<std::size_t>(input.size()) * static_cast<std::size_t>(groups);
   rmm::device_uvector<pair_t> pairs(pair_count, stream, mr.get_temporary_mr());
   auto data      = get_input_data(input, stream);
-  auto& prepared = regex_jit_program_accessor::kernel(prog, data.offset64);
+  auto& prepared = regex_jit_program_accessor::kernel(prog, kernel_role::PRIMARY, data.offset64);
   launch(prepared, data, stream, pairs.data());
 
   std::vector<device_span<pair_t const>> spans;
@@ -572,7 +596,7 @@ std::unique_ptr<column> extract_single_impl(strings_column_view const& input,
 
   rmm::device_uvector<pair_t> pairs(input.size(), stream, mr.get_temporary_mr());
   auto data      = get_input_data(input, stream);
-  auto& prepared = regex_jit_program_accessor::kernel(prog, data.offset64);
+  auto& prepared = regex_jit_program_accessor::kernel(prog, kernel_role::PRIMARY, data.offset64);
   launch(prepared, data, stream, pairs.data());
   return make_strings(pairs, stream, mr);
 }
@@ -623,7 +647,8 @@ std::unique_ptr<column> enumerate_impl(strings_column_view const& input,
            cache_plan.capacity,
            overflow->data());
   } else {
-    auto& size_kernel = regex_jit_program_accessor::kernel(prog, data.offset64);
+    auto& size_kernel =
+      regex_jit_program_accessor::kernel(prog, kernel_role::PRIMARY, data.offset64);
     launch(size_kernel,
            data,
            stream,
@@ -667,7 +692,8 @@ std::unique_ptr<column> enumerate_impl(strings_column_view const& input,
              offsets->view().data<size_type>(),
              overflow->data());
     } else {
-      auto& emit_kernel = regex_jit_program_accessor::kernel(prog, data.offset64, true);
+      auto& emit_kernel =
+        regex_jit_program_accessor::kernel(prog, kernel_role::EMIT, data.offset64);
       launch(emit_kernel, data, stream, pairs.data(), offsets->view().data<size_type>());
     }
   }
@@ -687,7 +713,7 @@ std::unique_ptr<column> enumerate_impl(strings_column_view const& input,
     input.size(), std::move(offsets), std::move(strings_output), null_count, std::move(null_mask));
 }
 
-using replacement_piece = regex_ir::nvvm::replacement_piece;
+using replacement_piece = detail::regex_jit::replacement_piece;
 
 std::vector<replacement_piece> literal_replacement(std::string_view replacement)
 {
@@ -800,7 +826,8 @@ std::unique_ptr<column> replace_impl(strings_column_view const& input,
            match_counts->data(),
            size_overflow.data());
   } else {
-    auto& size_kernel = regex_jit_program_accessor::kernel(prog, data.offset64);
+    auto& size_kernel =
+      regex_jit_program_accessor::kernel(prog, kernel_role::PRIMARY, data.offset64);
     launch(size_kernel, data, stream, sizes->mutable_view().head<void>(), size_overflow.data());
   }
   CUDF_EXPECTS(size_overflow.value(stream) == 0,
@@ -825,7 +852,7 @@ std::unique_ptr<column> replace_impl(strings_column_view const& input,
              match_counts->data());
     } else {
       auto& emit_kernel =
-        regex_jit_program_accessor::kernel(prog, data.offset64, true, output_offset64);
+        regex_jit_program_accessor::kernel(prog, kernel_role::EMIT, data.offset64, output_offset64);
       launch(emit_kernel, data, stream, chars.data(), offsets->view().head<void>());
     }
   }
@@ -893,7 +920,8 @@ split_result generate_split_pairs(strings_column_view const& input,
            cache_plan.capacity,
            overflow->data());
   } else {
-    auto& size_kernel = regex_jit_program_accessor::kernel(prog, data.offset64);
+    auto& size_kernel =
+      regex_jit_program_accessor::kernel(prog, kernel_role::PRIMARY, data.offset64);
     launch(size_kernel, data, stream, counts->mutable_view().head<void>());
   }
 
@@ -966,7 +994,8 @@ split_result generate_split_pairs(strings_column_view const& input,
              spans.data(),
              overflow->data());
     } else {
-      auto& emit_kernel = regex_jit_program_accessor::kernel(prog, data.offset64, true);
+      auto& emit_kernel =
+        regex_jit_program_accessor::kernel(prog, kernel_role::EMIT, data.offset64);
       launch(emit_kernel, data, stream, pairs.data(), effective_data, full_data, spans.data());
     }
   }
@@ -1016,16 +1045,11 @@ std::unique_ptr<table> split_table_impl(strings_column_view const& input,
 }  // namespace
 
 retained_kernel const& regex_jit_program_accessor::kernel(regex_jit_program const& prog,
+                                                          kernel_role role,
                                                           bool offset64,
-                                                          bool emit,
                                                           bool output_offset64)
 {
-  auto index =
-    emit && (prog.operation() == regex_operation::REPLACE ||
-             prog.operation() == regex_operation::REPLACE_WITH_BACKREFS)
-      ? 2U + static_cast<std::size_t>(offset64) * 2U + static_cast<std::size_t>(output_offset64)
-      : static_cast<std::size_t>(offset64) + (emit ? 2U : 0U);
-  return prog._impl->kernels.at(index);
+  return prog._impl->kernels[kernel_slot(role, offset64, output_offset64)].value();
 }
 
 std::unique_ptr<regex_jit_program> regex_jit_program::create(
@@ -1052,14 +1076,9 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
 {
   try {
     auto compile_pattern = normalize_pattern(pattern);
-    if (operation == regex_operation::MATCHES) {
-      compile_pattern = std::format(R"(\A(?:{}))", compile_pattern);
-    }
-
     auto compile_options = make_compile_options(flags);
     auto internal        = internal_operation(operation);
-    if (operation == regex_operation::FINDALL &&
-        captures == strings::capture_groups::NON_CAPTURE) {
+    if (operation == regex_operation::FINDALL && captures == strings::capture_groups::NON_CAPTURE) {
       internal = regex_ir::operation_kind::FIND_ALL;
     }
     auto replacement_operation =
@@ -1089,7 +1108,7 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
       try {
         return regex_ir::compile(compile_pattern,
                                  regex_ir::operation_kind::REPLACE,
-                                 regex_ir::nvvm::encode_replacement(replacement),
+                                 detail::regex_jit::encode_replacement(replacement),
                                  compile_options);
       } catch (std::invalid_argument const& error) {
         if (operation != regex_operation::REPLACE_WITH_BACKREFS) { throw; }
@@ -1110,28 +1129,25 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
         replacement      = literal_replacement("");
       }
     }
-    auto executor             = compiled.executor;
-    auto exact_ascii_literal  = std::move(compiled.exact_ascii_literal);
-    auto matcher              = std::move(compiled.nvvm_ir);
-    auto kernels              = std::vector<retained_kernel>{};
-    auto warp_literal_kernels = std::vector<retained_kernel>{};
-    auto cache_size_kernels   = std::vector<retained_kernel>{};
-    auto cache_emit_kernels   = std::vector<retained_kernel>{};
-    auto sample_kernels       = std::vector<retained_kernel>{};
-    auto cache_values         = size_type{0};
-    auto kernel_operation = replacement_operation ? regex_ir::operation_kind::REPLACE : internal;
+    auto executor            = compiled.executor;
+    auto exact_ascii_literal = std::move(compiled.exact_ascii_literal);
+    auto matcher             = std::move(compiled.nvvm_ir);
+    auto kernels             = std::array<std::optional<retained_kernel>, kernel_slot_count>{};
+    auto cache_values        = size_type{0};
+    auto kernel_operation    = replacement_operation ? regex_ir::operation_kind::REPLACE : internal;
 
-    auto add_pass = [&](auto&& make_wrapper, std::string_view name) {
+    auto add_pass = [&](kernel_role role, auto&& make_wrapper, std::string_view name) {
       for (auto offset64 : {false, true}) {
-        kernels.push_back(
-          compile_kernel(matcher, kernel_operation, executor, make_wrapper(offset64), name));
+        kernels[kernel_slot(role, offset64)] =
+          compile_kernel(matcher, kernel_operation, executor, make_wrapper(offset64), name);
       }
     };
-    auto add_output_offset_pass = [&](auto&& make_wrapper, std::string_view name) {
+    auto add_output_offset_pass = [&](
+                                    kernel_role role, auto&& make_wrapper, std::string_view name) {
       for (auto offset64 : {false, true}) {
         for (auto output_offset64 : {false, true}) {
-          kernels.push_back(compile_kernel(
-            matcher, kernel_operation, executor, make_wrapper(offset64, output_offset64), name));
+          kernels[kernel_slot(role, offset64, output_offset64)] = compile_kernel(
+            matcher, kernel_operation, executor, make_wrapper(offset64, output_offset64), name);
         }
       }
     };
@@ -1142,29 +1158,31 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
       case regex_operation::COUNT:
       case regex_operation::FIND:
         add_pass(
+          kernel_role::PRIMARY,
           [&](bool offset64) {
-            return regex_ir::nvvm::make_fixed_kernel(offset64, internal, KERNEL_ENTRY);
+            return detail::regex_jit::make_fixed_kernel(offset64, internal, KERNEL_ENTRY);
           },
           "cudf.experimental.regex.fixed");
         if (operation == regex_operation::CONTAINS) {
           if (exact_ascii_literal.has_value()) {
             for (auto offset64 : {false, true}) {
-              auto prepared    = compile_kernel(matcher,
+              auto prepared                                             = compile_kernel(matcher,
                                              internal,
                                              executor,
-                                             regex_ir::nvvm::make_warp_literal_contains_kernel(
+                                             detail::regex_jit::make_warp_literal_contains_kernel(
                                                offset64, *exact_ascii_literal, KERNEL_ENTRY),
                                              "cudf.experimental.regex.warp_literal_contains");
-              prepared.threads = 256;
-              warp_literal_kernels.push_back(std::move(prepared));
+              prepared.threads                                          = 256;
+              kernels[kernel_slot(kernel_role::WARP_LITERAL, offset64)] = std::move(prepared);
             }
           }
         }
         break;
       case regex_operation::EXTRACT:
         add_pass(
+          kernel_role::PRIMARY,
           [&](bool offset64) {
-            return regex_ir::nvvm::make_capture_kernel(
+            return detail::regex_jit::make_capture_kernel(
               offset64, (capture_count + 1) * 2, 0, capture_count, true, KERNEL_ENTRY);
           },
           "cudf.experimental.regex.extract");
@@ -1174,8 +1192,9 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
                      "extract_single requires a group in regex_jit_program_options");
         auto group = *program_options.group;
         add_pass(
+          kernel_role::PRIMARY,
           [&](bool offset64) {
-            return regex_ir::nvvm::make_capture_kernel(
+            return detail::regex_jit::make_capture_kernel(
               offset64, (capture_count + 1) * 2, group, 1, false, KERNEL_ENTRY);
           },
           "cudf.experimental.regex.extract_single");
@@ -1187,40 +1206,43 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
         auto groups  = captures == strings::capture_groups::EXTRACT ? capture_count : 0;
         auto slots   = (capture_count + 1) * 2;
         add_pass(
+          kernel_role::PRIMARY,
           [&](bool offset64) {
-            return regex_ir::nvvm::make_enumeration_size_kernel(
+            return detail::regex_jit::make_enumeration_size_kernel(
               offset64, slots, findall ? 1 : groups, !findall, false, KERNEL_ENTRY);
           },
           "cudf.experimental.regex.enumerate_size");
         add_pass(
+          kernel_role::EMIT,
           [&](bool offset64) {
-            return regex_ir::nvvm::make_enumeration_emit_kernel(
+            return detail::regex_jit::make_enumeration_emit_kernel(
               offset64, slots, groups, findall, false, KERNEL_ENTRY);
           },
           "cudf.experimental.regex.enumerate_emit");
         if (program_options.span_cache_policy != regex_jit_span_cache_policy::OFF) {
           cache_values = slots;
           for (auto offset64 : {false, true}) {
-            cache_size_kernels.push_back(
+            kernels[kernel_slot(kernel_role::CACHE_SIZE, offset64)] =
               compile_kernel(matcher,
                              kernel_operation,
                              executor,
-                             regex_ir::nvvm::make_enumeration_size_kernel(
+                             detail::regex_jit::make_enumeration_size_kernel(
                                offset64, slots, findall ? 1 : groups, !findall, true, KERNEL_ENTRY),
-                             "cudf.experimental.regex.enumerate_cache_size"));
-            cache_emit_kernels.push_back(
+                             "cudf.experimental.regex.enumerate_cache_size");
+            kernels[kernel_slot(kernel_role::CACHE_EMIT, offset64)] =
               compile_kernel(matcher,
                              kernel_operation,
                              executor,
-                             regex_ir::nvvm::make_enumeration_emit_kernel(
+                             detail::regex_jit::make_enumeration_emit_kernel(
                                offset64, slots, groups, findall, true, KERNEL_ENTRY),
-                             "cudf.experimental.regex.enumerate_overflow_emit"));
-            sample_kernels.push_back(compile_kernel(matcher,
-                                                    kernel_operation,
-                                                    executor,
-                                                    regex_ir::nvvm::make_span_cache_sample_kernel(
-                                                      offset64, false, slots, -1, KERNEL_ENTRY),
-                                                    "cudf.experimental.regex.enumerate_sample"));
+                             "cudf.experimental.regex.enumerate_overflow_emit");
+            kernels[kernel_slot(kernel_role::SAMPLE, offset64)] =
+              compile_kernel(matcher,
+                             kernel_operation,
+                             executor,
+                             detail::regex_jit::make_span_cache_sample_kernel(
+                               offset64, false, slots, -1, KERNEL_ENTRY),
+                             "cudf.experimental.regex.enumerate_sample");
           }
         }
         break;
@@ -1229,13 +1251,15 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
       case regex_operation::REPLACE_WITH_BACKREFS: {
         if (native_replace) {
           add_pass(
+            kernel_role::PRIMARY,
             [&](bool offset64) {
-              return regex_ir::nvvm::make_replace_kernel(offset64, false, false, KERNEL_ENTRY);
+              return detail::regex_jit::make_replace_kernel(offset64, false, false, KERNEL_ENTRY);
             },
             "cudf.experimental.regex.replace_size");
           add_output_offset_pass(
+            kernel_role::EMIT,
             [&](bool offset64, bool output_offset64) {
-              return regex_ir::nvvm::make_replace_kernel(
+              return detail::regex_jit::make_replace_kernel(
                 offset64, true, output_offset64, KERNEL_ENTRY);
             },
             "cudf.experimental.regex.replace_emit");
@@ -1248,41 +1272,45 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
                                                    : std::numeric_limits<size_type>::max();
         auto slots = (capture_count + 1) * 2;
         add_pass(
+          kernel_role::PRIMARY,
           [&](bool offset64) {
-            return regex_ir::nvvm::make_limited_replace_kernel(
+            return detail::regex_jit::make_limited_replace_kernel(
               offset64, false, false, false, replacement, slots, limit, KERNEL_ENTRY);
           },
           "cudf.experimental.regex.replace_size");
         add_output_offset_pass(
+          kernel_role::EMIT,
           [&](bool offset64, bool output_offset64) {
-            return regex_ir::nvvm::make_limited_replace_kernel(
+            return detail::regex_jit::make_limited_replace_kernel(
               offset64, true, output_offset64, false, replacement, slots, limit, KERNEL_ENTRY);
           },
           "cudf.experimental.regex.replace_emit");
         if (program_options.span_cache_policy != regex_jit_span_cache_policy::OFF) {
           cache_values = slots;
           for (auto offset64 : {false, true}) {
-            cache_size_kernels.push_back(compile_kernel(
+            kernels[kernel_slot(kernel_role::CACHE_SIZE, offset64)] = compile_kernel(
               matcher,
               kernel_operation,
               executor,
-              regex_ir::nvvm::make_limited_replace_kernel(
+              detail::regex_jit::make_limited_replace_kernel(
                 offset64, false, false, true, replacement, slots, limit, KERNEL_ENTRY),
-              "cudf.experimental.regex.replace_cache_size"));
-            sample_kernels.push_back(compile_kernel(matcher,
-                                                    kernel_operation,
-                                                    executor,
-                                                    regex_ir::nvvm::make_span_cache_sample_kernel(
-                                                      offset64, false, slots, limit, KERNEL_ENTRY),
-                                                    "cudf.experimental.regex.replace_sample"));
+              "cudf.experimental.regex.replace_cache_size");
+            kernels[kernel_slot(kernel_role::SAMPLE, offset64)] =
+              compile_kernel(matcher,
+                             kernel_operation,
+                             executor,
+                             detail::regex_jit::make_span_cache_sample_kernel(
+                               offset64, false, slots, limit, KERNEL_ENTRY),
+                             "cudf.experimental.regex.replace_sample");
             for (auto output_offset64 : {false, true}) {
-              cache_emit_kernels.push_back(compile_kernel(
-                matcher,
-                kernel_operation,
-                executor,
-                regex_ir::nvvm::make_limited_replace_kernel(
-                  offset64, true, output_offset64, true, replacement, slots, limit, KERNEL_ENTRY),
-                "cudf.experimental.regex.replace_cache_emit"));
+              kernels[kernel_slot(kernel_role::CACHE_EMIT, offset64, output_offset64)] =
+                compile_kernel(
+                  matcher,
+                  kernel_operation,
+                  executor,
+                  detail::regex_jit::make_limited_replace_kernel(
+                    offset64, true, output_offset64, true, replacement, slots, limit, KERNEL_ENTRY),
+                  "cudf.experimental.regex.replace_cache_emit");
             }
           }
         }
@@ -1295,56 +1323,50 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
         auto reverse =
           operation == regex_operation::RSPLIT || operation == regex_operation::RSPLIT_RECORD;
         add_pass(
+          kernel_role::PRIMARY,
           [&](bool offset64) {
-            return regex_ir::nvvm::make_split_size_kernel(
+            return detail::regex_jit::make_split_size_kernel(
               offset64, reverse ? -1 : program_options.maxsplit, false, KERNEL_ENTRY);
           },
           "cudf.experimental.regex.split_size");
         add_pass(
+          kernel_role::EMIT,
           [&](bool offset64) {
-            return regex_ir::nvvm::make_split_emit_kernel(
+            return detail::regex_jit::make_split_emit_kernel(
               offset64, reverse, program_options.maxsplit, false, KERNEL_ENTRY);
           },
           "cudf.experimental.regex.split_emit");
         if (program_options.span_cache_policy != regex_jit_span_cache_policy::OFF) {
           cache_values = 2;
           for (auto offset64 : {false, true}) {
-            cache_size_kernels.push_back(compile_kernel(
+            kernels[kernel_slot(kernel_role::CACHE_SIZE, offset64)] = compile_kernel(
               matcher,
               kernel_operation,
               executor,
-              regex_ir::nvvm::make_split_size_kernel(
+              detail::regex_jit::make_split_size_kernel(
                 offset64, reverse ? -1 : program_options.maxsplit, true, KERNEL_ENTRY),
-              "cudf.experimental.regex.split_cache_size"));
-            cache_emit_kernels.push_back(
+              "cudf.experimental.regex.split_cache_size");
+            kernels[kernel_slot(kernel_role::CACHE_EMIT, offset64)] =
               compile_kernel(matcher,
                              kernel_operation,
                              executor,
-                             regex_ir::nvvm::make_split_emit_kernel(
+                             detail::regex_jit::make_split_emit_kernel(
                                offset64, reverse, program_options.maxsplit, true, KERNEL_ENTRY),
-                             "cudf.experimental.regex.split_overflow_emit"));
-            sample_kernels.push_back(compile_kernel(
+                             "cudf.experimental.regex.split_overflow_emit");
+            kernels[kernel_slot(kernel_role::SAMPLE, offset64)] = compile_kernel(
               matcher,
               kernel_operation,
               executor,
-              regex_ir::nvvm::make_span_cache_sample_kernel(
+              detail::regex_jit::make_span_cache_sample_kernel(
                 offset64, true, 2, reverse ? -1 : program_options.maxsplit, KERNEL_ENTRY),
-              "cudf.experimental.regex.split_sample"));
+              "cudf.experimental.regex.split_sample");
           }
         }
         break;
       }
     }
-    _impl = std::make_unique<regex_jit_program_impl>(
-      regex_jit_program_impl{capture_count,
-                             std::move(kernels),
-                             std::move(cache_size_kernels),
-                             std::move(cache_emit_kernels),
-                             std::move(sample_kernels),
-                             std::move(warp_literal_kernels),
-                             executor,
-                             cache_values,
-                             std::move(validation_error)});
+    _impl = std::make_unique<regex_jit_program_impl>(regex_jit_program_impl{
+      capture_count, std::move(kernels), executor, cache_values, std::move(validation_error)});
   } catch (std::invalid_argument const& error) {
     CUDF_FAIL(error.what());
   }

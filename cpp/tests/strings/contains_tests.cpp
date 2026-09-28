@@ -610,6 +610,10 @@ TYPED_TEST(StringsContainsTests, NestedQuantifier)
 
 TYPED_TEST(StringsContainsTests, DeeplyNestedNoStackOverflow)
 {
+  if constexpr (!TypeParam::supports_unbounded_nesting) {
+    GTEST_SKIP() << "regex JIT compilation intentionally bounds parser nesting";
+  }
+
   // A pattern with very deep group nesting but only a single character-consuming
   // position.  It passes the Glushkov state cap (1 position) yet forces the
   // compiler's ε-closure traversal to walk a very long ε-chain.

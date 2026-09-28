@@ -3,8 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#define REGEX_IR_IMPLEMENTATION
-#include <regex_ir.hpp>
+#include "regex_ir_detail.hpp"
 
 #include <algorithm>
 #include <array>
@@ -197,7 +196,15 @@ inline constexpr unicode_data_range unicode_math_symbol_ranges[] = {
   {0x01d789U, 0x01d789U}, {0x01d7a9U, 0x01d7a9U}, {0x01d7c3U, 0x01d7c3U}, {0x01eef0U, 0x01eef1U},
 };
 
-struct parse_failure : std::exception {};
+struct compile_failure : std::exception {
+  compile_failure(source_span source, std::string message)
+    : source{source}, message{std::move(message)}
+  {
+  }
+
+  source_span source;
+  std::string message;
+};
 
 enum class node_kind : std::uint8_t {
   EMPTY       = 0,
@@ -400,26 +407,21 @@ class parser {
   std::unique_ptr<node> parse()
   {
     if (pattern_.size() > options_.limits.max_pattern_bytes) {
-      fail(
-        diagnostic_code::RESOURCE_LIMIT, {0, pattern_.size()}, "pattern exceeds max_pattern_bytes");
+      fail({0, pattern_.size()}, "pattern exceeds max_pattern_bytes");
     }
 
     auto expression = parse_alternation();
-    if (position_ != pattern_.size()) {
-      fail(diagnostic_code::UNEXPECTED_TOKEN, {position_, 1}, "unexpected token");
-    }
+    if (position_ != pattern_.size()) { fail({position_, 1}, "unexpected token"); }
 
     return expression;
   }
 
-  std::vector<diagnostic> diagnostics = std::vector<diagnostic>{};
-  std::uint32_t capture_count         = 0;
+  std::uint32_t capture_count = 0;
 
  private:
-  [[noreturn]] void fail(diagnostic_code code, source_span span, std::string message)
+  [[noreturn]] void fail(source_span span, std::string message)
   {
-    diagnostics.push_back({code, span, std::move(message)});
-    throw parse_failure{};
+    throw compile_failure{span, std::move(message)};
   }
 
   [[nodiscard]] bool at_end() const noexcept { return position_ >= pattern_.size(); }
@@ -428,9 +430,7 @@ class parser {
 
   char take()
   {
-    if (at_end()) {
-      fail(diagnostic_code::UNEXPECTED_END, {position_, 0}, "unexpected end of pattern");
-    }
+    if (at_end()) { fail({position_, 0}, "unexpected end of pattern"); }
     return pattern_[position_++];
   }
 
@@ -457,7 +457,7 @@ class parser {
       auto rhs       = parse_concatenation();
       auto alternate = make(node_kind::ALTERNATE, lhs->source.offset);
       if (lhs->kind == node_kind::EMPTY && rhs->kind == node_kind::EMPTY) {
-        fail(diagnostic_code::UNEXPECTED_TOKEN, {separator, 1}, "empty alternation");
+        fail({separator, 1}, "empty alternation");
       }
       alternate->children.push_back(std::move(lhs));
       alternate->children.push_back(std::move(rhs));
@@ -489,14 +489,10 @@ class parser {
       value = value * 10U + static_cast<unsigned>(take() - '0');
       ++count;
       if (value > options_.limits.max_repeat) {
-        fail(diagnostic_code::RESOURCE_LIMIT,
-             {position_ - count, count},
-             "repeat bound exceeds max_repeat");
+        fail({position_ - count, count}, "repeat bound exceeds max_repeat");
       }
     }
-    if (count == 0) {
-      fail(diagnostic_code::INVALID_QUANTIFIER, {position_, 0}, "expected repeat bound");
-    }
+    if (count == 0) { fail({position_, 0}, "expected repeat bound"); }
     return static_cast<std::uint32_t>(value);
   }
 
@@ -524,13 +520,9 @@ class parser {
       minimum = parse_decimal();
       maximum = minimum;
       if (consume(',')) { maximum = peek() == '}' ? unbounded_repeat : parse_decimal(); }
-      if (!consume('}')) {
-        fail(diagnostic_code::INVALID_QUANTIFIER, {position_, 0}, "unterminated quantifier");
-      }
+      if (!consume('}')) { fail({position_, 0}, "unterminated quantifier"); }
       if (maximum != unbounded_repeat && maximum < minimum) {
-        fail(diagnostic_code::INVALID_QUANTIFIER,
-             {start, position_ - start},
-             "repeat maximum is smaller than minimum");
+        fail({start, position_ - start}, "repeat maximum is smaller than minimum");
       }
     } else {
       quantified = false;
@@ -539,7 +531,7 @@ class parser {
     if (!quantified) { return atom; }
     auto greedy = !consume('?');
     if (peek() == '*' || peek() == '+' || peek() == '?' || peek() == '{') {
-      fail(diagnostic_code::INVALID_QUANTIFIER, {position_, 1}, "multiple repeat operators");
+      fail({position_, 1}, "multiple repeat operators");
     }
     if (is_unconditional_empty(*atom) && !contains_capture(*atom)) {
       // repeating an unconditional empty expression is still empty
@@ -547,9 +539,7 @@ class parser {
       return atom;
     }
     if (!can_consume_character(*atom)) {
-      fail(diagnostic_code::INVALID_QUANTIFIER,
-           {start, position_ - start},
-           "zero-width assertions cannot be repeated");
+      fail({start, position_ - start}, "zero-width assertions cannot be repeated");
     }
     auto result = make(node_kind::REPEAT, start);
     result->children.push_back(std::move(atom));
@@ -573,19 +563,17 @@ class parser {
     }
     std::size_t count = first < 0xE0U ? 2 : (first < 0xF0U ? 3 : 4);
     if (position_ + count > pattern_.size() || first < 0xC2U || first > 0xF4U) {
-      fail(diagnostic_code::INVALID_ESCAPE, {position_, 1}, "invalid UTF-8 in pattern");
+      fail({position_, 1}, "invalid UTF-8 in pattern");
     }
     char32_t value = first & (count == 2 ? 0x1FU : (count == 3 ? 0x0FU : 0x07U));
     for (std::size_t index = 1; index < count; ++index) {
       auto next = static_cast<unsigned char>(pattern_[position_ + index]);
-      if ((next & 0xC0U) != 0x80U) {
-        fail(diagnostic_code::INVALID_ESCAPE, {position_, count}, "invalid UTF-8 in pattern");
-      }
+      if ((next & 0xC0U) != 0x80U) { fail({position_, count}, "invalid UTF-8 in pattern"); }
       value = static_cast<char32_t>((value << 6U) | (next & 0x3FU));
     }
     if ((count == 3 && value < 0x800U) || (count == 4 && value < 0x10000U) || value > 0x10FFFFU ||
         (value >= 0xD800U && value <= 0xDFFFU)) {
-      fail(diagnostic_code::INVALID_ESCAPE, {position_, count}, "invalid UTF-8 scalar value");
+      fail({position_, count}, "invalid UTF-8 scalar value");
     }
     length = count;
     return value;
@@ -596,9 +584,7 @@ class parser {
     char32_t value{};
     for (std::size_t index = 0; index < digits; ++index) {
       if (at_end()) {
-        fail(diagnostic_code::INVALID_ESCAPE,
-             {escape_start, position_ - escape_start},
-             "truncated hexadecimal escape");
+        fail({escape_start, position_ - escape_start}, "truncated hexadecimal escape");
       }
       char const digit = take();
       value <<= 4U;
@@ -609,7 +595,7 @@ class parser {
       } else if (digit >= 'A' && digit <= 'F') {
         value |= static_cast<char32_t>(digit - 'A' + 10);
       } else {
-        fail(diagnostic_code::INVALID_ESCAPE, {position_ - 1, 1}, "invalid hexadecimal digit");
+        fail({position_ - 1, 1}, "invalid hexadecimal digit");
       }
     }
     return value;
@@ -693,7 +679,7 @@ class parser {
   std::unique_ptr<node> parse_escape(bool in_class)
   {
     auto start = position_ - 1;
-    if (at_end()) { fail(diagnostic_code::INVALID_ESCAPE, {start, 1}, "trailing backslash"); }
+    if (at_end()) { fail({start, 1}, "trailing backslash"); }
     char const value = take();
     if (!in_class &&
         (value == 'b' || value == 'B' || value == 'A' || value == 'Z' || value == 'z')) {
@@ -706,23 +692,13 @@ class parser {
     }
     auto result = make(node_kind::PREDICATE, start);
     if (value == 'p' || value == 'P') {
-      if (!consume('{')) {
-        fail(diagnostic_code::INVALID_ESCAPE, {start, position_ - start}, "missing property name");
-      }
+      if (!consume('{')) { fail({start, position_ - start}, "missing property name"); }
       auto property_begin = position_;
       while (!at_end() && peek() != '}')
         static_cast<void>(take());
-      if (!consume('}')) {
-        fail(diagnostic_code::INVALID_ESCAPE,
-             {start, position_ - start},
-             "unterminated Unicode property");
-      }
+      if (!consume('}')) { fail({start, position_ - start}, "unterminated Unicode property"); }
       auto property = pattern_.substr(property_begin, position_ - property_begin - 1U);
-      if (property != "Sm") {
-        fail(diagnostic_code::UNSUPPORTED_FEATURE,
-             {start, position_ - start},
-             "unsupported Unicode property");
-      }
+      if (property != "Sm") { fail({start, position_ - start}, "unsupported Unicode property"); }
       append_unicode_ranges(result->predicate, unicode_math_symbol_ranges);
       if (value == 'P') {
         result->predicate.ranges = complement_ranges(std::move(result->predicate.ranges));
@@ -735,13 +711,13 @@ class parser {
       if (std::isalpha(static_cast<unsigned char>(value)) != 0 && value != 'a' && value != 'b' &&
           value != 'f' && value != 'n' && value != 'r' && value != 't' && value != 'u' &&
           value != 'v' && value != 'x') {
-        fail(diagnostic_code::INVALID_ESCAPE, {start, 2}, "unknown alphabetic escape");
+        fail({start, 2}, "unknown alphabetic escape");
       }
       bool three_digit_octal = value >= '0' && value <= '7' && position_ + 1 < pattern_.size() &&
                                pattern_[position_] >= '0' && pattern_[position_] <= '7' &&
                                pattern_[position_ + 1] >= '0' && pattern_[position_ + 1] <= '7';
       if (value >= '1' && value <= '9' && !three_digit_octal) {
-        fail(diagnostic_code::UNSUPPORTED_FEATURE, {start, 2}, "backreferences are not supported");
+        fail({start, 2}, "backreferences are not supported");
       }
       auto literal = three_digit_octal ? parse_octal(value) : escaped_literal(value, start);
       if (options_.case_insensitive) {
@@ -778,16 +754,12 @@ class parser {
           ++position_;
         }
         if (position_ + 1U >= pattern_.size()) {
-          fail(diagnostic_code::INVALID_CHARACTER_CLASS,
-               {class_start, position_ - class_start},
-               "unterminated POSIX character class");
+          fail({class_start, position_ - class_start}, "unterminated POSIX character class");
         }
         auto name = pattern_.substr(name_start, position_ - name_start);
         position_ += 2U;
         if (!append_posix_class(result->predicate, name)) {
-          fail(diagnostic_code::UNSUPPORTED_FEATURE,
-               {class_start, position_ - class_start},
-               "unsupported POSIX character class");
+          fail({class_start, position_ - class_start}, "unsupported POSIX character class");
         }
         continue;
       }
@@ -814,9 +786,7 @@ class parser {
         if (consume('\\')) {
           auto escaped = parse_escape(true);
           if (!escaped->predicate.is_singleton()) {
-            fail(diagnostic_code::INVALID_CHARACTER_CLASS,
-                 {position_, 1},
-                 "range endpoint must be a literal");
+            fail({position_, 1}, "range endpoint must be a literal");
           }
           upper = escaped->predicate.singleton();
         } else {
@@ -824,11 +794,7 @@ class parser {
           upper = decode_literal(length);
           position_ += length;
         }
-        if (upper < lower) {
-          fail(diagnostic_code::INVALID_CHARACTER_CLASS,
-               {start, position_ - start},
-               "descending character range");
-        }
+        if (upper < lower) { fail({start, position_ - start}, "descending character range"); }
       }
       if (options_.case_insensitive) {
         add_case_pair(result->predicate, lower, upper);
@@ -836,15 +802,9 @@ class parser {
         result->predicate.ranges.push_back({lower, upper});
       }
     }
-    if (!closed) {
-      fail(diagnostic_code::INVALID_CHARACTER_CLASS,
-           {start, position_ - start},
-           "unterminated character class");
-    }
+    if (!closed) { fail({start, position_ - start}, "unterminated character class"); }
     if (result->predicate.ranges.empty()) {
-      fail(diagnostic_code::INVALID_CHARACTER_CLASS,
-           {start, position_ - start},
-           "empty character class");
+      fail({start, position_ - start}, "empty character class");
     }
     normalize_ranges(result->predicate);
     result->source.length = position_ - start;
@@ -861,26 +821,22 @@ class parser {
         if (consume(':')) {
           capturing = false;
         } else {
-          fail(diagnostic_code::UNSUPPORTED_FEATURE,
-               {start, position_ - start + 1},
+          fail({start, position_ - start + 1},
                "lookaround and inline group extensions are not supported");
         }
       }
       if (++depth_ > options_.limits.max_nesting) {
-        fail(diagnostic_code::RESOURCE_LIMIT, {start, 1}, "group nesting exceeds max_nesting");
+        fail({start, 1}, "group nesting exceeds max_nesting");
       }
       std::uint32_t capture{};
       if (capturing) {
         if (capture_count >= options_.limits.max_captures) {
-          fail(diagnostic_code::RESOURCE_LIMIT, {start, 1}, "capture count exceeds max_captures");
+          fail({start, 1}, "capture count exceeds max_captures");
         }
         capture = ++capture_count;
       }
       auto child = parse_alternation();
-      if (!consume(')')) {
-        fail(
-          diagnostic_code::UNMATCHED_PARENTHESIS, {start, position_ - start}, "unterminated group");
-      }
+      if (!consume(')')) { fail({start, position_ - start}, "unterminated group"); }
       --depth_;
       auto group = make(node_kind::GROUP, start);
       group->children.push_back(std::move(child));
@@ -904,7 +860,7 @@ class parser {
     }
     if (value == ')' || value == '|' || value == '*' || value == '+' || value == '?' ||
         (value == '{' && std::isdigit(static_cast<unsigned char>(peek())) != 0)) {
-      fail(diagnostic_code::UNEXPECTED_TOKEN, {start, 1}, "unexpected metacharacter");
+      fail({start, 1}, "unexpected metacharacter");
     }
 
     --position_;
@@ -945,9 +901,7 @@ class thompson_builder {
     ir.options = options;
   }
 
-  automata_ir ir                      = automata_ir{};
-  std::vector<diagnostic> diagnostics = std::vector<diagnostic>{};
-
+  automata_ir ir = automata_ir{};
   fragment build(node const& expression)
   {
     switch (expression.kind) {
@@ -956,9 +910,7 @@ class thompson_builder {
       case node_kind::ASSERTION: return make_assertion(expression);
       case node_kind::GROUP: return make_group(expression);
       case node_kind::CONCATENATE: return make_concatenate(expression);
-      case node_kind::ALTERNATE:
-        ir.has_alternation = true;
-        return make_alternate(expression);
+      case node_kind::ALTERNATE: ir.has_alternation = true; return make_alternate(expression);
       case node_kind::REPEAT:
         ir.has_lazy_quantifier = ir.has_lazy_quantifier || !expression.greedy;
         return make_repeat(expression);
@@ -981,9 +933,7 @@ class thompson_builder {
   state_id add_state(automata_state_kind kind, source_span source)
   {
     if (ir.states.size() >= ir.options.limits.max_states) {
-      diagnostics.push_back(
-        {diagnostic_code::RESOURCE_LIMIT, source, "state count exceeds max_states"});
-      throw parse_failure{};
+      throw compile_failure{source, "state count exceeds max_states"};
     }
     auto id = static_cast<state_id>(ir.states.size());
     automata_state state;
@@ -997,10 +947,7 @@ class thompson_builder {
   std::size_t add_edge(state_id from, state_id to, std::uint32_t priority)
   {
     if (transition_count_ >= ir.options.limits.max_transitions) {
-      diagnostics.push_back({diagnostic_code::RESOURCE_LIMIT,
-                             ir.states[from].source,
-                             "transition count exceeds limit"});
-      throw parse_failure{};
+      throw compile_failure{ir.states[from].source, "transition count exceeds limit"};
     }
     ++transition_count_;
     ir.states[from].edges.push_back({to, priority});
@@ -1122,10 +1069,8 @@ class thompson_builder {
   {
     auto& repeated = *expression.children.front();
     if (expression.maximum == unbounded_repeat && can_match_empty(repeated)) {
-      diagnostics.push_back({diagnostic_code::INVALID_QUANTIFIER,
-                             expression.source,
-                             "unbounded repetition of a nullable expression is not supported"});
-      throw parse_failure{};
+      throw compile_failure{expression.source,
+                            "unbounded repetition of a nullable expression is not supported"};
     }
     std::optional<fragment> result;
     auto append = [&](fragment next) {
@@ -1185,1644 +1130,65 @@ char32_t character_predicate::singleton() const noexcept
   return is_singleton() ? ranges.front().first : U'\0';
 }
 
-std::vector<diagnostic> verify(automata_ir const& ir)
+void verify(automata_ir const& ir)
 {
-  std::vector<diagnostic> result;
-  auto invalid = [&](source_span span, std::string message) {
-    result.push_back({diagnostic_code::INVALID_AUTOMATA_IR, span, std::move(message)});
-  };
+  auto invalid = [](std::string_view message) { throw std::logic_error(std::string{message}); };
 
-  if (ir.entry >= ir.states.size()) invalid({}, "entry state is invalid");
-  if (ir.accept >= ir.states.size()) invalid({}, "accept state is invalid");
+  if (ir.entry >= ir.states.size()) invalid("entry state is invalid");
+  if (ir.accept >= ir.states.size()) invalid("accept state is invalid");
 
   for (std::size_t index = 0; index < ir.states.size(); ++index) {
     auto& state = ir.states[index];
-    if (state.id != index) invalid(state.source, "state ID does not match storage index");
+    if (state.id != index) invalid("state ID does not match storage index");
 
     for (auto edge : state.edges) {
-      if (edge.target >= ir.states.size()) invalid(state.source, "edge target is invalid");
+      if (edge.target >= ir.states.size()) invalid("edge target is invalid");
     }
 
     if (state.kind == automata_state_kind::ACCEPT && !state.edges.empty()) {
-      invalid(state.source, "accept state has outgoing edges");
+      invalid("accept state has outgoing edges");
     }
     if (state.kind == automata_state_kind::CONSUME && state.edges.size() != 1) {
-      invalid(state.source, "consume state must have one edge");
+      invalid("consume state must have one edge");
     }
     if ((state.kind == automata_state_kind::JUMP || state.kind == automata_state_kind::ASSERTION ||
          state.kind == automata_state_kind::CAPTURE) &&
         state.edges.size() != 1) {
-      invalid(state.source, "linear epsilon state must have one edge");
+      invalid("linear epsilon state must have one edge");
     }
     if (state.kind == automata_state_kind::BRANCH && state.edges.size() < 2) {
-      invalid(state.source, "branch state must have at least two edges");
+      invalid("branch state must have at least two edges");
     }
     if (state.kind == automata_state_kind::CAPTURE &&
         (state.capture_index == 0 || state.capture_index > ir.capture_count)) {
-      invalid(state.source, "capture index is out of range");
+      invalid("capture index is out of range");
     }
   }
-
-  return result;
 }
 
-automata_result compile_automata(std::string_view pattern, compile_options const& options)
+automata_ir compile_automata(std::string_view pattern, compile_options const& options)
 {
   parser parse_pattern(pattern, options);
-  std::unique_ptr<node> expression;
-  try {
-    expression = parse_pattern.parse();
-  } catch (parse_failure const&) {
-    return {std::nullopt, std::move(parse_pattern.diagnostics)};
-  }
+  auto expression = parse_pattern.parse();
 
   thompson_builder builder(pattern, options);
-  try {
-    auto fragment = builder.build(*expression);
-    builder.finish(std::move(fragment), parse_pattern.capture_count);
-  } catch (parse_failure const&) {
-    auto diagnostics = std::move(builder.diagnostics);
-    diagnostics.insert(
-      diagnostics.end(), parse_pattern.diagnostics.begin(), parse_pattern.diagnostics.end());
-    return {std::nullopt, std::move(diagnostics)};
-  }
-
-  auto diagnostics = verify(builder.ir);
-  if (!diagnostics.empty()) { return {std::nullopt, std::move(diagnostics)}; }
-  return {std::move(builder.ir), {}};
+  auto fragment = builder.build(*expression);
+  builder.finish(std::move(fragment), parse_pattern.capture_count);
+  verify(builder.ir);
+  return std::move(builder.ir);
 }
 
 }  // namespace regex_ir
-
-namespace regex_ir::nvvm {
-namespace {
-
-void replace_all(std::string& text, std::string_view from, std::string_view to)
-{
-  for (auto position = text.find(from); position != std::string::npos;
-       position      = text.find(from, position + to.size())) {
-    text.replace(position, from.size(), to);
-  }
-}
-
-std::string common_nvvm(bool offset64, bool pairs)
-{
-  std::string result = R"NVVM(
-declare i32 @llvm.nvvm.read.ptx.sreg.tid.x() nounwind readnone
-declare i32 @llvm.nvvm.read.ptx.sreg.ntid.x() nounwind readnone
-declare i32 @llvm.nvvm.read.ptx.sreg.ctaid.x() nounwind readnone
-
-define internal i32 @libregex_ir_row_index() alwaysinline nounwind readnone {
-entry:
-  %thread = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
-  %width = call i32 @llvm.nvvm.read.ptx.sreg.ntid.x()
-  %block = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
-  %base = mul i32 %block, %width
-  %row = add i32 %base, %thread
-  ret i32 %row
-}
-
-define internal i1 @libregex_ir_is_valid(i32* %mask, i32 %row) alwaysinline nounwind readonly {
-entry:
-  %all_valid = icmp eq i32* %mask, null
-  br i1 %all_valid, label %yes, label %check
-check:
-  %word_index = lshr i32 %row, 5
-  %word_ptr = getelementptr i32, i32* %mask, i32 %word_index
-  %word = load i32, i32* %word_ptr, align 4
-  %bit_index = and i32 %row, 31
-  %shifted = lshr i32 %word, %bit_index
-  %bit = and i32 %shifted, 1
-  %valid = icmp ne i32 %bit, 0
-  ret i1 %valid
-yes:
-  ret i1 true
-}
-
-define internal i64 @libregex_ir_load_offset(i8* %offsets, i32 %index) alwaysinline nounwind readonly {
-entry:
-  %typed = bitcast i8* %offsets to @OFFSET_TYPE@*
-  %ptr = getelementptr @OFFSET_TYPE@, @OFFSET_TYPE@* %typed, i32 %index
-  %raw = load @OFFSET_TYPE@, @OFFSET_TYPE@* %ptr, align @OFFSET_ALIGN@
-  %value = @OFFSET_EXTEND@ @OFFSET_TYPE@ %raw to i64
-  ret i64 %value
-}
-
-define internal i64 @libregex_ir_advance_utf8(i8* %data, i64 %size, i64 %position) alwaysinline nounwind readonly {
-entry:
-  %at_end = icmp uge i64 %position, %size
-  br i1 %at_end, label %done, label %read
-read:
-  %ptr = getelementptr i8, i8* %data, i64 %position
-  %byte = load i8, i8* %ptr, align 1
-  %unsigned = zext i8 %byte to i32
-  %ascii = icmp ult i32 %unsigned, 128
-  %two_test = and i32 %unsigned, 224
-  %is_two = icmp eq i32 %two_test, 192
-  %three_test = and i32 %unsigned, 240
-  %is_three = icmp eq i32 %three_test, 224
-  %wide = select i1 %is_three, i64 3, i64 4
-  %non_ascii = select i1 %is_two, i64 2, i64 %wide
-  %width = select i1 %ascii, i64 1, i64 %non_ascii
-  %advanced = add i64 %position, %width
-  %clamped_test = icmp ult i64 %advanced, %size
-  %clamped = select i1 %clamped_test, i64 %advanced, i64 %size
-  ret i64 %clamped
-done:
-  ret i64 %size
-}
-)NVVM";
-  replace_all(result, "@OFFSET_TYPE@", offset64 ? "i64" : "i32");
-  replace_all(result, "@OFFSET_ALIGN@", offset64 ? "8" : "4");
-  replace_all(result, "@OFFSET_EXTEND@", offset64 ? "add i64 0," : "sext");
-  if (offset64) {
-    replace_all(result, "%value = add i64 0, i64 %raw to i64", "%value = add i64 %raw, 0");
-  }
-  if (pairs) {
-    result += R"NVVM(
-%libregex_ir_pair = type { i8*, i32 }
-
-define internal void @libregex_ir_write_pair(%libregex_ir_pair* %output, i64 %index, i8* %data, i8* %empty, i64 %begin, i64 %end, i1 %present) alwaysinline nounwind {
-entry:
-  %size64 = sub i64 %end, %begin
-  %size = trunc i64 %size64 to i32
-  %data_ptr = getelementptr i8, i8* %data, i64 %begin
-  %is_empty = icmp eq i64 %size64, 0
-  %empty_ptr = select i1 %is_empty, i8* %empty, i8* %data_ptr
-  %pointer = select i1 %present, i8* %empty_ptr, i8* null
-  %stored_size = select i1 %present, i32 %size, i32 0
-  %pair_ptr = getelementptr %libregex_ir_pair, %libregex_ir_pair* %output, i64 %index
-  %pointer_ptr = getelementptr %libregex_ir_pair, %libregex_ir_pair* %pair_ptr, i32 0, i32 0
-  %size_ptr = getelementptr %libregex_ir_pair, %libregex_ir_pair* %pair_ptr, i32 0, i32 1
-  store i8* %pointer, i8** %pointer_ptr, align 8
-  store i32 %stored_size, i32* %size_ptr, align 4
-  ret void
-}
-)NVVM";
-  }
-  return result;
-}
-
-void require_kernel_name(std::string_view kernel_name)
-{
-  auto first_is_valid = [](unsigned char character) {
-    return std::isalpha(character) != 0 || character == '_';
-  };
-  auto rest_is_valid = [&](unsigned char character) {
-    return first_is_valid(character) || std::isdigit(character) != 0;
-  };
-  if (kernel_name.empty() || !first_is_valid(static_cast<unsigned char>(kernel_name.front())) ||
-      !std::all_of(kernel_name.begin() + 1, kernel_name.end(), [&](char character) {
-        return rest_is_valid(static_cast<unsigned char>(character));
-      })) {
-    throw std::invalid_argument("kernel_name must be a valid source identifier");
-  }
-  if (kernel_name.starts_with("llvm.") || kernel_name.starts_with("nvvm.")) {
-    throw std::invalid_argument("kernel_name uses a reserved identifier");
-  }
-}
-
-std::string annotate_kernel(std::string module,
-                            std::string_view signature,
-                            std::string_view kernel_name)
-{
-  require_kernel_name(kernel_name);
-  replace_all(module, "@KERNEL_ENTRY@", std::format("@{}", kernel_name));
-  module += std::format(
-    "\n@llvm.used = appending global [1 x i8*] [i8* bitcast (void ({})* "
-    "@{} to i8*)], section \"llvm.metadata\"\n",
-    signature,
-    kernel_name);
-  module += "\n!nvvm.annotations = !{!900000}\n";
-  module +=
-    std::format("!900000 = !{{void ({})* @{}, !\"kernel\", i32 1}}\n", signature, kernel_name);
-  return module;
-}
-
-}  // namespace
-
-std::string assemble(std::string matcher, std::string wrapper)
-{
-  auto metadata = matcher.find("\n!nvvmir.version");
-  if (metadata == std::string::npos) {
-    throw std::invalid_argument("generated regex NVVM IR has no version metadata");
-  }
-  matcher.insert(metadata, std::move(wrapper));
-  return matcher;
-}
-
-std::string make_warp_literal_contains_kernel(bool offset64,
-                                              std::string_view literal,
-                                              std::string_view kernel_name)
-{
-  if (literal.empty()) { throw std::invalid_argument("literal must not be empty"); }
-  auto comparisons = std::string{};
-  auto matched     = std::string{};
-  auto offset      = std::size_t{1};
-  auto index       = std::size_t{0};
-  while (offset < literal.size()) {
-    auto remaining      = literal.size() - offset;
-    auto width          = remaining >= 8U ? 8U : remaining >= 4U ? 4U : remaining >= 2U ? 2U : 1U;
-    std::uint64_t value = 0;
-    for (std::size_t byte = 0; byte < width; ++byte) {
-      value |= static_cast<std::uint64_t>(static_cast<std::uint8_t>(literal[offset + byte]))
-               << (byte * 8U);
-    }
-    auto bits = width * 8U;
-    std::format_to(std::back_inserter(comparisons),
-                   "  %literal_ptr_{0} = getelementptr i8, i8* %data, i64 %literal_offset_{0}\n",
-                   index);
-    if (width == 1U) {
-      std::format_to(std::back_inserter(comparisons),
-                     "  %literal_chunk_{0} = load i8, i8* %literal_ptr_{0}, align 1\n",
-                     index);
-    } else {
-      std::format_to(std::back_inserter(comparisons),
-                     "  %literal_chunk_ptr_{0} = bitcast i8* %literal_ptr_{0} to i{1}*\n"
-                     "  %literal_chunk_{0} = load i{1}, i{1}* %literal_chunk_ptr_{0}, align 1\n",
-                     index,
-                     bits);
-    }
-    std::format_to(std::back_inserter(comparisons),
-                   "  %literal_equal_{0} = icmp eq i{1} %literal_chunk_{0}, {2}\n",
-                   index,
-                   bits,
-                   value);
-    if (matched.empty()) {
-      matched = std::format("%literal_equal_{}", index);
-    } else {
-      std::format_to(std::back_inserter(comparisons),
-                     "  %literal_through_{0} = and i1 {1}, %literal_equal_{0}\n",
-                     index,
-                     matched);
-      matched = std::format("%literal_through_{}", index);
-    }
-    offset += width;
-    ++index;
-  }
-
-  auto offsets = std::string{};
-  offset       = 1;
-  for (std::size_t chunk = 0; chunk < index; ++chunk) {
-    std::format_to(std::back_inserter(offsets),
-                   "  %literal_offset_{0} = add i64 %position, {1}\n",
-                   chunk,
-                   offset);
-    auto remaining = literal.size() - offset;
-    offset += remaining >= 8U ? 8U : remaining >= 4U ? 4U : remaining >= 2U ? 2U : 1U;
-  }
-
-  auto verify = literal.size() == 1U
-                  ? std::string{"  br i1 %first_equal, label %local_yes, label %inner_continue\n"}
-                  : std::format(
-                      R"NVVM(  br i1 %first_equal, label %verify, label %inner_continue
-verify:
-{0}{1}  br i1 {2}, label %local_yes, label %inner_continue
-)NVVM",
-                      offsets,
-                      comparisons,
-                      matched);
-
-  auto result = common_nvvm(offset64, false);
-  result += std::format(
-    R"NVVM(
-declare i1 @llvm.nvvm.vote.any.sync(i32, i1) nounwind convergent
-
-define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output) nounwind {{
-entry:
-  %thread = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
-  %width = call i32 @llvm.nvvm.read.ptx.sreg.ntid.x()
-  %block = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
-  %base = mul i32 %block, %width
-  %global = add i32 %base, %thread
-  %lane = and i32 %thread, 31
-  %row = lshr i32 %global, 5
-  %in_bounds = icmp slt i32 %row, %rows
-  br i1 %in_bounds, label %work, label %done
-work:
-  %physical = add i32 %row_offset, %row
-  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
-  %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
-  %next = add i32 %physical, 1
-  %end = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %next)
-  %size = sub i64 %end, %begin
-  %data = getelementptr i8, i8* %chars, i64 %begin
-  %lane64 = zext i32 %lane to i64
-  %lane_base = mul nuw i64 %lane64, 4
-  br label %search
-search:
-  %round = phi i64 [ 0, %work ], [ %next_round, %continue ]
-  %first_round = icmp eq i64 %round, 0
-  %round_lane = select i1 %first_round, i64 %lane64, i64 %lane_base
-  %candidate_limit = select i1 %first_round, i64 1, i64 4
-  %lane_position = add i64 %round, %round_lane
-  br label %inner
-inner:
-  %candidate_offset = phi i64 [ 0, %search ], [ %next_candidate, %inner_continue ]
-  %position = add i64 %lane_position, %candidate_offset
-  %candidate_end = add i64 %position, {0}
-  %candidate = icmp ule i64 %candidate_end, %size
-  br i1 %candidate, label %compare, label %inner_done
-compare:
-  %first_ptr = getelementptr i8, i8* %data, i64 %position
-  %first = load i8, i8* %first_ptr, align 1
-  %first_equal = icmp eq i8 %first, {1}
-{2}inner_continue:
-  %next_candidate = add nuw i64 %candidate_offset, 1
-  %more_candidates = icmp ult i64 %next_candidate, %candidate_limit
-  br i1 %more_candidates, label %inner, label %inner_done
-local_yes:
-  br label %inner_done
-inner_done:
-  %local_match = phi i1 [ true, %local_yes ], [ false, %inner ], [ false, %inner_continue ]
-  br label %vote
-vote:
-  %warp_match = call i1 @llvm.nvvm.vote.any.sync(i32 -1, i1 %local_match)
-  br i1 %warp_match, label %store_true, label %continue
-continue:
-  %later_round = add i64 %round, 128
-  %next_round = select i1 %first_round, i64 32, i64 %later_round
-  %round_possible = icmp ult i64 %next_round, %size
-  br i1 %round_possible, label %search, label %store_false
-store_true:
-  br label %store
-store_false:
-  br label %store
-store:
-  %value = phi i8 [ 1, %store_true ], [ 0, %store_false ]
-  %lane_zero = icmp eq i32 %lane, 0
-  %write = and i1 %lane_zero, %valid
-  br i1 %write, label %write_value, label %done
-write_value:
-  %out = getelementptr i8, i8* %output, i32 %row
-  store i8 %value, i8* %out, align 1
-  br label %done
-done:
-  ret void
-}}
-)NVVM",
-    literal.size(),
-    static_cast<std::uint32_t>(static_cast<std::uint8_t>(literal.front())),
-    verify);
-  return annotate_kernel(std::move(result), "i8*, i8*, i32*, i32, i32, i8*", kernel_name);
-}
-
-std::string make_fixed_kernel(bool offset64,
-                              regex_ir::operation_kind operation,
-                              std::string_view kernel_name)
-{
-  auto result = common_nvvm(offset64, false);
-  if (operation == regex_ir::operation_kind::CONTAINS) {
-    result += R"NVVM(
-define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output) nounwind {
-entry:
-  %row = call i32 @libregex_ir_row_index()
-  %in_bounds = icmp slt i32 %row, %rows
-  br i1 %in_bounds, label %work, label %done
-work:
-  %physical = add i32 %row_offset, %row
-  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
-  br i1 %valid, label %match, label %store_false
-match:
-  %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
-  %next = add i32 %physical, 1
-  %end = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %next)
-  %size = sub i64 %end, %begin
-  %data = getelementptr i8, i8* %chars, i64 %begin
-  %matched = call i1 @regex_ir_execute(i8* %data, i64 %size)
-  %value = zext i1 %matched to i8
-  br label %store
-store_false:
-  br label %store
-store:
-  %result = phi i8 [ %value, %match ], [ 0, %store_false ]
-  %out = getelementptr i8, i8* %output, i32 %row
-  store i8 %result, i8* %out, align 1
-  br label %done
-done:
-  ret void
-}
-)NVVM";
-  } else if (operation == regex_ir::operation_kind::COUNT) {
-    result += R"NVVM(
-define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output) nounwind {
-entry:
-  %row = call i32 @libregex_ir_row_index()
-  %in_bounds = icmp slt i32 %row, %rows
-  br i1 %in_bounds, label %work, label %done
-work:
-  %physical = add i32 %row_offset, %row
-  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
-  br i1 %valid, label %count, label %store_zero
-count:
-  %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
-  %next = add i32 %physical, 1
-  %end = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %next)
-  %size = sub i64 %end, %begin
-  %data = getelementptr i8, i8* %chars, i64 %begin
-  %count64 = call i64 @regex_ir_execute(i8* %data, i64 %size)
-  %value = trunc i64 %count64 to i32
-  br label %store
-store_zero:
-  br label %store
-store:
-  %result = phi i32 [ %value, %count ], [ 0, %store_zero ]
-  %typed_output = bitcast i8* %output to i32*
-  %out = getelementptr i32, i32* %typed_output, i32 %row
-  store i32 %result, i32* %out, align 4
-  br label %done
-done:
-  ret void
-}
-)NVVM";
-  } else {
-    result += R"NVVM(
-define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output) nounwind {
-entry:
-  %span = alloca [2 x i64], align 8
-  %row = call i32 @libregex_ir_row_index()
-  %in_bounds = icmp slt i32 %row, %rows
-  br i1 %in_bounds, label %work, label %done
-work:
-  %physical = add i32 %row_offset, %row
-  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
-  br i1 %valid, label %find, label %store_missing
-find:
-  %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
-  %next = add i32 %physical, 1
-  %end = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %next)
-  %size = sub i64 %end, %begin
-  %data = getelementptr i8, i8* %chars, i64 %begin
-  %span_ptr = getelementptr [2 x i64], [2 x i64]* %span, i32 0, i32 0
-  %matched = call i1 @regex_ir_execute(i8* %data, i64 %size, i64* %span_ptr)
-  br i1 %matched, label %convert, label %store_missing
-convert:
-  %match_begin = load i64, i64* %span_ptr, align 8
-  br label %utf8_loop
-utf8_loop:
-  %position = phi i64 [ 0, %convert ], [ %advanced, %utf8_loop ]
-  %characters = phi i32 [ 0, %convert ], [ %next_characters, %utf8_loop ]
-  %at_match = icmp uge i64 %position, %match_begin
-  %advanced = call i64 @libregex_ir_advance_utf8(i8* %data, i64 %size, i64 %position)
-  %next_characters = add i32 %characters, 1
-  br i1 %at_match, label %store_found, label %utf8_loop
-store_found:
-  br label %store
-store_missing:
-  br label %store
-store:
-  %result = phi i32 [ %characters, %store_found ], [ -1, %store_missing ]
-  %typed_output = bitcast i8* %output to i32*
-  %out = getelementptr i32, i32* %typed_output, i32 %row
-  store i32 %result, i32* %out, align 4
-  br label %done
-done:
-  ret void
-}
-)NVVM";
-  }
-  return annotate_kernel(std::move(result), "i8*, i8*, i32*, i32, i32, i8*", kernel_name);
-}
-
-std::string make_capture_kernel(bool offset64,
-                                std::int32_t capture_slots,
-                                std::int32_t first_group,
-                                std::int32_t output_groups,
-                                bool column_major,
-                                std::string_view kernel_name)
-{
-  auto result = common_nvvm(offset64, true);
-  result += R"NVVM(
-define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output) nounwind {
-entry:
-  %captures = alloca [@CAPTURE_SLOTS@ x i64], align 8
-  %row = call i32 @libregex_ir_row_index()
-  %in_bounds = icmp slt i32 %row, %rows
-  br i1 %in_bounds, label %work, label %done
-work:
-  %physical = add i32 %row_offset, %row
-  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
-  br i1 %valid, label %match, label %output_begin
-match:
-  %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
-  %next = add i32 %physical, 1
-  %end = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %next)
-  %size = sub i64 %end, %begin
-  %data = getelementptr i8, i8* %chars, i64 %begin
-  %capture_ptr = getelementptr [@CAPTURE_SLOTS@ x i64], [@CAPTURE_SLOTS@ x i64]* %captures, i32 0, i32 0
-  %matched = call i1 @regex_ir_execute(i8* %data, i64 %size, i64 0, i64* %capture_ptr)
-  br label %output_begin
-output_begin:
-  %row_data = phi i8* [ %data, %match ], [ %chars, %work ]
-  %row_matched = phi i1 [ %matched, %match ], [ false, %work ]
-  %typed_output = bitcast i8* %output to %libregex_ir_pair*
-  br label %group_loop
-group_loop:
-  %group = phi i32 [ 0, %output_begin ], [ %next_group, %group_done ]
-  br i1 %row_matched, label %group_found, label %group_missing
-group_found:
-  %capture_group = add i32 %group, @FIRST_GROUP@
-  %capture_plus_whole = add i32 %capture_group, 1
-  %capture_slot = shl i32 %capture_plus_whole, 1
-  %capture_begin_ptr = getelementptr [@CAPTURE_SLOTS@ x i64], [@CAPTURE_SLOTS@ x i64]* %captures, i32 0, i32 %capture_slot
-  %capture_end_slot = add i32 %capture_slot, 1
-  %capture_end_ptr = getelementptr [@CAPTURE_SLOTS@ x i64], [@CAPTURE_SLOTS@ x i64]* %captures, i32 0, i32 %capture_end_slot
-  %capture_begin = load i64, i64* %capture_begin_ptr, align 8
-  %capture_end = load i64, i64* %capture_end_ptr, align 8
-  %has_begin = icmp sge i64 %capture_begin, 0
-  %has_end = icmp sge i64 %capture_end, 0
-  %present = and i1 %has_begin, %has_end
-  br label %group_write
-group_missing:
-  br label %group_write
-group_write:
-  %stored_begin = phi i64 [ %capture_begin, %group_found ], [ 0, %group_missing ]
-  %stored_end = phi i64 [ %capture_end, %group_found ], [ 0, %group_missing ]
-  %stored_present = phi i1 [ %present, %group_found ], [ false, %group_missing ]
-  %group64 = sext i32 %group to i64
-  @PAIR_INDEX@
-  call void @libregex_ir_write_pair(%libregex_ir_pair* %typed_output, i64 %pair_index, i8* %row_data, i8* %offsets, i64 %stored_begin, i64 %stored_end, i1 %stored_present)
-  br label %group_done
-group_done:
-  %next_group = add i32 %group, 1
-  %finished = icmp eq i32 %next_group, @OUTPUT_GROUPS@
-  br i1 %finished, label %done, label %group_loop
-done:
-  ret void
-}
-)NVVM";
-  replace_all(result, "@CAPTURE_SLOTS@", std::to_string(capture_slots));
-  replace_all(result, "@FIRST_GROUP@", std::to_string(first_group));
-  replace_all(result, "@OUTPUT_GROUPS@", std::to_string(output_groups));
-  replace_all(result,
-              "@PAIR_INDEX@",
-              column_major ? "%group_base = mul i64 %group64, %rows64\n  %row64 = sext i32 %row to "
-                             "i64\n  %pair_index = add i64 %group_base, %row64"
-                           : "%pair_index = sext i32 %row to i64");
-  if (column_major) {
-    replace_all(result,
-                "%typed_output = bitcast i8* %output to %libregex_ir_pair*",
-                "%typed_output = bitcast i8* %output to %libregex_ir_pair*\n  %rows64 = sext i32 "
-                "%rows to i64");
-  }
-  return annotate_kernel(std::move(result), "i8*, i8*, i32*, i32, i32, i8*", kernel_name);
-}
-
-std::string capture_cache_helpers();
-
-std::string make_enumeration_size_kernel(bool offset64,
-                                         std::int32_t capture_slots,
-                                         std::int32_t multiplier,
-                                         bool require_match,
-                                         bool cache,
-                                         std::string_view kernel_name)
-{
-  auto result = common_nvvm(offset64, false);
-  if (cache) { result += capture_cache_helpers(); }
-  result += R"NVVM(
-define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output, i8* %output_validity) nounwind {
-entry:
-  %captures = alloca [@CAPTURE_SLOTS@ x i64], align 8
-  %row = call i32 @libregex_ir_row_index()
-  %in_bounds = icmp slt i32 %row, %rows
-  br i1 %in_bounds, label %work, label %done
-work:
-  %physical = add i32 %row_offset, %row
-  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
-  br i1 %valid, label %setup, label %store_invalid
-setup:
-  %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
-  %next = add i32 %physical, 1
-  %end = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %next)
-  %size = sub i64 %end, %begin
-  %data = getelementptr i8, i8* %chars, i64 %begin
-  %capture_ptr = getelementptr [@CAPTURE_SLOTS@ x i64], [@CAPTURE_SLOTS@ x i64]* %captures, i32 0, i32 0
-  br label %match_loop
-match_loop:
-  %search = phi i64 [ 0, %setup ], [ %match_end, %continue_nonempty ], [ %advanced, %continue_empty ]
-  %count = phi i64 [ 0, %setup ], [ %next_count, %continue_nonempty ], [ %next_count, %continue_empty ]
-  %matched = call i1 @regex_ir_execute(i8* %data, i64 %size, i64 %search, i64* %capture_ptr)
-  br i1 %matched, label %found, label %store_count
-found:
-  %match_begin_ptr = getelementptr [@CAPTURE_SLOTS@ x i64], [@CAPTURE_SLOTS@ x i64]* %captures, i32 0, i32 0
-  %match_end_ptr = getelementptr [@CAPTURE_SLOTS@ x i64], [@CAPTURE_SLOTS@ x i64]* %captures, i32 0, i32 1
-  %match_begin = load i64, i64* %match_begin_ptr, align 8
-  %match_end = load i64, i64* %match_end_ptr, align 8
-  %next_count = add i64 %count, 1
-  %nonempty = icmp ne i64 %match_begin, %match_end
-  br i1 %nonempty, label %continue_nonempty, label %empty
-continue_nonempty:
-  br label %match_loop
-empty:
-  %empty_at_end = icmp eq i64 %match_end, %size
-  br i1 %empty_at_end, label %store_after_match, label %continue_empty
-continue_empty:
-  %advanced = call i64 @libregex_ir_advance_utf8(i8* %data, i64 %size, i64 %match_end)
-  br label %match_loop
-store_after_match:
-  br label %store
-store_count:
-  br label %store
-store_invalid:
-  br label %store
-store:
-  %matches = phi i64 [ %next_count, %store_after_match ], [ %count, %store_count ], [ 0, %store_invalid ]
-  %scaled = mul i64 %matches, @MULTIPLIER@
-  %stored_count = trunc i64 %scaled to i32
-  %typed_output = bitcast i8* %output to i32*
-  %out = getelementptr i32, i32* %typed_output, i32 %row
-  store i32 %stored_count, i32* %out, align 4
-  %has_match = icmp ne i64 %matches, 0
-  %row_valid = @ROW_VALID@
-  %valid_byte = zext i1 %row_valid to i8
-  %valid_out = getelementptr i8, i8* %output_validity, i32 %row
-  store i8 %valid_byte, i8* %valid_out, align 1
-  br label %done
-done:
-  ret void
-}
-)NVVM";
-  if (cache) {
-    replace_all(result,
-                "i8* %output, i8* %output_validity) nounwind {",
-                "i8* %output, i8* %output_validity, i8* %cache_buffer, i32 %capacity, i8* "
-                "%overflow) nounwind {");
-    replace_all(
-      result,
-      "  %match_end = load i64, i64* %match_end_ptr, align 8\n  %next_count =",
-      std::format(
-        "  %match_end = load i64, i64* %match_end_ptr, align 8\n  %typed_cache = bitcast i8* "
-        "%cache_buffer to i64*\n  %overflow_ptr = getelementptr i8, i8* %overflow, i32 %row\n  "
-        "call void @libregex_ir_cache_captures(i64* %capture_ptr, i64* %typed_cache, i32 %row, i32 "
-        "%capacity, i32 {}, i64 %count, i8* %overflow_ptr)\n  %next_count =",
-        capture_slots));
-  }
-  replace_all(result, "@CAPTURE_SLOTS@", std::to_string(capture_slots));
-  replace_all(result, "@MULTIPLIER@", std::to_string(multiplier));
-  replace_all(
-    result, "@ROW_VALID@", require_match ? "and i1 %valid, %has_match" : "and i1 %valid, true");
-  return annotate_kernel(std::move(result),
-                         cache ? "i8*, i8*, i32*, i32, i32, i8*, i8*, i8*, i32, i8*"
-                               : "i8*, i8*, i32*, i32, i32, i8*, i8*",
-                         kernel_name);
-}
-
-std::string make_enumeration_emit_kernel(bool offset64,
-                                         std::int32_t capture_slots,
-                                         std::int32_t groups,
-                                         bool findall,
-                                         bool overflow_only,
-                                         std::string_view kernel_name)
-{
-  auto result = common_nvvm(offset64, true);
-  result += R"NVVM(
-define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output, i8* %output_offsets) nounwind {
-entry:
-  %captures = alloca [@CAPTURE_SLOTS@ x i64], align 8
-  %row = call i32 @libregex_ir_row_index()
-  %in_bounds = icmp slt i32 %row, %rows
-  br i1 %in_bounds, label %work, label %done
-work:
-  %physical = add i32 %row_offset, %row
-  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
-  br i1 %valid, label %setup, label %done
-setup:
-  %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
-  %next = add i32 %physical, 1
-  %end = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %next)
-  %size = sub i64 %end, %begin
-  %data = getelementptr i8, i8* %chars, i64 %begin
-  %capture_ptr = getelementptr [@CAPTURE_SLOTS@ x i64], [@CAPTURE_SLOTS@ x i64]* %captures, i32 0, i32 0
-  %typed_offsets = bitcast i8* %output_offsets to i32*
-  %row_output_ptr = getelementptr i32, i32* %typed_offsets, i32 %row
-  %row_output = load i32, i32* %row_output_ptr, align 4
-  %row_output64 = sext i32 %row_output to i64
-  %typed_output = bitcast i8* %output to %libregex_ir_pair*
-  br label %match_loop
-match_loop:
-  %search = phi i64 [ 0, %setup ], [ %match_end, %continue_nonempty ], [ %advanced, %continue_empty ]
-  %output_index = phi i64 [ 0, %setup ], [ %next_output_index, %continue_nonempty ], [ %next_output_index, %continue_empty ]
-  %matched = call i1 @regex_ir_execute(i8* %data, i64 %size, i64 %search, i64* %capture_ptr)
-  br i1 %matched, label %found, label %done
-found:
-  %match_begin_ptr = getelementptr [@CAPTURE_SLOTS@ x i64], [@CAPTURE_SLOTS@ x i64]* %captures, i32 0, i32 0
-  %match_end_ptr = getelementptr [@CAPTURE_SLOTS@ x i64], [@CAPTURE_SLOTS@ x i64]* %captures, i32 0, i32 1
-  %match_begin = load i64, i64* %match_begin_ptr, align 8
-  %match_end = load i64, i64* %match_end_ptr, align 8
-  @WRITE_MATCH@
-after_write:
-  %nonempty = icmp ne i64 %match_begin, %match_end
-  br i1 %nonempty, label %continue_nonempty, label %empty
-continue_nonempty:
-  br label %match_loop
-empty:
-  %empty_at_end = icmp eq i64 %match_end, %size
-  br i1 %empty_at_end, label %done, label %continue_empty
-continue_empty:
-  %advanced = call i64 @libregex_ir_advance_utf8(i8* %data, i64 %size, i64 %match_end)
-  br label %match_loop
-done:
-  ret void
-}
-)NVVM";
-  if (overflow_only) {
-    replace_all(result,
-                "i8* %output, i8* %output_offsets) nounwind {",
-                "i8* %output, i8* %output_offsets, i8* %overflow) nounwind {");
-    replace_all(
-      result,
-      "  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)\n  br i1 %valid, "
-      "label %setup, label %done",
-      "  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)\n  %overflow_ptr = "
-      "getelementptr i8, i8* %overflow, i32 %row\n  %overflow_value = load i8, i8* %overflow_ptr, "
-      "align 1\n  %did_overflow = icmp ne i8 %overflow_value, 0\n  %selected = and i1 %valid, "
-      "%did_overflow\n  br i1 %selected, label %setup, label %done");
-  }
-  auto write_findall =
-    groups == 0
-      ? R"NVVM(%selected_begin = add i64 %match_begin, 0
-  %selected_end = add i64 %match_end, 0
-  %present = icmp sge i64 %selected_begin, 0
-  %pair_index = add i64 %row_output64, %output_index
-  call void @libregex_ir_write_pair(%libregex_ir_pair* %typed_output, i64 %pair_index, i8* %data, i8* %offsets, i64 %selected_begin, i64 %selected_end, i1 %present)
-  %next_output_index = add i64 %output_index, 1
-  br label %after_write)NVVM"
-      : R"NVVM(%selected_begin_ptr = getelementptr [@CAPTURE_SLOTS@ x i64], [@CAPTURE_SLOTS@ x i64]* %captures, i32 0, i32 2
-  %selected_end_ptr = getelementptr [@CAPTURE_SLOTS@ x i64], [@CAPTURE_SLOTS@ x i64]* %captures, i32 0, i32 3
-  %selected_begin = load i64, i64* %selected_begin_ptr, align 8
-  %selected_end = load i64, i64* %selected_end_ptr, align 8
-  %has_begin = icmp sge i64 %selected_begin, 0
-  %has_end = icmp sge i64 %selected_end, 0
-  %present = and i1 %has_begin, %has_end
-  %pair_index = add i64 %row_output64, %output_index
-  call void @libregex_ir_write_pair(%libregex_ir_pair* %typed_output, i64 %pair_index, i8* %data, i8* %offsets, i64 %selected_begin, i64 %selected_end, i1 %present)
-  %next_output_index = add i64 %output_index, 1
-  br label %after_write)NVVM";
-  auto write_extract = R"NVVM(br label %group_loop
-group_loop:
-  %group = phi i32 [ 0, %found ], [ %next_group, %group_write ]
-  %capture_plus_whole = add i32 %group, 1
-  %capture_slot = shl i32 %capture_plus_whole, 1
-  %capture_begin_ptr = getelementptr [@CAPTURE_SLOTS@ x i64], [@CAPTURE_SLOTS@ x i64]* %captures, i32 0, i32 %capture_slot
-  %capture_end_slot = add i32 %capture_slot, 1
-  %capture_end_ptr = getelementptr [@CAPTURE_SLOTS@ x i64], [@CAPTURE_SLOTS@ x i64]* %captures, i32 0, i32 %capture_end_slot
-  %capture_begin = load i64, i64* %capture_begin_ptr, align 8
-  %capture_end = load i64, i64* %capture_end_ptr, align 8
-  %has_begin = icmp sge i64 %capture_begin, 0
-  %has_end = icmp sge i64 %capture_end, 0
-  %present = and i1 %has_begin, %has_end
-  %group64 = sext i32 %group to i64
-  %group_output = add i64 %output_index, %group64
-  %pair_index = add i64 %row_output64, %group_output
-  call void @libregex_ir_write_pair(%libregex_ir_pair* %typed_output, i64 %pair_index, i8* %data, i8* %offsets, i64 %capture_begin, i64 %capture_end, i1 %present)
-  br label %group_write
-group_write:
-  %next_group = add i32 %group, 1
-  %groups_done = icmp eq i32 %next_group, @GROUPS@
-  br i1 %groups_done, label %groups_finished, label %group_loop
-groups_finished:
-  %next_output_index = add i64 %output_index, @GROUPS@
-  br label %after_write)NVVM";
-  replace_all(result, "@WRITE_MATCH@", findall ? write_findall : write_extract);
-  replace_all(result, "@CAPTURE_SLOTS@", std::to_string(capture_slots));
-  replace_all(result, "@GROUPS@", std::to_string(groups));
-  return annotate_kernel(std::move(result),
-                         overflow_only ? "i8*, i8*, i32*, i32, i32, i8*, i8*, i8*"
-                                       : "i8*, i8*, i32*, i32, i32, i8*, i8*",
-                         kernel_name);
-}
-
-namespace {
-
-std::string llvm_bytes(std::string_view value)
-{
-  std::string result;
-  result.reserve(value.size() * 3);
-  for (auto character : value) {
-    result += std::format("\\{:02X}", static_cast<unsigned char>(character));
-  }
-  return result;
-}
-
-}  // namespace
-
-std::string capture_cache_helpers()
-{
-  return R"NVVM(
-define internal void @libregex_ir_cache_captures(i64* %captures, i64* %cache, i32 %row, i32 %capacity, i32 %values, i64 %match, i8* %overflow) nounwind {
-entry:
-  %missing = icmp eq i64* %cache, null
-  br i1 %missing, label %done, label %check_capacity
-check_capacity:
-  %capacity64 = zext i32 %capacity to i64
-  %fits = icmp ult i64 %match, %capacity64
-  br i1 %fits, label %copy_setup, label %mark_overflow
-mark_overflow:
-  store i8 1, i8* %overflow, align 1
-  br label %done
-copy_setup:
-  %row64 = zext i32 %row to i64
-  %values64 = zext i32 %values to i64
-  %row_matches = mul i64 %row64, %capacity64
-  %record = add i64 %row_matches, %match
-  %base = mul i64 %record, %values64
-  br label %copy_loop
-copy_loop:
-  %slot = phi i32 [ 0, %copy_setup ], [ %next_slot, %copy_loop ]
-  %slot64 = zext i32 %slot to i64
-  %source = getelementptr i64, i64* %captures, i64 %slot64
-  %value = load i64, i64* %source, align 8
-  %index = add i64 %base, %slot64
-  %destination = getelementptr i64, i64* %cache, i64 %index
-  store i64 %value, i64* %destination, align 8
-  %next_slot = add i32 %slot, 1
-  %finished = icmp eq i32 %next_slot, %values
-  br i1 %finished, label %done, label %copy_loop
-done:
-  ret void
-}
-)NVVM";
-}
-
-std::string make_limited_replace_kernel(bool offset64,
-                                        bool emit,
-                                        bool output_offset64,
-                                        bool cache,
-                                        std::span<replacement_piece const> replacement,
-                                        std::int32_t capture_slots,
-                                        std::int32_t max_replace_count,
-                                        std::string_view kernel_name)
-{
-  auto result = common_nvvm(offset64, false);
-  if (cache) { result += capture_cache_helpers(); }
-  for (std::size_t index = 0; index < replacement.size(); ++index) {
-    auto& literal = replacement[index].literal;
-    if (!literal.empty()) {
-      result +=
-        std::format("\n@libregex_ir_replacement_{0} = private constant [{1} x i8] c\"{2}\"\n",
-                    index,
-                    literal.size(),
-                    llvm_bytes(literal));
-    }
-  }
-  result += R"NVVM(
-declare void @llvm.memcpy.p0i8.p0i8.i64(i8*, i8*, i64, i1)
-
-define internal i64 @libregex_ir_append_range(i8* %source, i64 %begin, i64 %end, i8* %output, i64 %cursor) alwaysinline nounwind {
-entry:
-  %length = sub i64 %end, %begin
-  %next_cursor = add i64 %cursor, %length
-  %output_missing = icmp eq i8* %output, null
-  %empty = icmp eq i64 %length, 0
-  %skip = or i1 %output_missing, %empty
-  br i1 %skip, label %done, label %copy
-copy:
-  %source_ptr = getelementptr i8, i8* %source, i64 %begin
-  %output_ptr = getelementptr i8, i8* %output, i64 %cursor
-  call void @llvm.memcpy.p0i8.p0i8.i64(i8* align 1 %output_ptr, i8* align 1 %source_ptr, i64 %length, i1 false)
-  br label %done
-done:
-  ret i64 %next_cursor
-}
-)NVVM";
-
-  std::string steps;
-  auto cursor = std::string{"%cursor_unmatched"};
-  for (std::size_t index = 0; index < replacement.size(); ++index) {
-    auto& piece      = replacement[index];
-    auto next_cursor = std::format("%cursor_piece_{}", index);
-    if (piece.capture.has_value()) {
-      auto slot = static_cast<std::int64_t>(*piece.capture) * 2;
-      steps += std::format(
-        R"NVVM(  %capture_begin_ptr_{0} = getelementptr i64, i64* %captures, i64 {2}
-  %capture_end_ptr_{0} = getelementptr i64, i64* %captures, i64 {3}
-  %capture_begin_{0} = load i64, i64* %capture_begin_ptr_{0}, align 8
-  %capture_end_{0} = load i64, i64* %capture_end_ptr_{0}, align 8
-  %capture_has_begin_{0} = icmp sge i64 %capture_begin_{0}, 0
-  %capture_has_end_{0} = icmp sge i64 %capture_end_{0}, 0
-  %capture_present_{0} = and i1 %capture_has_begin_{0}, %capture_has_end_{0}
-  %capture_selected_begin_{0} = select i1 %capture_present_{0}, i64 %capture_begin_{0}, i64 0
-  %capture_selected_end_{0} = select i1 %capture_present_{0}, i64 %capture_end_{0}, i64 0
-  {4} = call i64 @libregex_ir_append_range(i8* %data, i64 %capture_selected_begin_{0}, i64 %capture_selected_end_{0}, i8* %output, i64 {5})
-)NVVM",
-        index,
-        capture_slots,
-        slot,
-        slot + 1,
-        next_cursor,
-        cursor);
-    } else if (!piece.literal.empty()) {
-      steps += std::format(
-        R"NVVM(  %literal_{0} = getelementptr [{1} x i8], [{1} x i8]* @libregex_ir_replacement_{0}, i32 0, i32 0
-  {2} = call i64 @libregex_ir_append_range(i8* %literal_{0}, i64 0, i64 {1}, i8* %output, i64 {3})
-)NVVM",
-        index,
-        piece.literal.size(),
-        next_cursor,
-        cursor);
-    } else {
-      continue;
-    }
-    cursor = std::move(next_cursor);
-  }
-  steps += std::format("  %replacement_cursor = add i64 {}, 0\n", cursor);
-
-  result += R"NVVM(
-define internal i64 @libregex_ir_replace_execute(i8* %data, i64 %size, i8* %output) nounwind {
-entry:
-  %capture_array = alloca [@CAPTURE_SLOTS@ x i64], align 8
-  %captures = getelementptr [@CAPTURE_SLOTS@ x i64], [@CAPTURE_SLOTS@ x i64]* %capture_array, i32 0, i32 0
-  br label %loop
-loop:
-  %search_start = phi i64 [ 0, %entry ], [ %match_end, %continue_nonempty ], [ %advanced_start, %continue_empty ]
-  %copied = phi i64 [ 0, %entry ], [ %match_end, %continue_nonempty ], [ %match_end, %continue_empty ]
-  %cursor = phi i64 [ 0, %entry ], [ %replacement_cursor, %continue_nonempty ], [ %replacement_cursor, %continue_empty ]
-  %replacement_count = phi i64 [ 0, %entry ], [ %next_replacement_count, %continue_nonempty ], [ %next_replacement_count, %continue_empty ]
-  %limit_reached = @LIMIT_REACHED@
-  br i1 %limit_reached, label %finish_limit, label %search
-search:
-  %matched = call i1 @regex_ir_execute(i8* %data, i64 %size, i64 %search_start, i64* %captures)
-  br i1 %matched, label %found, label %no_match
-found:
-  %match_begin_ptr = getelementptr [@CAPTURE_SLOTS@ x i64], [@CAPTURE_SLOTS@ x i64]* %capture_array, i32 0, i32 0
-  %match_end_ptr = getelementptr [@CAPTURE_SLOTS@ x i64], [@CAPTURE_SLOTS@ x i64]* %capture_array, i32 0, i32 1
-  %match_begin = load i64, i64* %match_begin_ptr, align 8
-  %match_end = load i64, i64* %match_end_ptr, align 8
-  %cursor_unmatched = call i64 @libregex_ir_append_range(i8* %data, i64 %copied, i64 %match_begin, i8* %output, i64 %cursor)
-@REPLACEMENT_STEPS@  %next_replacement_count = add i64 %replacement_count, 1
-  %nonempty = icmp ne i64 %match_begin, %match_end
-  br i1 %nonempty, label %continue_nonempty, label %empty
-continue_nonempty:
-  br label %loop
-empty:
-  %empty_at_end = icmp eq i64 %match_end, %size
-  br i1 %empty_at_end, label %finish_empty, label %continue_empty
-continue_empty:
-  %advanced_start = call i64 @libregex_ir_advance_utf8(i8* %data, i64 %size, i64 %match_end)
-  br label %loop
-finish_limit:
-  br label %finish
-no_match:
-  br label %finish
-finish_empty:
-  br label %finish
-finish:
-  %tail_begin = phi i64 [ %copied, %finish_limit ], [ %copied, %no_match ], [ %match_end, %finish_empty ]
-  %tail_cursor = phi i64 [ %cursor, %finish_limit ], [ %cursor, %no_match ], [ %replacement_cursor, %finish_empty ]
-  %final_cursor = call i64 @libregex_ir_append_range(i8* %data, i64 %tail_begin, i64 %size, i8* %output, i64 %tail_cursor)
-  ret i64 %final_cursor
-}
-)NVVM";
-  if (cache) {
-    replace_all(
-      result,
-      "define internal i64 @libregex_ir_replace_execute(i8* %data, i64 %size, i8* %output) "
-      "nounwind {",
-      "define internal i64 @libregex_ir_replace_execute(i8* %data, i64 %size, i8* %output, i64* "
-      "%cache, i32 %row, i32 %capacity, i8* %overflow, i32* %count_out) nounwind {");
-    replace_all(
-      result,
-      "  %match_end = load i64, i64* %match_end_ptr, align 8\n  %cursor_unmatched =",
-      std::format(
-        "  %match_end = load i64, i64* %match_end_ptr, align 8\n  call void "
-        "@libregex_ir_cache_captures(i64* %captures, i64* %cache, i32 %row, i32 %capacity, i32 {}, "
-        "i64 %replacement_count, i8* %overflow)\n  %cursor_unmatched =",
-        capture_slots));
-    replace_all(
-      result,
-      "  %final_cursor = call i64 @libregex_ir_append_range(i8* %data, i64 %tail_begin, i64 %size, "
-      "i8* %output, i64 %tail_cursor)\n  ret i64 %final_cursor",
-      "  %final_count = phi i64 [ %replacement_count, %finish_limit ], [ %replacement_count, "
-      "%no_match ], [ %next_replacement_count, %finish_empty ]\n  %stored_count = trunc i64 "
-      "%final_count to i32\n  store i32 %stored_count, i32* %count_out, align 4\n  %final_cursor = "
-      "call i64 @libregex_ir_append_range(i8* %data, i64 %tail_begin, i64 %size, i8* %output, i64 "
-      "%tail_cursor)\n  ret i64 %final_cursor");
-    result += R"NVVM(
-define internal i64 @libregex_ir_replace_cached(i8* %data, i64 %size, i8* %output, i64* %cache, i32 %row, i32 %capacity, i32 %match_count) nounwind {
-entry:
-  %row64 = zext i32 %row to i64
-  %capacity64 = zext i32 %capacity to i64
-  %slots64 = zext i32 @CAPTURE_SLOTS@ to i64
-  %row_records = mul i64 %row64, %capacity64
-  %row_base = mul i64 %row_records, %slots64
-  br label %loop
-loop:
-  %match = phi i32 [ 0, %entry ], [ %next_match, %copy_match ]
-  %copied = phi i64 [ 0, %entry ], [ %match_end, %copy_match ]
-  %cursor = phi i64 [ 0, %entry ], [ %replacement_cursor, %copy_match ]
-  %finished = icmp eq i32 %match, %match_count
-  br i1 %finished, label %finish, label %copy_match
-copy_match:
-  %match64 = zext i32 %match to i64
-  %record_offset = mul i64 %match64, %slots64
-  %capture_offset = add i64 %row_base, %record_offset
-  %captures = getelementptr i64, i64* %cache, i64 %capture_offset
-  %match_begin_ptr = getelementptr i64, i64* %captures, i64 0
-  %match_end_ptr = getelementptr i64, i64* %captures, i64 1
-  %match_begin = load i64, i64* %match_begin_ptr, align 8
-  %match_end = load i64, i64* %match_end_ptr, align 8
-  %cursor_unmatched = call i64 @libregex_ir_append_range(i8* %data, i64 %copied, i64 %match_begin, i8* %output, i64 %cursor)
-@REPLACEMENT_STEPS@  %next_match = add i32 %match, 1
-  br label %loop
-finish:
-  %final_cursor = call i64 @libregex_ir_append_range(i8* %data, i64 %copied, i64 %size, i8* %output, i64 %cursor)
-  ret i64 %final_cursor
-}
-)NVVM";
-  }
-  replace_all(result, "@CAPTURE_SLOTS@", std::to_string(capture_slots));
-  replace_all(result, "@REPLACEMENT_STEPS@", steps);
-  replace_all(result,
-              "@LIMIT_REACHED@",
-              std::format("icmp uge i64 %replacement_count, {}", max_replace_count));
-
-  auto output_offset_type   = output_offset64 ? std::string{"i64"} : std::string{"i32"};
-  auto output_offset_align  = output_offset64 ? std::string{"8"} : std::string{"4"};
-  auto extend_output_offset = output_offset64
-                                ? std::string{"%output_offset64 = add i64 %output_offset, 0"}
-                                : std::string{"%output_offset64 = sext i32 %output_offset to i64"};
-
-  result += emit ? R"NVVM(
-define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output, i8* %output_offsets) nounwind {
-entry:
-  %row = call i32 @libregex_ir_row_index()
-  %in_bounds = icmp slt i32 %row, %rows
-  br i1 %in_bounds, label %work, label %done
-work:
-  %physical = add i32 %row_offset, %row
-  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
-  br i1 %valid, label %replace, label %done
-replace:
-  %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
-  %next = add i32 %physical, 1
-  %end = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %next)
-  %size = sub i64 %end, %begin
-  %data = getelementptr i8, i8* %chars, i64 %begin
-  %typed_output_offsets = bitcast i8* %output_offsets to @OUTPUT_OFFSET_TYPE@*
-  %output_offset_ptr = getelementptr @OUTPUT_OFFSET_TYPE@, @OUTPUT_OFFSET_TYPE@* %typed_output_offsets, i32 %row
-  %output_offset = load @OUTPUT_OFFSET_TYPE@, @OUTPUT_OFFSET_TYPE@* %output_offset_ptr, align @OUTPUT_OFFSET_ALIGN@
-  @EXTEND_OUTPUT_OFFSET@
-  %output_ptr = getelementptr i8, i8* %output, i64 %output_offset64
-  %written = call i64 @libregex_ir_replace_execute(i8* %data, i64 %size, i8* %output_ptr)
-  br label %done
-done:
-  ret void
-}
-)NVVM"
-                 : R"NVVM(
-define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output, i32* %size_overflow) nounwind {
-entry:
-  %row = call i32 @libregex_ir_row_index()
-  %in_bounds = icmp slt i32 %row, %rows
-  br i1 %in_bounds, label %work, label %done
-work:
-  %physical = add i32 %row_offset, %row
-  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
-  br i1 %valid, label %replace, label %store_zero
-replace:
-  %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
-  %next = add i32 %physical, 1
-  %end = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %next)
-  %size = sub i64 %end, %begin
-  %data = getelementptr i8, i8* %chars, i64 %begin
-  %result_size = call i64 @libregex_ir_replace_execute(i8* %data, i64 %size, i8* null)
-  %too_large = icmp ugt i64 %result_size, 2147483647
-  br i1 %too_large, label %mark_overflow, label %size_fits
-mark_overflow:
-  %overflow_old = atomicrmw max i32* %size_overflow, i32 1 monotonic
-  br label %size_fits
-size_fits:
-  %stored_size = trunc i64 %result_size to i32
-  br label %store
-store_zero:
-  br label %store
-store:
-  %value = phi i32 [ %stored_size, %size_fits ], [ 0, %store_zero ]
-  %typed_output = bitcast i8* %output to i32*
-  %out = getelementptr i32, i32* %typed_output, i32 %row
-  store i32 %value, i32* %out, align 4
-  br label %done
-done:
-  ret void
-}
-)NVVM";
-  if (cache) {
-    auto kernel_position = result.rfind("define void @KERNEL_ENTRY@");
-    result.resize(kernel_position);
-    result +=
-      emit
-        ? R"NVVM(define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output, i8* %output_offsets, i8* %cache_buffer, i32 %capacity, i8* %overflow, i8* %match_counts) nounwind {
-entry:
-  %dummy_count = alloca i32, align 4
-  %row = call i32 @libregex_ir_row_index()
-  %in_bounds = icmp slt i32 %row, %rows
-  br i1 %in_bounds, label %work, label %done
-work:
-  %physical = add i32 %row_offset, %row
-  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
-  br i1 %valid, label %replace, label %done
-replace:
-  %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
-  %next = add i32 %physical, 1
-  %end = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %next)
-  %size = sub i64 %end, %begin
-  %data = getelementptr i8, i8* %chars, i64 %begin
-  %typed_output_offsets = bitcast i8* %output_offsets to @OUTPUT_OFFSET_TYPE@*
-  %output_offset_ptr = getelementptr @OUTPUT_OFFSET_TYPE@, @OUTPUT_OFFSET_TYPE@* %typed_output_offsets, i32 %row
-  %output_offset = load @OUTPUT_OFFSET_TYPE@, @OUTPUT_OFFSET_TYPE@* %output_offset_ptr, align @OUTPUT_OFFSET_ALIGN@
-  @EXTEND_OUTPUT_OFFSET@
-  %output_ptr = getelementptr i8, i8* %output, i64 %output_offset64
-  %overflow_ptr = getelementptr i8, i8* %overflow, i32 %row
-  %row_overflow = load i8, i8* %overflow_ptr, align 1
-  %did_overflow = icmp ne i8 %row_overflow, 0
-  br i1 %did_overflow, label %rematch, label %cached
-rematch:
-  %rematched = call i64 @libregex_ir_replace_execute(i8* %data, i64 %size, i8* %output_ptr, i64* null, i32 %row, i32 %capacity, i8* %overflow_ptr, i32* %dummy_count)
-  br label %done
-cached:
-  %typed_cache = bitcast i8* %cache_buffer to i64*
-  %typed_counts = bitcast i8* %match_counts to i32*
-  %count_ptr = getelementptr i32, i32* %typed_counts, i32 %row
-  %match_count = load i32, i32* %count_ptr, align 4
-  %written = call i64 @libregex_ir_replace_cached(i8* %data, i64 %size, i8* %output_ptr, i64* %typed_cache, i32 %row, i32 %capacity, i32 %match_count)
-  br label %done
-done:
-  ret void
-}
-)NVVM"
-        : R"NVVM(define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output, i8* %cache_buffer, i32 %capacity, i8* %overflow, i8* %match_counts, i32* %size_overflow) nounwind {
-entry:
-  %typed_counts = bitcast i8* %match_counts to i32*
-  %row = call i32 @libregex_ir_row_index()
-  %in_bounds = icmp slt i32 %row, %rows
-  br i1 %in_bounds, label %work, label %done
-work:
-  %physical = add i32 %row_offset, %row
-  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
-  br i1 %valid, label %replace, label %store_zero
-replace:
-  %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
-  %next = add i32 %physical, 1
-  %end = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %next)
-  %size = sub i64 %end, %begin
-  %data = getelementptr i8, i8* %chars, i64 %begin
-  %typed_cache = bitcast i8* %cache_buffer to i64*
-  %overflow_ptr = getelementptr i8, i8* %overflow, i32 %row
-  %count_ptr = getelementptr i32, i32* %typed_counts, i32 %row
-  %result_size = call i64 @libregex_ir_replace_execute(i8* %data, i64 %size, i8* null, i64* %typed_cache, i32 %row, i32 %capacity, i8* %overflow_ptr, i32* %count_ptr)
-  %too_large = icmp ugt i64 %result_size, 2147483647
-  br i1 %too_large, label %mark_overflow, label %size_fits
-mark_overflow:
-  %overflow_old = atomicrmw max i32* %size_overflow, i32 1 monotonic
-  br label %size_fits
-size_fits:
-  %stored_size = trunc i64 %result_size to i32
-  br label %store
-store_zero:
-  %invalid_count_ptr = getelementptr i32, i32* %typed_counts, i32 %row
-  store i32 0, i32* %invalid_count_ptr, align 4
-  br label %store
-store:
-  %value = phi i32 [ %stored_size, %size_fits ], [ 0, %store_zero ]
-  %typed_output = bitcast i8* %output to i32*
-  %out = getelementptr i32, i32* %typed_output, i32 %row
-  store i32 %value, i32* %out, align 4
-  br label %done
-done:
-  ret void
-}
-)NVVM";
-  }
-  replace_all(result, "@OUTPUT_OFFSET_TYPE@", output_offset_type);
-  replace_all(result, "@OUTPUT_OFFSET_ALIGN@", output_offset_align);
-  replace_all(result, "@EXTEND_OUTPUT_OFFSET@", extend_output_offset);
-  return annotate_kernel(
-    std::move(result),
-    cache ? (emit ? "i8*, i8*, i32*, i32, i32, i8*, i8*, i8*, i32, i8*, i8*"
-                  : "i8*, i8*, i32*, i32, i32, i8*, i8*, i32, i8*, i8*, i32*")
-          : (emit ? "i8*, i8*, i32*, i32, i32, i8*, i8*" : "i8*, i8*, i32*, i32, i32, i8*, i32*"),
-    kernel_name);
-}
-
-std::string encode_replacement(std::span<replacement_piece const> replacement)
-{
-  std::string result;
-  for (auto& piece : replacement) {
-    if (piece.capture.has_value()) {
-      result += std::format("${{{}}}", *piece.capture);
-      continue;
-    }
-    for (auto character : piece.literal) {
-      result.push_back(character);
-      if (character == '$') { result.push_back('$'); }
-    }
-  }
-  return result;
-}
-
-std::string make_replace_kernel(bool offset64,
-                                bool emit,
-                                bool output_offset64,
-                                std::string_view kernel_name)
-{
-  auto result = common_nvvm(offset64, false);
-  result += emit ? R"NVVM(
-define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output, i8* %output_offsets) nounwind {
-entry:
-  %row = call i32 @libregex_ir_row_index()
-  %in_bounds = icmp slt i32 %row, %rows
-  br i1 %in_bounds, label %work, label %done
-work:
-  %physical = add i32 %row_offset, %row
-  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
-  br i1 %valid, label %replace, label %done
-replace:
-  %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
-  %next = add i32 %physical, 1
-  %end = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %next)
-  %size = sub i64 %end, %begin
-  %data = getelementptr i8, i8* %chars, i64 %begin
-  %typed_output_offsets = bitcast i8* %output_offsets to @OUTPUT_TYPE@*
-  %output_offset_ptr = getelementptr @OUTPUT_TYPE@, @OUTPUT_TYPE@* %typed_output_offsets, i32 %row
-  %raw_output_offset = load @OUTPUT_TYPE@, @OUTPUT_TYPE@* %output_offset_ptr, align @OUTPUT_ALIGN@
-  %output_offset = @OUTPUT_EXTEND@ @OUTPUT_TYPE@ %raw_output_offset to i64
-  %output_ptr = getelementptr i8, i8* %output, i64 %output_offset
-  %written = call i64 @regex_ir_execute(i8* %data, i64 %size, i8* %output_ptr)
-  br label %done
-done:
-  ret void
-}
-)NVVM"
-                 : R"NVVM(
-define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output) nounwind {
-entry:
-  %row = call i32 @libregex_ir_row_index()
-  %in_bounds = icmp slt i32 %row, %rows
-  br i1 %in_bounds, label %work, label %done
-work:
-  %physical = add i32 %row_offset, %row
-  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
-  br i1 %valid, label %replace, label %store_zero
-replace:
-  %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
-  %next = add i32 %physical, 1
-  %end = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %next)
-  %size = sub i64 %end, %begin
-  %data = getelementptr i8, i8* %chars, i64 %begin
-  %result_size = call i64 @regex_ir_execute(i8* %data, i64 %size, i8* null)
-  %stored_size = trunc i64 %result_size to i32
-  br label %store
-store_zero:
-  br label %store
-store:
-  %value = phi i32 [ %stored_size, %replace ], [ 0, %store_zero ]
-  %typed_output = bitcast i8* %output to i32*
-  %out = getelementptr i32, i32* %typed_output, i32 %row
-  store i32 %value, i32* %out, align 4
-  br label %done
-done:
-  ret void
-}
-)NVVM";
-  if (emit) {
-    replace_all(result, "@OUTPUT_TYPE@", output_offset64 ? "i64" : "i32");
-    replace_all(result, "@OUTPUT_ALIGN@", output_offset64 ? "8" : "4");
-    replace_all(result, "@OUTPUT_EXTEND@", output_offset64 ? "add i64 0," : "sext");
-    if (output_offset64) {
-      replace_all(result,
-                  "%output_offset = add i64 0, i64 %raw_output_offset to i64",
-                  "%output_offset = add i64 %raw_output_offset, 0");
-    }
-  }
-  return annotate_kernel(
-    std::move(result),
-    emit ? "i8*, i8*, i32*, i32, i32, i8*, i8*" : "i8*, i8*, i32*, i32, i32, i8*",
-    kernel_name);
-}
-
-std::string make_split_size_kernel(bool offset64,
-                                   std::int32_t maxsplit,
-                                   bool cache,
-                                   std::string_view kernel_name)
-{
-  auto result = common_nvvm(offset64, false);
-  result += R"NVVM(
-define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output) nounwind {
-entry:
-  %row = call i32 @libregex_ir_row_index()
-  %in_bounds = icmp slt i32 %row, %rows
-  br i1 %in_bounds, label %work, label %done
-work:
-  %physical = add i32 %row_offset, %row
-  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
-  br i1 %valid, label %split, label %store_zero
-split:
-  %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
-  %next = add i32 %physical, 1
-  %end = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %next)
-  %size = sub i64 %end, %begin
-  %data = getelementptr i8, i8* %chars, i64 %begin
-  %count64 = call i64 @libregex_ir_split_execute_limited(i8* %data, i64 %size, i64* null, i64 @MAXSPLIT@, i64 -1, i8* null)
-  %count = trunc i64 %count64 to i32
-  br label %store
-store_zero:
-  br label %store
-store:
-  %stored_count = phi i32 [ %count, %split ], [ 0, %store_zero ]
-  %typed_output = bitcast i8* %output to i32*
-  %out = getelementptr i32, i32* %typed_output, i32 %row
-  store i32 %stored_count, i32* %out, align 4
-  br label %done
-done:
-  ret void
-}
-)NVVM";
-  if (cache) {
-    replace_all(result,
-                "i8* %output) nounwind {",
-                "i8* %output, i8* %cache_buffer, i32 %capacity, i8* %overflow) nounwind {");
-    replace_all(
-      result,
-      "  %count64 = call i64 @libregex_ir_split_execute_limited(i8* %data, i64 %size, i64* null, "
-      "i64 @MAXSPLIT@, i64 -1, i8* null)",
-      "  %typed_cache = bitcast i8* %cache_buffer to i64*\n  %row64 = zext i32 %row to i64\n  "
-      "%fields_per_row = add i32 %capacity, 1\n  %fields_per_row64 = zext i32 %fields_per_row "
-      "to i64\n  %row_fields = mul i64 %row64, %fields_per_row64\n  %row_base = shl i64 "
-      "%row_fields, 1\n  %row_spans = getelementptr i64, i64* %typed_cache, i64 %row_base\n  "
-      "%overflow_ptr = getelementptr i8, i8* %overflow, i32 %row\n  %count64 = call i64 "
-      "@libregex_ir_split_execute_limited(i8* %data, i64 %size, i64* %row_spans, i64 "
-      "@MAXSPLIT@, i64 %fields_per_row64, i8* %overflow_ptr)");
-  }
-  replace_all(result, "@MAXSPLIT@", std::to_string(maxsplit));
-  return annotate_kernel(
-    std::move(result),
-    cache ? "i8*, i8*, i32*, i32, i32, i8*, i8*, i32, i8*" : "i8*, i8*, i32*, i32, i32, i8*",
-    kernel_name);
-}
-
-std::string make_split_emit_kernel(bool offset64,
-                                   bool reverse,
-                                   std::int32_t maxsplit,
-                                   bool overflow_only,
-                                   std::string_view kernel_name)
-{
-  auto result = common_nvvm(offset64, true);
-  result += R"NVVM(
-define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output, i8* %effective_offsets, i8* %full_offsets, i64* %spans) nounwind {
-entry:
-  %row = call i32 @libregex_ir_row_index()
-  %in_bounds = icmp slt i32 %row, %rows
-  br i1 %in_bounds, label %work, label %done
-work:
-  %physical = add i32 %row_offset, %row
-  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
-  br i1 %valid, label %setup, label %done
-setup:
-  %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
-  %next = add i32 %physical, 1
-  %end = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %next)
-  %size = sub i64 %end, %begin
-  %data = getelementptr i8, i8* %chars, i64 %begin
-  %typed_effective_offsets = bitcast i8* %effective_offsets to i32*
-  %effective_begin_ptr = getelementptr i32, i32* %typed_effective_offsets, i32 %row
-  %effective_next = add i32 %row, 1
-  %effective_end_ptr = getelementptr i32, i32* %typed_effective_offsets, i32 %effective_next
-  %effective_begin = load i32, i32* %effective_begin_ptr, align 4
-  %effective_end = load i32, i32* %effective_end_ptr, align 4
-  %effective_count = sub i32 %effective_end, %effective_begin
-  %typed_full_offsets = bitcast i8* %full_offsets to i32*
-  %full_begin_ptr = getelementptr i32, i32* %typed_full_offsets, i32 %row
-  %full_next = add i32 %row, 1
-  %full_end_ptr = getelementptr i32, i32* %typed_full_offsets, i32 %full_next
-  %full_begin = load i32, i32* %full_begin_ptr, align 4
-  %full_end = load i32, i32* %full_end_ptr, align 4
-  %full_count = sub i32 %full_end, %full_begin
-  %full_begin64 = sext i32 %full_begin to i64
-  %span_base_index = shl i64 %full_begin64, 1
-  %row_spans = getelementptr i64, i64* %spans, i64 %span_base_index
-  %written_fields = call i64 @libregex_ir_split_execute_limited(i8* %data, i64 %size, i64* %row_spans, i64 @MAXSPLIT@, i64 -1, i8* null)
-  %typed_output = bitcast i8* %output to %libregex_ir_pair*
-  %effective_begin64 = sext i32 %effective_begin to i64
-  %truncated = icmp sgt i32 %full_count, %effective_count
-  br label %token_loop
-token_loop:
-  %token = phi i32 [ 0, %setup ], [ %next_token, %token_loop ]
-  @SOURCE_INDEX@
-  %source64 = sext i32 %source to i64
-  %source_base = shl i64 %source64, 1
-  %source_end_index = add i64 %source_base, 1
-  %source_begin_ptr = getelementptr i64, i64* %row_spans, i64 %source_base
-  %source_end_ptr = getelementptr i64, i64* %row_spans, i64 %source_end_index
-  %source_begin = load i64, i64* %source_begin_ptr, align 8
-  %source_end = load i64, i64* %source_end_ptr, align 8
-  @SELECT_SPAN@
-  %token64 = sext i32 %token to i64
-  %pair_index = add i64 %effective_begin64, %token64
-  call void @libregex_ir_write_pair(%libregex_ir_pair* %typed_output, i64 %pair_index, i8* %data, i8* %offsets, i64 %selected_begin, i64 %selected_end, i1 true)
-  %next_token = add i32 %token, 1
-  %finished = icmp eq i32 %next_token, %effective_count
-  br i1 %finished, label %done, label %token_loop
-done:
-  ret void
-}
-)NVVM";
-  if (overflow_only) {
-    replace_all(
-      result,
-      "i8* %effective_offsets, i8* %full_offsets, i64* %spans) nounwind {",
-      "i8* %effective_offsets, i8* %full_offsets, i64* %spans, i8* %overflow) nounwind {");
-    replace_all(
-      result,
-      "  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)\n  br i1 %valid, "
-      "label %setup, label %done",
-      "  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)\n  %overflow_ptr = "
-      "getelementptr i8, i8* %overflow, i32 %row\n  %overflow_value = load i8, i8* "
-      "%overflow_ptr, align 1\n  %did_overflow = icmp ne i8 %overflow_value, 0\n  %selected = "
-      "and i1 %valid, %did_overflow\n  br i1 %selected, label %setup, label %done");
-  }
-  replace_all(result, "@MAXSPLIT@", std::to_string(reverse ? -1 : maxsplit));
-  if (reverse) {
-    replace_all(result,
-                "@SOURCE_INDEX@",
-                R"NVVM(%removed = sub i32 %full_count, %effective_count
-  %is_first = icmp eq i32 %token, 0
-  %shifted = add i32 %removed, %token
-  %truncated_source = select i1 %is_first, i32 0, i32 %shifted
-  %source = select i1 %truncated, i32 %truncated_source, i32 %token)NVVM");
-    replace_all(result,
-                "@SELECT_SPAN@",
-                R"NVVM(%merged_field = sub i32 %full_count, %effective_count
-  %merged_field64 = sext i32 %merged_field to i64
-  %merged_field_base = shl i64 %merged_field64, 1
-  %merged_end_index = add i64 %merged_field_base, 1
-  %merged_end_ptr = getelementptr i64, i64* %row_spans, i64 %merged_end_index
-  %merged_end = load i64, i64* %merged_end_ptr, align 8
-  %is_first_selected = and i1 %truncated, %is_first
-  %selected_begin = add i64 %source_begin, 0
-  %selected_end = select i1 %is_first_selected, i64 %merged_end, i64 %source_end)NVVM");
-  } else {
-    replace_all(result, "@SOURCE_INDEX@", "%source = add i32 %token, 0");
-    replace_all(result,
-                "@SELECT_SPAN@",
-                R"NVVM(%last_token = sub i32 %effective_count, 1
-  %is_last = icmp eq i32 %token, %last_token
-  %merge_tail = and i1 %truncated, %is_last
-  %selected_begin = add i64 %source_begin, 0
-  %selected_end = select i1 %merge_tail, i64 %size, i64 %source_end)NVVM");
-  }
-  return annotate_kernel(std::move(result),
-                         overflow_only ? "i8*, i8*, i32*, i32, i32, i8*, i8*, i8*, i64*, i8*"
-                                       : "i8*, i8*, i32*, i32, i32, i8*, i8*, i8*, i64*",
-                         kernel_name);
-}
-
-std::string make_span_cache_sample_kernel(bool offset64,
-                                          bool split,
-                                          std::int32_t capture_slots,
-                                          std::int32_t match_limit,
-                                          std::string_view kernel_name)
-{
-  auto result = common_nvvm(offset64, false);
-  result += split ? R"NVVM(
-define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i32 %samples, i32 %capacity, i8* %statistics) nounwind {
-entry:
-  %sample = call i32 @libregex_ir_row_index()
-  %in_bounds = icmp slt i32 %sample, %samples
-  br i1 %in_bounds, label %select, label %done
-select:
-  %sample64 = zext i32 %sample to i64
-  %rows64 = zext i32 %rows to i64
-  %samples64 = zext i32 %samples to i64
-  %scaled = mul i64 %sample64, %rows64
-  %selected64 = udiv i64 %scaled, %samples64
-  %selected = trunc i64 %selected64 to i32
-  %physical = add i32 %row_offset, %selected
-  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
-  br i1 %valid, label %sample_row, label %done
-sample_row:
-  %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
-  %next = add i32 %physical, 1
-  %end = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %next)
-  %size = sub i64 %end, %begin
-  %data = getelementptr i8, i8* %chars, i64 %begin
-  %fields = call i64 @libregex_ir_split_execute_limited(i8* %data, i64 %size, i64* null, i64 @MATCH_LIMIT@, i64 -1, i8* null)
-  %matches = sub i64 %fields, 1
-  br label %record
-record:
-  %capacity64 = zext i32 %capacity to i64
-  %overflow = icmp ugt i64 %matches, %capacity64
-  %cap_plus_one = add i64 %capacity64, 1
-  %sampled_matches = select i1 %overflow, i64 %cap_plus_one, i64 %matches
-  %stats = bitcast i8* %statistics to i64*
-  %valid_ptr = getelementptr i64, i64* %stats, i64 0
-  %bytes_ptr = getelementptr i64, i64* %stats, i64 1
-  %matches_ptr = getelementptr i64, i64* %stats, i64 2
-  %overflow_ptr = getelementptr i64, i64* %stats, i64 3
-  %valid_old = atomicrmw add i64* %valid_ptr, i64 1 monotonic
-  %bytes_old = atomicrmw add i64* %bytes_ptr, i64 %size monotonic
-  %matches_old = atomicrmw add i64* %matches_ptr, i64 %sampled_matches monotonic
-  %overflow64 = zext i1 %overflow to i64
-  %overflow_old = atomicrmw add i64* %overflow_ptr, i64 %overflow64 monotonic
-  br label %done
-done:
-  ret void
-}
-)NVVM"
-                  : R"NVVM(
-define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i32 %samples, i32 %capacity, i8* %statistics) nounwind {
-entry:
-  %captures = alloca [@CAPTURE_SLOTS@ x i64], align 8
-  %sample = call i32 @libregex_ir_row_index()
-  %in_bounds = icmp slt i32 %sample, %samples
-  br i1 %in_bounds, label %select, label %done
-select:
-  %sample64 = zext i32 %sample to i64
-  %rows64 = zext i32 %rows to i64
-  %samples64 = zext i32 %samples to i64
-  %scaled = mul i64 %sample64, %rows64
-  %selected64 = udiv i64 %scaled, %samples64
-  %selected = trunc i64 %selected64 to i32
-  %physical = add i32 %row_offset, %selected
-  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
-  br i1 %valid, label %sample_row, label %done
-sample_row:
-  %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
-  %next = add i32 %physical, 1
-  %end = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %next)
-  %size = sub i64 %end, %begin
-  %data = getelementptr i8, i8* %chars, i64 %begin
-  %capture_ptr = getelementptr [@CAPTURE_SLOTS@ x i64], [@CAPTURE_SLOTS@ x i64]* %captures, i32 0, i32 0
-  br label %match_loop
-match_loop:
-  %search = phi i64 [ 0, %sample_row ], [ %match_end, %continue_nonempty ], [ %advanced, %continue_empty ]
-  %count = phi i64 [ 0, %sample_row ], [ %next_count, %continue_nonempty ], [ %next_count, %continue_empty ]
-  %semantic_limited = icmp sge i64 @MATCH_LIMIT@, 0
-  %at_semantic_limit = icmp eq i64 %count, @MATCH_LIMIT@
-  %semantic_done = and i1 %semantic_limited, %at_semantic_limit
-  br i1 %semantic_done, label %record, label %search_match
-search_match:
-  %matched = call i1 @regex_ir_execute(i8* %data, i64 %size, i64 %search, i64* %capture_ptr)
-  br i1 %matched, label %found, label %record
-found:
-  %match_begin_ptr = getelementptr [@CAPTURE_SLOTS@ x i64], [@CAPTURE_SLOTS@ x i64]* %captures, i32 0, i32 0
-  %match_end_ptr = getelementptr [@CAPTURE_SLOTS@ x i64], [@CAPTURE_SLOTS@ x i64]* %captures, i32 0, i32 1
-  %match_begin = load i64, i64* %match_begin_ptr, align 8
-  %match_end = load i64, i64* %match_end_ptr, align 8
-  %next_count = add i64 %count, 1
-  %capacity64_found = zext i32 %capacity to i64
-  %overflow_found = icmp ugt i64 %next_count, %capacity64_found
-  br i1 %overflow_found, label %record_overflow, label %check_empty
-check_empty:
-  %nonempty = icmp ne i64 %match_begin, %match_end
-  br i1 %nonempty, label %continue_nonempty, label %empty
-continue_nonempty:
-  br label %match_loop
-empty:
-  %empty_at_end = icmp eq i64 %match_end, %size
-  br i1 %empty_at_end, label %record_after_match, label %continue_empty
-continue_empty:
-  %advanced = call i64 @libregex_ir_advance_utf8(i8* %data, i64 %size, i64 %match_end)
-  br label %match_loop
-record_after_match:
-  br label %record
-record_overflow:
-  br label %record
-record:
-  %matches = phi i64 [ %count, %match_loop ], [ %count, %search_match ], [ %next_count, %record_after_match ], [ %next_count, %record_overflow ]
-  %capacity64 = zext i32 %capacity to i64
-  %overflow = icmp ugt i64 %matches, %capacity64
-  %stats = bitcast i8* %statistics to i64*
-  %valid_ptr = getelementptr i64, i64* %stats, i64 0
-  %bytes_ptr = getelementptr i64, i64* %stats, i64 1
-  %matches_ptr = getelementptr i64, i64* %stats, i64 2
-  %overflow_ptr = getelementptr i64, i64* %stats, i64 3
-  %valid_old = atomicrmw add i64* %valid_ptr, i64 1 monotonic
-  %bytes_old = atomicrmw add i64* %bytes_ptr, i64 %size monotonic
-  %matches_old = atomicrmw add i64* %matches_ptr, i64 %matches monotonic
-  %overflow64 = zext i1 %overflow to i64
-  %overflow_old = atomicrmw add i64* %overflow_ptr, i64 %overflow64 monotonic
-  br label %done
-done:
-  ret void
-}
-)NVVM";
-  replace_all(result, "@CAPTURE_SLOTS@", std::to_string(std::max(capture_slots, 2)));
-  replace_all(result, "@MATCH_LIMIT@", std::to_string(match_limit));
-  return annotate_kernel(std::move(result), "i8*, i8*, i32*, i32, i32, i32, i32, i8*", kernel_name);
-}
-
-}  // namespace regex_ir::nvvm
 
 // instruction IR lowering
 
 namespace regex_ir {
 namespace {
 
-std::vector<diagnostic> parse_replacement(std::string const& replacement,
-                                          std::uint32_t capture_count,
-                                          std::vector<replacement_token>& output)
+void parse_replacement(std::string const& replacement,
+                       std::uint32_t capture_count,
+                       std::vector<replacement_token>& output)
 {
-  std::vector<diagnostic> diagnostics;
   std::string literal;
   auto flush_literal = [&] {
     if (!literal.empty()) {
@@ -2846,28 +1212,21 @@ std::vector<diagnostic> parse_replacement(std::string const& replacement,
     if (braced) { ++position; }
     if (position == replacement.size() ||
         std::isdigit(static_cast<unsigned char>(replacement[position])) == 0) {
-      diagnostics.push_back({diagnostic_code::INVALID_REPLACEMENT,
-                             {start, position - start},
-                             "dollar must be followed by a capture number or dollar"});
-      return diagnostics;
+      throw compile_failure{{start, position - start},
+                            "dollar must be followed by a capture number or dollar"};
     }
     std::uint64_t capture{};
     while (position < replacement.size() &&
            std::isdigit(static_cast<unsigned char>(replacement[position])) != 0) {
       capture = capture * 10U + static_cast<unsigned>(replacement[position++] - '0');
       if (capture > capture_count) {
-        diagnostics.push_back({diagnostic_code::INVALID_REPLACEMENT,
-                               {start, position - start},
-                               "replacement capture is out of range"});
-        return diagnostics;
+        throw compile_failure{{start, position - start}, "replacement capture is out of range"};
       }
     }
     if (braced) {
       if (position == replacement.size() || replacement[position] != '}') {
-        diagnostics.push_back({diagnostic_code::INVALID_REPLACEMENT,
-                               {start, position - start},
-                               "braced replacement capture is not terminated"});
-        return diagnostics;
+        throw compile_failure{{start, position - start},
+                              "braced replacement capture is not terminated"};
       }
       ++position;
     }
@@ -2875,27 +1234,23 @@ std::vector<diagnostic> parse_replacement(std::string const& replacement,
     output.push_back({replacement_token::kind::CAPTURE, {}, static_cast<std::uint32_t>(capture)});
   }
   flush_literal();
-  return diagnostics;
 }
 
 }  // namespace
 
-std::vector<diagnostic> verify(instruction_ir const& ir)
+void verify(instruction_ir const& ir)
 {
-  std::vector<diagnostic> result;
-  auto invalid = [&](source_span span, std::string message) {
-    result.push_back({diagnostic_code::INVALID_INSTRUCTION_IR, span, std::move(message)});
-  };
+  auto invalid = [](std::string_view message) { throw std::logic_error(std::string{message}); };
 
-  if (ir.entry >= ir.blocks.size()) invalid({}, "entry block is invalid");
-  if (ir.accept >= ir.blocks.size()) invalid({}, "accept block is invalid");
+  if (ir.entry >= ir.blocks.size()) invalid("entry block is invalid");
+  if (ir.accept >= ir.blocks.size()) invalid("accept block is invalid");
 
   for (std::size_t index = 0; index < ir.blocks.size(); ++index) {
     auto& block = ir.blocks[index];
-    if (block.id != index) invalid(block.source, "block ID does not match storage index");
+    if (block.id != index) invalid("block ID does not match storage index");
 
     for (auto edge : block.successors) {
-      if (edge.target >= ir.blocks.size()) invalid(block.source, "successor target is invalid");
+      if (edge.target >= ir.blocks.size()) invalid("successor target is invalid");
     }
 
     bool accepting{};
@@ -2911,53 +1266,32 @@ std::vector<diagnostic> verify(instruction_ir const& ir)
       if (auto* capture = std::get_if<write_capture>(&item);
           capture != nullptr &&
           (capture->capture_index == 0 || capture->capture_index > ir.capture_count)) {
-        invalid(block.source, "capture write index is out of range");
+        invalid("capture write index is out of range");
       }
     }
-    if (accepting && !block.successors.empty()) {
-      invalid(block.source, "accept block has successors");
-    }
-    if (character_tests > 1) invalid(block.source, "block has multiple character tests");
-    if (advances > 1) invalid(block.source, "block advances more than once");
+    if (accepting && !block.successors.empty()) { invalid("accept block has successors"); }
+    if (character_tests > 1) invalid("block has multiple character tests");
+    if (advances > 1) invalid("block advances more than once");
   }
-
-  return result;
 }
 
-instruction_result lower(automata_ir const& automata, operation const& selected)
+instruction_ir lower(automata_ir const& automata, operation const& selected)
 {
-  auto diagnostics = verify(automata);
-  if (!diagnostics.empty()) { return {std::nullopt, std::move(diagnostics)}; }
+  verify(automata);
 
   instruction_ir result;
   result.pattern            = automata.pattern;
   result.options            = automata.options;
   result.selected_operation = selected;
   switch (selected.kind) {
-    case operation_kind::MATCHES:
-      result.control = {false, true, true, true, result_shape::BOOLEAN};
-      break;
-    case operation_kind::CONTAINS:
-      result.control = {true, false, true, true, result_shape::BOOLEAN};
-      break;
-    case operation_kind::FIND:
-      result.control = {true, false, true, true, result_shape::MATCH_SPAN};
-      break;
-    case operation_kind::FIND_ALL:
-      result.control = {true, false, false, true, result_shape::MATCH_SPAN};
-      break;
-    case operation_kind::COUNT:
-      result.control = {true, false, false, true, result_shape::MATCH_COUNT};
-      break;
-    case operation_kind::EXTRACT:
-      result.control = {true, false, true, true, result_shape::CAPTURES};
-      break;
-    case operation_kind::REPLACE:
-      result.control = {true, false, false, true, result_shape::REPLACEMENT};
-      break;
-    case operation_kind::SPLIT:
-      result.control = {true, false, false, true, result_shape::SPLIT_FIELDS};
-      break;
+    case operation_kind::MATCHES: result.control = {false, false, result_shape::BOOLEAN}; break;
+    case operation_kind::CONTAINS: result.control = {true, false, result_shape::BOOLEAN}; break;
+    case operation_kind::FIND: result.control = {true, false, result_shape::MATCH_SPAN}; break;
+    case operation_kind::FIND_ALL: result.control = {true, false, result_shape::MATCH_SPAN}; break;
+    case operation_kind::COUNT: result.control = {true, false, result_shape::MATCH_COUNT}; break;
+    case operation_kind::EXTRACT: result.control = {true, false, result_shape::CAPTURES}; break;
+    case operation_kind::REPLACE: result.control = {true, false, result_shape::REPLACEMENT}; break;
+    case operation_kind::SPLIT: result.control = {true, false, result_shape::SPLIT_FIELDS}; break;
   }
   result.entry               = automata.entry;
   result.accept              = automata.accept;
@@ -2995,29 +1329,22 @@ instruction_result lower(automata_ir const& automata, operation const& selected)
   }
 
   if (selected.kind == operation_kind::REPLACE) {
-    auto replacement_diagnostics =
-      parse_replacement(selected.replacement, result.capture_count, result.replacement);
-    diagnostics.insert(diagnostics.end(),
-                       std::make_move_iterator(replacement_diagnostics.begin()),
-                       std::make_move_iterator(replacement_diagnostics.end()));
+    parse_replacement(selected.replacement, result.capture_count, result.replacement);
   }
 
-  if (!diagnostics.empty()) return {std::nullopt, std::move(diagnostics)};
-  diagnostics = verify(result);
-  if (!diagnostics.empty()) return {std::nullopt, std::move(diagnostics)};
-  return {std::move(result), {}};
+  verify(result);
+  return result;
 }
 
-instruction_result compile_instruction_ir(std::string_view pattern,
-                                          operation const& selected,
-                                          compile_options const& options,
-                                          optimization_options const& optimization)
+instruction_ir optimize(instruction_ir ir, optimization_options const& options);
+
+instruction_ir compile_instruction_ir(std::string_view pattern,
+                                      operation const& selected,
+                                      compile_options const& options,
+                                      optimization_options const& optimization)
 {
   auto automata = compile_automata(pattern, options);
-  if (!automata) return {std::nullopt, std::move(automata.diagnostics)};
-  auto instructions = lower(*automata.value, selected);
-  if (!instructions) return instructions;
-  return optimize(std::move(*instructions.value), optimization);
+  return optimize(lower(automata, selected), optimization);
 }
 
 }  // namespace regex_ir
@@ -3158,10 +1485,9 @@ void remove_unreachable(instruction_ir& ir)
 
 }  // namespace
 
-instruction_result optimize(instruction_ir ir, optimization_options const& options)
+instruction_ir optimize(instruction_ir ir, optimization_options const& options)
 {
-  auto diagnostics = verify(ir);
-  if (!diagnostics.empty()) return {std::nullopt, std::move(diagnostics)};
+  verify(ir);
 
   if (options.strip_unobserved_captures) strip_captures(ir);
   if (options.fold_epsilon_jumps) fold_empty_jumps(ir);
@@ -3169,9 +1495,8 @@ instruction_result optimize(instruction_ir ir, optimization_options const& optio
   if (options.fold_epsilon_jumps) fold_empty_jumps(ir);
   if (options.remove_unreachable) remove_unreachable(ir);
 
-  diagnostics = verify(ir);
-  if (!diagnostics.empty()) return {std::nullopt, std::move(diagnostics)};
-  return {std::move(ir), {}};
+  verify(ir);
+  return ir;
 }
 
 }  // namespace regex_ir
@@ -3216,11 +1541,7 @@ void require_identifier(std::string_view value, std::string_view field)
   }
 }
 
-void require_codegen_ir(instruction_ir const& ir)
-{
-  auto diagnostics = verify(ir);
-  if (!diagnostics.empty()) throw std::invalid_argument("cannot generate code from invalid IR");
-}
+void require_codegen_ir(instruction_ir const& ir) { verify(ir); }
 
 std::string nvvm_symbol(std::string_view prefix, std::string_view suffix)
 {
@@ -4248,14 +2569,13 @@ class nvvm_ir_renderer {
     exact_ascii_literal_metadata_ = exact_ascii_literal();
     auto result                   = ir_.control.result;
     auto adapt_count              = result == result_shape::MATCH_COUNT;
-    auto adapt_find = result == result_shape::MATCH_SPAN &&
+    auto adapt_find               = result == result_shape::MATCH_SPAN &&
                       ir_.selected_operation.kind == operation_kind::FIND &&
                       !ir_.options.find_match_end_observable;
     if (begins_at_input_start() && (adapt_count || adapt_find)) {
       anchored_boolean_result_  = result;
       options_.execute_function = name("anchored_boolean_execute");
       ir_.control.result        = result_shape::BOOLEAN;
-      ir_.control.first_only    = true;
     }
   }
 
@@ -4296,9 +2616,8 @@ class nvvm_ir_renderer {
     utf8_literal_pivot_ =
       utf8_literal_.has_value() ? utf8_literal_pivot(*utf8_literal_) : std::nullopt;
     prefix_seek_byte_ = required_ascii_prefix();
-    if (ir_.has_alternation || string_operations_.has_value() ||
-        line_tail_literal_.has_value() || word_run_minimum_.has_value() ||
-        ascii_literal_.has_value() || utf8_literal_.has_value()) {
+    if (ir_.has_alternation || string_operations_.has_value() || line_tail_literal_.has_value() ||
+        word_run_minimum_.has_value() || ascii_literal_.has_value() || utf8_literal_.has_value()) {
       prefix_seek_byte_.reset();
     }
     // short early-hit scans favor the compact DFA; long literals repay wide candidate scans.
@@ -4323,8 +2642,8 @@ class nvvm_ir_renderer {
       // capture substitutions need its one-pass capture propagation rather than a second
       // span-recovery pass.
       auto accelerated_restart = required_ascii_prefix().has_value();
-      auto streaming_span_result = span_or_count && !uses_capture_buffer() &&
-                                   !ir_.has_lazy_quantifier && !accelerated_restart;
+      auto streaming_span_result =
+        span_or_count && !uses_capture_buffer() && !ir_.has_lazy_quantifier && !accelerated_restart;
       if ((boolean_result && !begins_at_input_start()) || streaming_span_result) {
         glushkov_      = make_glushkov_machine(ir_, ir_.control.scan_input);
         deterministic_ = make_deterministic_machine(ir_, ir_.control.scan_input, false);
@@ -4349,9 +2668,9 @@ class nvvm_ir_renderer {
       }
       // This assertion machine records longest matches, so keep priority-sensitive syntax on the
       // ordered executor until assertion closures carry branch-priority metadata.
-      auto assertion_candidate =
-        !boolean_result && !deterministic_.has_value() && !uses_capture_buffer() &&
-        !ir_.has_alternation && ir_.pattern.find('?') == std::string::npos;
+      auto assertion_candidate = !boolean_result && !deterministic_.has_value() &&
+                                 !uses_capture_buffer() && !ir_.has_alternation &&
+                                 ir_.pattern.find('?') == std::string::npos;
       auto keep_prefix_count =
         ir_.control.result == result_shape::MATCH_COUNT && required_ascii_prefix().has_value();
       if (assertion_candidate && !keep_prefix_count) {
@@ -4541,8 +2860,8 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i1
       if (boolean_result) {
         emit_execute();
       } else {
-        if (!deterministic_.has_value() && !glushkov_.has_value() &&
-            !ascii_literal_.has_value() && !utf8_literal_.has_value()) {
+        if (!deterministic_.has_value() && !glushkov_.has_value() && !ascii_literal_.has_value() &&
+            !utf8_literal_.has_value()) {
           emit_find_from();
         }
         switch (ir_.control.result) {
@@ -5304,18 +3623,14 @@ done:
     return std::nullopt;
   }
 
-  [[nodiscard]] std::optional<utf8_literal> exact_utf8_literal() const
+  [[nodiscard]] std::optional<utf8_literal> exact_literal() const
   {
-    if (ir_.options.characters == character_mode::BYTES || ir_.entry >= ir_.blocks.size() ||
-        ir_.accept >= ir_.blocks.size()) {
-      return std::nullopt;
-    }
+    if (ir_.entry >= ir_.blocks.size() || ir_.accept >= ir_.blocks.size()) { return std::nullopt; }
 
     std::vector<bool> visited(ir_.blocks.size(), false);
     std::u32string literal;
-    auto byte_count    = std::size_t{0};
-    auto has_non_ascii = false;
-    auto current       = ir_.entry;
+    auto byte_count = std::size_t{0};
+    auto current    = ir_.entry;
     while (current < ir_.blocks.size() && !visited[current]) {
       visited[current] = true;
       auto& block      = ir_.blocks[current];
@@ -5323,7 +3638,7 @@ done:
         auto accepting = block.instructions.size() == 1U &&
                          std::holds_alternative<emit_accept>(block.instructions.front()) &&
                          block.successors.empty();
-        if (!accepting || literal.empty() || !has_non_ascii) { return std::nullopt; }
+        if (!accepting || literal.empty()) { return std::nullopt; }
         return utf8_literal{std::move(literal), byte_count};
       }
       if (block.successors.size() != 1U) return std::nullopt;
@@ -5366,7 +3681,6 @@ done:
           if (codepoint > 0x10ffffU || (codepoint >= 0xd800U && codepoint <= 0xdfffU)) {
             return std::nullopt;
           }
-          has_non_ascii = has_non_ascii || codepoint > 0x7fU;
           byte_count += codepoint <= 0x7fU     ? 1U
                         : codepoint <= 0x7ffU  ? 2U
                         : codepoint <= 0xffffU ? 3U
@@ -5381,65 +3695,24 @@ done:
 
   [[nodiscard]] std::optional<std::string> exact_ascii_literal() const
   {
-    if (ir_.entry >= ir_.blocks.size() || ir_.accept >= ir_.blocks.size()) { return std::nullopt; }
-
-    std::vector<bool> visited(ir_.blocks.size(), false);
-    std::string literal;
-    auto current = ir_.entry;
-    while (current < ir_.blocks.size() && !visited[current]) {
-      visited[current] = true;
-      auto& block      = ir_.blocks[current];
-      if (current == ir_.accept) {
-        auto accepting = block.instructions.size() == 1U &&
-                         std::holds_alternative<emit_accept>(block.instructions.front()) &&
-                         block.successors.empty();
-        return accepting && !literal.empty() ? std::optional<std::string>{std::move(literal)}
-                                             : std::nullopt;
-      }
-      if (block.successors.size() != 1U) return std::nullopt;
-
-      std::u32string consumed;
-      std::optional<std::uint32_t> peek_count;
-      std::optional<std::uint32_t> advance_count;
-      auto reads_character = false;
-      for (auto& item : block.instructions) {
-        if (auto* peek = std::get_if<can_peek>(&item)) {
-          if (peek_count.has_value()) return std::nullopt;
-          peek_count = peek->characters;
-        } else if (std::holds_alternative<read_character>(item)) {
-          if (reads_character) return std::nullopt;
-          reads_character = true;
-        } else if (auto* character_match = std::get_if<match_character>(&item)) {
-          if (!consumed.empty() || !character_match->predicate.is_singleton()) {
-            return std::nullopt;
-          }
-          consumed.push_back(character_match->predicate.singleton());
-        } else if (auto* literal_match = std::get_if<match_literal>(&item)) {
-          if (!consumed.empty()) return std::nullopt;
-          consumed = literal_match->value;
-        } else if (auto* advance = std::get_if<advance_cursor>(&item)) {
-          if (advance_count.has_value()) return std::nullopt;
-          advance_count = advance->characters;
-        } else {
-          return std::nullopt;
-        }
-      }
-
-      if (!block.instructions.empty()) {
-        auto count = static_cast<std::uint32_t>(consumed.size());
-        if (count == 0U || !peek_count.has_value() || *peek_count != count ||
-            !advance_count.has_value() || *advance_count != count ||
-            (reads_character && count != 1U)) {
-          return std::nullopt;
-        }
-        for (auto codepoint : consumed) {
-          if (codepoint > 0x7f) return std::nullopt;
-          literal.push_back(static_cast<char>(codepoint));
-        }
-      }
-      current = block.successors.front().target;
+    auto literal = exact_literal();
+    if (!literal.has_value() || std::any_of(literal->codepoints.begin(),
+                                            literal->codepoints.end(),
+                                            [](auto codepoint) { return codepoint > 0x7fU; })) {
+      return std::nullopt;
     }
-    return std::nullopt;
+    return encode_utf8_literal(literal->codepoints);
+  }
+
+  [[nodiscard]] std::optional<utf8_literal> exact_utf8_literal() const
+  {
+    if (ir_.options.characters == character_mode::BYTES) return std::nullopt;
+    auto literal = exact_literal();
+    return literal.has_value() && std::any_of(literal->codepoints.begin(),
+                                              literal->codepoints.end(),
+                                              [](auto value) { return value > 0x7fU; })
+             ? std::move(literal)
+             : std::nullopt;
   }
 
   static std::string escaped_comment(std::string_view value)
@@ -6344,16 +4617,15 @@ yes:
    */
   void emit_glushkov_find_from(glushkov_machine const& machine)
   {
-    auto accept_at_end = machine.accept_at_end ? "%phase1_at_input_end" : "true";
+    auto accept_at_end        = machine.accept_at_end ? "%phase1_at_input_end" : "true";
     auto rescan_accept_at_end = machine.accept_at_end ? "%rescan_at_input_end" : "true";
     if (!prefix_seek_byte_.has_value()) {
       output_.emit("declare i64 @llvm.cttz.i64(i64, i1)");
       output_.blank();
     }
-    output_.emit(
-      "{}",
-      std::format(
-        R"NVVM(define internal i64 @{0}(i64 %state) alwaysinline nounwind readnone {{
+    output_.emit("{}",
+                 std::format(
+                   R"NVVM(define internal i64 @{0}(i64 %state) alwaysinline nounwind readnone {{
 entry:
   %accept_bits = and i64 %state, {9}
   %accepted = icmp ne i64 %accept_bits, 0
@@ -6520,20 +4792,20 @@ yes:
 no:
   ret i1 false
 }})NVVM",
-        name("glushkov_priority_kill"),
-        name("find_from"),
-        name("load_byte"),
-        name("decode_codepoint"),
-        name("decode_width"),
-        name("dfa_classify"),
-        name("glushkov_reach"),
-        name("glushkov_follow"),
-        llvm_i64(machine.first_set),
-        llvm_i64(machine.accept_mask),
-        accept_at_end,
-        rescan_accept_at_end,
-        machine.accept_at_end ? "%rescan_loop_at_input_end" : "true",
-        name("advance")));
+                   name("glushkov_priority_kill"),
+                   name("find_from"),
+                   name("load_byte"),
+                   name("decode_codepoint"),
+                   name("decode_width"),
+                   name("dfa_classify"),
+                   name("glushkov_reach"),
+                   name("glushkov_follow"),
+                   llvm_i64(machine.first_set),
+                   llvm_i64(machine.accept_mask),
+                   accept_at_end,
+                   rescan_accept_at_end,
+                   machine.accept_at_end ? "%rescan_loop_at_input_end" : "true",
+                   name("advance")));
     output_.blank();
   }
 
@@ -9539,7 +7811,7 @@ done:
     output_.emit(
       "{}",
       std::format(
-        R"NVVM(define internal i64 @libregex_ir_split_execute_limited(i8* %data, i64 %size, i64* %spans, i64 %maxsplit, i64 %span_capacity, i8* %overflow) nounwind {{
+        R"NVVM(define i64 @libregex_ir_split_execute_limited(i8* %data, i64 %size, i64* %spans, i64 %maxsplit, i64 %span_capacity, i8* %overflow) nounwind {{
 entry:
   %match_begin = alloca i64, align 8
   %match_end = alloca i64, align 8
@@ -9665,11 +7937,9 @@ std::optional<compile_result> render_large_boolean_alternation(
   std::vector<instruction_ir> alternatives;
   alternatives.reserve(entry.successors.size());
   for (auto edge : entry.successors) {
-    auto branch    = ir;
-    branch.entry   = edge.target;
-    auto optimized = optimize(std::move(branch));
-    if (!optimized) return std::nullopt;
-    alternatives.push_back(std::move(*optimized.value));
+    auto branch  = ir;
+    branch.entry = edge.target;
+    alternatives.push_back(optimize(std::move(branch), {}));
   }
 
   std::string result;
@@ -9714,12 +7984,8 @@ define zeroext i1 @{}(i8* %data, i64 %size) nounwind readonly {{
     options.execute_function,
     branches);
   result += "\n!nvvmir.version = !{!0}\n!0 = !{i32 2, i32 0}\n";
-  return compile_result{std::move(result),
-                        ir.capture_count,
-                        executor_kind::BOOLEAN_ALTERNATION,
-                        0,
-                        0,
-                        std::nullopt};
+  return compile_result{
+    std::move(result), ir.capture_count, executor_kind::BOOLEAN_ALTERNATION, 0, 0, std::nullopt};
 }
 
 }  // namespace
@@ -9761,15 +8027,14 @@ compile_result compile(std::string_view pattern,
     default: throw std::invalid_argument("invalid regex operation");
   }
 
-  auto compiled = compile_instruction_ir(
-    pattern, operation{operation_kind_value, replacement.value_or("")}, options);
-  if (!compiled) {
-    if (compiled.diagnostics.empty()) { throw std::invalid_argument("regex compilation failed"); }
-    auto& diagnostic = compiled.diagnostics.front();
+  try {
+    auto compiled = compile_instruction_ir(
+      pattern, operation{operation_kind_value, replacement.value_or("")}, options, {});
+    return generate_nvvm_ir(compiled, {});
+  } catch (compile_failure const& failure) {
     throw std::invalid_argument(std::format(
-      "regex compilation failed at byte {}: {}", diagnostic.span.offset, diagnostic.message));
+      "regex compilation failed at byte {}: {}", failure.source.offset, failure.message));
   }
-  return generate_nvvm_ir(*compiled.value);
 }
 
 }  // namespace regex_ir

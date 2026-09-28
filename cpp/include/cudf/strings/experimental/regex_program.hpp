@@ -4,13 +4,9 @@
  */
 #pragma once
 
-#include <cudf/column/column.hpp>
-#include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/regex/flags.hpp>
-#include <cudf/strings/strings_column_view.hpp>
-#include <cudf/table/table.hpp>
-#include <cudf/utilities/default_stream.hpp>
-#include <cudf/utilities/memory_resource.hpp>
+#include <cudf/types.hpp>
+#include <cudf/utilities/export.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -113,97 +109,6 @@ struct regex_jit_program {
 
   friend struct regex_jit_program_accessor;
 };
-
-std::unique_ptr<column> contains_re(
-  strings_column_view const& input,
-  regex_jit_program const& prog,
-  cuda::stream_ref stream   = cudf::get_default_stream(),
-  cudf::memory_resources mr = cudf::get_current_device_resource_ref());
-
-std::unique_ptr<column> matches_re(
-  strings_column_view const& input,
-  regex_jit_program const& prog,
-  cuda::stream_ref stream   = cudf::get_default_stream(),
-  cudf::memory_resources mr = cudf::get_current_device_resource_ref());
-
-std::unique_ptr<column> count_re(
-  strings_column_view const& input,
-  regex_jit_program const& prog,
-  cuda::stream_ref stream   = cudf::get_default_stream(),
-  cudf::memory_resources mr = cudf::get_current_device_resource_ref());
-
-std::unique_ptr<table> extract(strings_column_view const& input,
-                               regex_jit_program const& prog,
-                               cuda::stream_ref stream   = cudf::get_default_stream(),
-                               cudf::memory_resources mr = cudf::get_current_device_resource_ref());
-
-std::unique_ptr<column> extract_all_record(
-  strings_column_view const& input,
-  regex_jit_program const& prog,
-  cuda::stream_ref stream   = cudf::get_default_stream(),
-  cudf::memory_resources mr = cudf::get_current_device_resource_ref());
-
-std::unique_ptr<column> extract_single(
-  strings_column_view const& input,
-  regex_jit_program const& prog,
-  size_type group,
-  cuda::stream_ref stream   = cudf::get_default_stream(),
-  cudf::memory_resources mr = cudf::get_current_device_resource_ref());
-
-std::unique_ptr<column> findall(
-  strings_column_view const& input,
-  regex_jit_program const& prog,
-  cuda::stream_ref stream   = cudf::get_default_stream(),
-  cudf::memory_resources mr = cudf::get_current_device_resource_ref());
-
-std::unique_ptr<column> find_re(
-  strings_column_view const& input,
-  regex_jit_program const& prog,
-  cuda::stream_ref stream   = cudf::get_default_stream(),
-  cudf::memory_resources mr = cudf::get_current_device_resource_ref());
-
-std::unique_ptr<column> replace_re(
-  strings_column_view const& input,
-  regex_jit_program const& prog,
-  string_scalar const& replacement           = string_scalar(""),
-  std::optional<size_type> max_replace_count = std::nullopt,
-  cuda::stream_ref stream                    = cudf::get_default_stream(),
-  cudf::memory_resources mr                  = cudf::get_current_device_resource_ref());
-
-std::unique_ptr<column> replace_with_backrefs(
-  strings_column_view const& input,
-  regex_jit_program const& prog,
-  std::string_view replacement,
-  cuda::stream_ref stream   = cudf::get_default_stream(),
-  cudf::memory_resources mr = cudf::get_current_device_resource_ref());
-
-std::unique_ptr<table> split_re(
-  strings_column_view const& input,
-  regex_jit_program const& prog,
-  size_type maxsplit        = -1,
-  cuda::stream_ref stream   = cudf::get_default_stream(),
-  cudf::memory_resources mr = cudf::get_current_device_resource_ref());
-
-std::unique_ptr<table> rsplit_re(
-  strings_column_view const& input,
-  regex_jit_program const& prog,
-  size_type maxsplit        = -1,
-  cuda::stream_ref stream   = cudf::get_default_stream(),
-  cudf::memory_resources mr = cudf::get_current_device_resource_ref());
-
-std::unique_ptr<column> split_record_re(
-  strings_column_view const& input,
-  regex_jit_program const& prog,
-  size_type maxsplit        = -1,
-  cuda::stream_ref stream   = cudf::get_default_stream(),
-  cudf::memory_resources mr = cudf::get_current_device_resource_ref());
-
-std::unique_ptr<column> rsplit_record_re(
-  strings_column_view const& input,
-  regex_jit_program const& prog,
-  size_type maxsplit        = -1,
-  cuda::stream_ref stream   = cudf::get_default_stream(),
-  cudf::memory_resources mr = cudf::get_current_device_resource_ref());
 
 }  // namespace experimental
 }  // namespace CUDF_EXPORT cudf
