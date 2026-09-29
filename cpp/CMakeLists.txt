@@ -494,6 +494,41 @@ endforeach()
 
 rtcx_embed(cudf_cuda_embed COMPRESSION zstd OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/embed")
 
+rtcx_add_embed(regex_ir_nvvm_templates)
+
+function(add_regex_ir_nvvm_template TEMPLATE_ID TEMPLATE_PATH)
+  rtcx_embed_blob(
+    regex_ir_nvvm_templates
+    ID ${TEMPLATE_ID}
+    FILE "${CMAKE_CURRENT_SOURCE_DIR}/${TEMPLATE_PATH}"
+    DEST "${TEMPLATE_PATH}"
+  )
+endfunction()
+
+add_regex_ir_nvvm_template(regex_module experimental/libregex_ir/nvvm/module.ll.in)
+add_regex_ir_nvvm_template(regex_functions experimental/libregex_ir/nvvm/functions.ll.in)
+add_regex_ir_nvvm_template(regex_literals experimental/libregex_ir/nvvm/literals.ll.in)
+add_regex_ir_nvvm_template(regex_glushkov experimental/libregex_ir/nvvm/glushkov.ll.in)
+add_regex_ir_nvvm_template(regex_dfa experimental/libregex_ir/nvvm/dfa.ll.in)
+add_regex_ir_nvvm_template(regex_recursive experimental/libregex_ir/nvvm/recursive.ll.in)
+add_regex_ir_nvvm_template(regex_operations experimental/libregex_ir/nvvm/operations.ll.in)
+add_regex_ir_nvvm_template(kernel_module src/strings/experimental/regex_jit/nvvm/module.ll.in)
+add_regex_ir_nvvm_template(kernel_functions
+                           src/strings/experimental/regex_jit/nvvm/functions.ll.in)
+add_regex_ir_nvvm_template(kernel_fixed src/strings/experimental/regex_jit/nvvm/fixed.ll.in)
+add_regex_ir_nvvm_template(kernel_enumeration
+                           src/strings/experimental/regex_jit/nvvm/enumeration.ll.in)
+add_regex_ir_nvvm_template(kernel_replace src/strings/experimental/regex_jit/nvvm/replace.ll.in)
+add_regex_ir_nvvm_template(kernel_split src/strings/experimental/regex_jit/nvvm/split.ll.in)
+add_regex_ir_nvvm_template(kernel_warp_literal
+                           src/strings/experimental/regex_jit/nvvm/warp_literal.ll.in)
+
+rtcx_embed(
+  regex_ir_nvvm_templates
+  COMPRESSION none
+  OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/embed"
+)
+
 rtcx_add_embed(cudf_fragments)
 
 # This function precompiles the unary and binary transform kernel fragments for all fixed-width
@@ -1229,10 +1264,11 @@ add_library(
   src/utilities/type_checks.cpp
   src/utilities/type_dispatcher.cpp
   ${cudf_cuda_embed_SOURCE_DIR}/cudf_cuda_embed.s
+  ${regex_ir_nvvm_templates_SOURCE_DIR}/regex_ir_nvvm_templates.s
   ${cudf_fragments_SOURCE_DIR}/cudf_fragments.s
 )
 
-add_dependencies(cudf cudf_cuda_embed cudf_fragments)
+add_dependencies(cudf cudf_cuda_embed regex_ir_nvvm_templates cudf_fragments)
 
 set_property(
   SOURCE src/io/parquet/writer_impl.cu
@@ -1306,6 +1342,7 @@ target_include_directories(
           "$<BUILD_INTERFACE:${FlatBuffers_SOURCE_DIR}/include>"
           "$<BUILD_INTERFACE:${ZSTD_INCLUDE_DIR}>"
           "$<BUILD_INTERFACE:${cudf_cuda_embed_INCLUDE_DIRS}>"
+          "$<BUILD_INTERFACE:${regex_ir_nvvm_templates_INCLUDE_DIRS}>"
           "$<BUILD_INTERFACE:${cudf_fragments_INCLUDE_DIRS}>"
   INTERFACE "$<INSTALL_INTERFACE:include>"
 )

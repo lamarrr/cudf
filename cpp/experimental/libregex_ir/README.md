@@ -13,6 +13,7 @@ notes:
 - `regex_ir.hpp`: public compiler API and generated-code metadata
 - `regex_ir_detail.hpp`: private compiler intermediate representations and passes
 - `regex_ir.cpp`: compiler, optimizer, NVVM renderer, and embedded Unicode data
+- `nvvm/`: sectioned matcher and executor NVVM templates embedded at build time with RTCX
 
 The implementation includes its private header directly; no implementation
 macro changes the declarations exposed by `regex_ir.hpp`.
