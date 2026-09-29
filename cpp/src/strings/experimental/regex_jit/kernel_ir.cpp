@@ -248,7 +248,7 @@ std::string make_enumeration_size_kernel(bool offset64,
   auto cache_match      = cache ? std::format(
                                R"NVVM(%typed_cache = bitcast i8* %cache_buffer to i64*
   %overflow_ptr = getelementptr i8, i8* %overflow, i32 %row
-  call void @libregex_ir_cache_captures(i64* %capture_ptr, i64* %typed_cache, i32 %row, i32 %capacity, i32 {}, i64 %count, i8* %overflow_ptr))NVVM",
+  call void @regex_ir_cache_captures(i64* %capture_ptr, i64* %typed_cache, i32 %row, i32 %capacity, i32 {}, i64 %count, i8* %overflow_ptr))NVVM",
                                capture_slots)
                                 : "";
   result += regex_ir::render_nvvm_template_section(
@@ -334,24 +334,21 @@ std::string make_limited_replace_kernel(bool offset64,
                                         std::string_view kernel_name)
 {
   auto result = common_nvvm(offset64, false, matcher_abi::CAPTURES);
-  if (emit) {
-    result += regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions,
-                                              "load_offset_general");
-  }
   if (cache) {
     result +=
       regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions, "capture_cache");
   }
+  result += regex_ir::nvvm_template_section(regex_ir_nvvm_templates::regex_functions,
+                                            "llvm_memcpy_declaration");
   result +=
-    regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions, "append_range");
+    regex_ir::nvvm_template_section(regex_ir_nvvm_templates::regex_functions, "append_range");
   for (std::size_t index = 0; index < replacement.size(); ++index) {
     auto& literal = replacement[index].literal;
     if (!literal.empty()) {
-      result +=
-        std::format("\n@libregex_ir_replacement_{0} = private constant [{1} x i8] c\"{2}\"\n",
-                    index,
-                    literal.size(),
-                    llvm_bytes(literal));
+      result += std::format("\n@regex_ir_replacement_{0} = private constant [{1} x i8] c\"{2}\"\n",
+                            index,
+                            literal.size(),
+                            llvm_bytes(literal));
     }
   }
   std::string steps;
@@ -371,7 +368,7 @@ std::string make_limited_replace_kernel(bool offset64,
   %capture_present_{0} = and i1 %capture_has_begin_{0}, %capture_has_end_{0}
   %capture_selected_begin_{0} = select i1 %capture_present_{0}, i64 %capture_begin_{0}, i64 0
   %capture_selected_end_{0} = select i1 %capture_present_{0}, i64 %capture_end_{0}, i64 0
-  {4} = call i64 @libregex_ir_append_range(i8* %data, i64 %capture_selected_begin_{0}, i64 %capture_selected_end_{0}, i8* %output, i64 {5})
+  {4} = call i64 @regex_ir_append_range(i8* %data, i64 %capture_selected_begin_{0}, i64 %capture_selected_end_{0}, i8* %output, i64 {5})
 )NVVM",
         index,
         capture_slots,
@@ -381,8 +378,8 @@ std::string make_limited_replace_kernel(bool offset64,
         cursor);
     } else if (!piece.literal.empty()) {
       steps += std::format(
-        R"NVVM(  %literal_{0} = getelementptr [{1} x i8], [{1} x i8]* @libregex_ir_replacement_{0}, i32 0, i32 0
-  {2} = call i64 @libregex_ir_append_range(i8* %literal_{0}, i64 0, i64 {1}, i8* %output, i64 {3})
+        R"NVVM(  %literal_{0} = getelementptr [{1} x i8], [{1} x i8]* @regex_ir_replacement_{0}, i32 0, i32 0
+  {2} = call i64 @regex_ir_append_range(i8* %literal_{0}, i64 0, i64 {1}, i8* %output, i64 {3})
 )NVVM",
         index,
         piece.literal.size(),
@@ -451,8 +448,6 @@ std::string make_replace_kernel(bool offset64,
 {
   auto result = common_nvvm(offset64, false, matcher_abi::REPLACE);
   if (emit) {
-    result += regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions,
-                                              "load_offset_general");
     result += regex_ir::render_nvvm_template_section(
       regex_ir_nvvm_templates::kernel_replace,
       "replace_emit",
@@ -480,8 +475,8 @@ std::string make_split_size_kernel(bool offset64,
   auto cache_parameters = cache ? ", i8* %cache_buffer, i32 %capacity, i8* %overflow" : "";
   auto split_call =
     cache
-      ? R"NVVM(  %count64 = call i64 @libregex_ir_split_cached(i8* %data, i64 %size, i8* %cache_buffer, i32 %row, i32 %capacity, i8* %overflow, i64 @MAXSPLIT@))NVVM"
-      : R"NVVM(  %count64 = call i64 @libregex_ir_split_execute_limited(i8* %data, i64 %size, i64* null, i64 @MAXSPLIT@, i64 -1, i8* null))NVVM";
+      ? R"NVVM(  %count64 = call i64 @regex_ir_split_cached(i8* %data, i64 %size, i8* %cache_buffer, i32 %row, i32 %capacity, i8* %overflow, i64 @MAXSPLIT@))NVVM"
+      : R"NVVM(  %count64 = call i64 @regex_ir_split_execute_limited(i8* %data, i64 %size, i64* null, i64 @MAXSPLIT@, i64 -1, i8* null))NVVM";
   result += regex_ir::render_nvvm_template_section(regex_ir_nvvm_templates::kernel_split,
                                                    "split_size",
                                                    {{"@CACHE_PARAMETERS@", cache_parameters},
@@ -507,7 +502,7 @@ std::string make_split_emit_kernel(bool offset64,
   }
   auto overflow_guard =
     overflow_only
-      ? R"NVVM(  %selected = call i1 @libregex_ir_split_row_selected(i1 %valid, i8* %overflow, i32 %row)
+      ? R"NVVM(  %selected = call i1 @regex_ir_split_row_selected(i1 %valid, i8* %overflow, i32 %row)
   br i1 %selected, label %setup, label %done)NVVM"
       : "  br i1 %valid, label %setup, label %done";
   auto source_index = std::string{};
@@ -516,15 +511,15 @@ std::string make_split_emit_kernel(bool offset64,
     result +=
       regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions, "split_reverse");
     source_index =
-      R"NVVM(%source = call i32 @libregex_ir_reverse_split_source(i32 %full_count, i32 %effective_count, i32 %token, i1 %truncated))NVVM";
+      R"NVVM(%source = call i32 @regex_ir_reverse_split_source(i32 %full_count, i32 %effective_count, i32 %token, i1 %truncated))NVVM";
     select_span = R"NVVM(%selected_begin = add i64 %source_begin, 0
-  %selected_end = call i64 @libregex_ir_reverse_split_end(i64* %row_spans, i32 %full_count, i32 %effective_count, i32 %token, i1 %truncated, i64 %source_end))NVVM";
+  %selected_end = call i64 @regex_ir_reverse_split_end(i64* %row_spans, i32 %full_count, i32 %effective_count, i32 %token, i1 %truncated, i64 %source_end))NVVM";
   } else {
     result +=
       regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions, "split_forward");
     source_index = "%source = add i32 %token, 0";
     select_span  = R"NVVM(%selected_begin = add i64 %source_begin, 0
-  %selected_end = call i64 @libregex_ir_forward_split_end(i32 %effective_count, i32 %token, i1 %truncated, i64 %size, i64 %source_end))NVVM";
+  %selected_end = call i64 @regex_ir_forward_split_end(i32 %effective_count, i32 %token, i1 %truncated, i64 %size, i64 %source_end))NVVM";
   }
   result +=
     regex_ir::render_nvvm_template_section(regex_ir_nvvm_templates::kernel_split,
@@ -547,6 +542,8 @@ std::string make_span_cache_sample_kernel(bool offset64,
                                           std::string_view kernel_name)
 {
   auto result = common_nvvm(offset64, false, split ? matcher_abi::SPLIT : matcher_abi::CAPTURES);
+  result +=
+    regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions, "span_cache_sample");
   result += split
               ? std::string{regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_split,
                                                             "span_cache_sample_split")}

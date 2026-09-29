@@ -2793,7 +2793,7 @@ class nvvm_ir_renderer {
     } else if (line_tail_literal_.has_value()) {
       emit_line_tail_execute(*line_tail_literal_);
     } else if (word_run_minimum_.has_value()) {
-      if (!ir_.options.ascii_classes) emit_is_word();
+      emit_is_word();
       emit_word_run_execute(*word_run_minimum_);
     } else if (ascii_literal_.has_value() && boolean_result) {
       emit_ascii_literal_execute(*ascii_literal_);

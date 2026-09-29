@@ -6,19 +6,17 @@
 define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output) nounwind {
 entry:
   %captures = alloca [@CAPTURE_SLOTS@ x i64], align 8
-  %row = call i32 @libregex_ir_row_index()
+  %row = call i32 @regex_ir_row_index()
   %in_bounds = icmp slt i32 %row, %rows
   br i1 %in_bounds, label %work, label %done
 work:
   %physical = add i32 %row_offset, %row
-  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
+  %valid = call i1 @regex_ir_is_valid(i32* %validity, i32 %physical)
   br i1 %valid, label %match, label %output_begin
 match:
-  %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
-  %next = add i32 %physical, 1
-  %end = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %next)
-  %size = sub i64 %end, %begin
-  %data = getelementptr i8, i8* %chars, i64 %begin
+  %string = call %regex_ir_string @regex_ir_load_string(i8* %chars, i8* %offsets, i32 %physical)
+  %data = extractvalue %regex_ir_string %string, 0
+  %size = extractvalue %regex_ir_string %string, 1
   %capture_ptr = getelementptr [@CAPTURE_SLOTS@ x i64], [@CAPTURE_SLOTS@ x i64]* %captures, i32 0, i32 0
   %matched = call i1 @regex_ir_execute(i8* %data, i64 %size, i64 0, i64* %capture_ptr)
   br label %output_begin
@@ -52,7 +50,7 @@ group_write:
   %stored_present = phi i1 [ %present, %group_found ], [ false, %group_missing ]
   %group64 = sext i32 %group to i64
   @PAIR_INDEX@
-  call void @libregex_ir_write_pair(i8* %typed_output, i64 %pair_index, i8* %row_data, i8* %offsets, i64 %stored_begin, i64 %stored_end, i1 %stored_present)
+  call void @regex_ir_write_pair(i8* %typed_output, i64 %pair_index, i8* %row_data, i8* %offsets, i64 %stored_begin, i64 %stored_end, i1 %stored_present)
   br label %group_done
 group_done:
   %next_group = add i32 %group, 1
@@ -68,19 +66,17 @@ done:
 define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output, i8* %output_offsets@OVERFLOW_PARAMETER@) nounwind {
 entry:
   %captures = alloca [@CAPTURE_SLOTS@ x i64], align 8
-  %row = call i32 @libregex_ir_row_index()
+  %row = call i32 @regex_ir_row_index()
   %in_bounds = icmp slt i32 %row, %rows
   br i1 %in_bounds, label %work, label %done
 work:
   %physical = add i32 %row_offset, %row
-  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
+  %valid = call i1 @regex_ir_is_valid(i32* %validity, i32 %physical)
   @OVERFLOW_GUARD@
 setup:
-  %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
-  %next = add i32 %physical, 1
-  %end = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %next)
-  %size = sub i64 %end, %begin
-  %data = getelementptr i8, i8* %chars, i64 %begin
+  %string = call %regex_ir_string @regex_ir_load_string(i8* %chars, i8* %offsets, i32 %physical)
+  %data = extractvalue %regex_ir_string %string, 0
+  %size = extractvalue %regex_ir_string %string, 1
   %capture_ptr = getelementptr [@CAPTURE_SLOTS@ x i64], [@CAPTURE_SLOTS@ x i64]* %captures, i32 0, i32 0
   %typed_offsets = bitcast i8* %output_offsets to i32*
   %row_output_ptr = getelementptr i32, i32* %typed_offsets, i32 %row
@@ -108,7 +104,7 @@ empty:
   %empty_at_end = icmp eq i64 %match_end, %size
   br i1 %empty_at_end, label %done, label %continue_empty
 continue_empty:
-  %advanced = call i64 @libregex_ir_advance_utf8(i8* %data, i64 %size, i64 %match_end)
+  %advanced = call i64 @regex_ir_advance_utf8(i8* %data, i64 %size, i64 %match_end)
   br label %match_loop
 done:
   ret void
@@ -120,19 +116,17 @@ done:
 define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output, i8* %output_validity@CACHE_PARAMETERS@) nounwind {
 entry:
   %captures = alloca [@CAPTURE_SLOTS@ x i64], align 8
-  %row = call i32 @libregex_ir_row_index()
+  %row = call i32 @regex_ir_row_index()
   %in_bounds = icmp slt i32 %row, %rows
   br i1 %in_bounds, label %work, label %done
 work:
   %physical = add i32 %row_offset, %row
-  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
+  %valid = call i1 @regex_ir_is_valid(i32* %validity, i32 %physical)
   br i1 %valid, label %setup, label %store_invalid
 setup:
-  %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
-  %next = add i32 %physical, 1
-  %end = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %next)
-  %size = sub i64 %end, %begin
-  %data = getelementptr i8, i8* %chars, i64 %begin
+  %string = call %regex_ir_string @regex_ir_load_string(i8* %chars, i8* %offsets, i32 %physical)
+  %data = extractvalue %regex_ir_string %string, 0
+  %size = extractvalue %regex_ir_string %string, 1
   %capture_ptr = getelementptr [@CAPTURE_SLOTS@ x i64], [@CAPTURE_SLOTS@ x i64]* %captures, i32 0, i32 0
   br label %match_loop
 match_loop:
@@ -155,7 +149,7 @@ empty:
   %empty_at_end = icmp eq i64 %match_end, %size
   br i1 %empty_at_end, label %store_after_match, label %continue_empty
 continue_empty:
-  %advanced = call i64 @libregex_ir_advance_utf8(i8* %data, i64 %size, i64 %match_end)
+  %advanced = call i64 @regex_ir_advance_utf8(i8* %data, i64 %size, i64 %match_end)
   br label %match_loop
 store_after_match:
   br label %store
@@ -186,7 +180,7 @@ done:
 define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i32 %samples, i32 %capacity, i8* %statistics) nounwind {
 entry:
   %captures = alloca [@CAPTURE_SLOTS@ x i64], align 8
-  %sample = call i32 @libregex_ir_row_index()
+  %sample = call i32 @regex_ir_row_index()
   %in_bounds = icmp slt i32 %sample, %samples
   br i1 %in_bounds, label %select, label %done
 select:
@@ -197,14 +191,12 @@ select:
   %selected64 = udiv i64 %scaled, %samples64
   %selected = trunc i64 %selected64 to i32
   %physical = add i32 %row_offset, %selected
-  %valid = call i1 @libregex_ir_is_valid(i32* %validity, i32 %physical)
+  %valid = call i1 @regex_ir_is_valid(i32* %validity, i32 %physical)
   br i1 %valid, label %sample_row, label %done
 sample_row:
-  %begin = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %physical)
-  %next = add i32 %physical, 1
-  %end = call i64 @libregex_ir_load_offset(i8* %offsets, i32 %next)
-  %size = sub i64 %end, %begin
-  %data = getelementptr i8, i8* %chars, i64 %begin
+  %string = call %regex_ir_string @regex_ir_load_string(i8* %chars, i8* %offsets, i32 %physical)
+  %data = extractvalue %regex_ir_string %string, 0
+  %size = extractvalue %regex_ir_string %string, 1
   %capture_ptr = getelementptr [@CAPTURE_SLOTS@ x i64], [@CAPTURE_SLOTS@ x i64]* %captures, i32 0, i32 0
   br label %match_loop
 match_loop:
@@ -235,7 +227,7 @@ empty:
   %empty_at_end = icmp eq i64 %match_end, %size
   br i1 %empty_at_end, label %record_after_match, label %continue_empty
 continue_empty:
-  %advanced = call i64 @libregex_ir_advance_utf8(i8* %data, i64 %size, i64 %match_end)
+  %advanced = call i64 @regex_ir_advance_utf8(i8* %data, i64 %size, i64 %match_end)
   br label %match_loop
 record_after_match:
   br label %record
@@ -243,18 +235,7 @@ record_overflow:
   br label %record
 record:
   %matches = phi i64 [ %count, %match_loop ], [ %count, %search_match ], [ %next_count, %record_after_match ], [ %next_count, %record_overflow ]
-  %capacity64 = zext i32 %capacity to i64
-  %overflow = icmp ugt i64 %matches, %capacity64
-  %stats = bitcast i8* %statistics to i64*
-  %valid_ptr = getelementptr i64, i64* %stats, i64 0
-  %bytes_ptr = getelementptr i64, i64* %stats, i64 1
-  %matches_ptr = getelementptr i64, i64* %stats, i64 2
-  %overflow_ptr = getelementptr i64, i64* %stats, i64 3
-  %valid_old = atomicrmw add i64* %valid_ptr, i64 1 monotonic
-  %bytes_old = atomicrmw add i64* %bytes_ptr, i64 %size monotonic
-  %matches_old = atomicrmw add i64* %matches_ptr, i64 %matches monotonic
-  %overflow64 = zext i1 %overflow to i64
-  %overflow_old = atomicrmw add i64* %overflow_ptr, i64 %overflow64 monotonic
+  call void @regex_ir_record_span_cache_sample(i8* %statistics, i64 %size, i64 %matches, i32 %capacity)
   br label %done
 done:
   ret void
@@ -279,7 +260,7 @@ group_loop:
   %group64 = sext i32 %group to i64
   %group_output = add i64 %output_index, %group64
   %pair_index = add i64 %row_output64, %group_output
-  call void @libregex_ir_write_pair(i8* %typed_output, i64 %pair_index, i8* %data, i8* %offsets, i64 %capture_begin, i64 %capture_end, i1 %present)
+  call void @regex_ir_write_pair(i8* %typed_output, i64 %pair_index, i8* %data, i8* %offsets, i64 %capture_begin, i64 %capture_end, i1 %present)
   br label %group_write
 group_write:
   %next_group = add i32 %group, 1
@@ -300,7 +281,7 @@ groups_finished:
   %has_end = icmp sge i64 %selected_end, 0
   %present = and i1 %has_begin, %has_end
   %pair_index = add i64 %row_output64, %output_index
-  call void @libregex_ir_write_pair(i8* %typed_output, i64 %pair_index, i8* %data, i8* %offsets, i64 %selected_begin, i64 %selected_end, i1 %present)
+  call void @regex_ir_write_pair(i8* %typed_output, i64 %pair_index, i8* %data, i8* %offsets, i64 %selected_begin, i64 %selected_end, i1 %present)
   %next_output_index = add i64 %output_index, 1
   br label %after_write
 ; END write_findall_capture
@@ -311,7 +292,7 @@ groups_finished:
   %selected_end = add i64 %match_end, 0
   %present = icmp sge i64 %selected_begin, 0
   %pair_index = add i64 %row_output64, %output_index
-  call void @libregex_ir_write_pair(i8* %typed_output, i64 %pair_index, i8* %data, i8* %offsets, i64 %selected_begin, i64 %selected_end, i1 %present)
+  call void @regex_ir_write_pair(i8* %typed_output, i64 %pair_index, i8* %data, i8* %offsets, i64 %selected_begin, i64 %selected_end, i1 %present)
   %next_output_index = add i64 %output_index, 1
   br label %after_write
 ; END write_findall_whole

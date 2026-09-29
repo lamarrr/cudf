@@ -265,7 +265,7 @@ finish:
 ; END replacement_capture_step
 
 ; BEGIN split_execute
-define i64 @libregex_ir_split_execute_limited(i8* %data, i64 %size, i64* %spans, i64 %maxsplit, i64 %span_capacity, i8* %overflow) nounwind {{
+define i64 @regex_ir_split_execute_limited(i8* %data, i64 %size, i64* %spans, i64 %maxsplit, i64 %span_capacity, i8* %overflow) nounwind {{
 entry:
   %match_begin = alloca i64, align 8
   %match_end = alloca i64, align 8
@@ -314,7 +314,7 @@ finish:
 
 define i64 @{0}(i8* %data, i64 %size, i64* %spans) nounwind {{
 entry:
-  %result = call i64 @libregex_ir_split_execute_limited(i8* %data, i64 %size, i64* %spans, i64 -1, i64 -1, i8* null)
+  %result = call i64 @regex_ir_split_execute_limited(i8* %data, i64 %size, i64* %spans, i64 -1, i64 -1, i8* null)
   ret i64 %result
 }}
 ; END split_execute

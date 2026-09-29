@@ -360,19 +360,7 @@ search:
 load:
   %byte_ptr = getelementptr i8, i8* %data, i64 %position
   %byte = call i32 @{1}(i8* %byte_ptr)
-  %digit_low = icmp uge i32 %byte, 48
-  %digit_high = icmp ule i32 %byte, 57
-  %digit = and i1 %digit_low, %digit_high
-  %upper_low = icmp uge i32 %byte, 65
-  %upper_high = icmp ule i32 %byte, 90
-  %upper = and i1 %upper_low, %upper_high
-  %lower_low = icmp uge i32 %byte, 97
-  %lower_high = icmp ule i32 %byte, 122
-  %lower = and i1 %lower_low, %lower_high
-  %underscore = icmp eq i32 %byte, 95
-  %alpha = or i1 %upper, %lower
-  %alnum = or i1 %alpha, %digit
-  %word = or i1 %alnum, %underscore
+  %word = call i1 @regex_ir_is_ascii_word(i32 %byte)
   br i1 %word, label %run, label %advance
 advance:
   %next_position = add nuw i64 %position, 1
@@ -386,19 +374,7 @@ scan:
 run_load:
   %run_byte_ptr = getelementptr i8, i8* %data, i64 %run_position
   %run_byte = call i32 @{1}(i8* %run_byte_ptr)
-  %run_digit_low = icmp uge i32 %run_byte, 48
-  %run_digit_high = icmp ule i32 %run_byte, 57
-  %run_digit = and i1 %run_digit_low, %run_digit_high
-  %run_upper_low = icmp uge i32 %run_byte, 65
-  %run_upper_high = icmp ule i32 %run_byte, 90
-  %run_upper = and i1 %run_upper_low, %run_upper_high
-  %run_lower_low = icmp uge i32 %run_byte, 97
-  %run_lower_high = icmp ule i32 %run_byte, 122
-  %run_lower = and i1 %run_lower_low, %run_lower_high
-  %run_underscore = icmp eq i32 %run_byte, 95
-  %run_alpha = or i1 %run_upper, %run_lower
-  %run_alnum = or i1 %run_alpha, %run_digit
-  %run_word = or i1 %run_alnum, %run_underscore
+  %run_word = call i1 @regex_ir_is_ascii_word(i32 %run_byte)
   br i1 %run_word, label %run_continue, label %run_done_nonword
 run_continue:
   %run_next = add nuw i64 %run_position, 1
