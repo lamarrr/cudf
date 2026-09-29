@@ -88,6 +88,17 @@ else()
   )
 endif()
 
+set(DEFAULT_CUDF_STATIC_LINK_NVVM OFF)
+if(CUDF_BUILD_STATIC_DEPS STREQUAL "FORCE")
+  set(DEFAULT_CUDF_STATIC_LINK_NVVM ON)
+endif()
+option(CUDF_STATIC_LINK_NVVM "Use static linking for libNVVM" ${DEFAULT_CUDF_STATIC_LINK_NVVM})
+set(CUDF_NVVM_STATIC_LIBRARY
+    ""
+    CACHE FILEPATH "Path to the static libNVVM archive"
+)
+mark_as_advanced(CUDF_NVVM_STATIC_LIBRARY)
+
 set(DEFAULT_CUDF_BUILD_STREAMS_TEST_UTIL ON)
 
 if(NOT BUILD_SHARED_LIBS)
@@ -950,6 +961,7 @@ add_library(
   src/io/utilities/trie.cu
   src/jit/cache.cpp
   src/jit/helpers.cpp
+  src/jit/nvvm.cpp
   src/jit/parser.cpp
   src/jit/row_ir.cpp
   src/jit/util.cpp
@@ -1276,10 +1288,16 @@ set_property(
   PROPERTY COMPILE_DEFINITIONS "CUDF_VERSION=${PROJECT_VERSION}"
 )
 
+set_property(
+  SOURCE src/jit/nvvm.cpp
+  APPEND
+  PROPERTY COMPILE_DEFINITIONS "CUDF_STATIC_LINK_NVVM=$<BOOL:${CUDF_STATIC_LINK_NVVM}>"
+)
+
 set_target_properties(
   cudf
-  PROPERTIES BUILD_RPATH "\$ORIGIN"
-             INSTALL_RPATH "\$ORIGIN"
+  PROPERTIES BUILD_RPATH "\$ORIGIN;${CUDAToolkit_LIBRARY_ROOT}/nvvm/lib64"
+             INSTALL_RPATH "\$ORIGIN;\$ORIGIN/../nvvm/lib64"
              # set target compile options
              CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
@@ -1511,9 +1529,17 @@ target_link_libraries(
           ${CUDF_nanoarrow_TARGET}
           zstd
           $<BUILD_LOCAL_INTERFACE:xxhash>
-          "${CUDAToolkit_LIBRARY_ROOT}/nvvm/lib64/libnvvm.so"
           rtcx::rtcx
 )
+
+if(CUDF_STATIC_LINK_NVVM)
+  if(NOT CUDF_NVVM_STATIC_LIBRARY)
+    message(FATAL_ERROR "CUDF_STATIC_LINK_NVVM=ON requires CUDF_NVVM_STATIC_LIBRARY")
+  endif()
+  target_link_libraries(cudf PRIVATE "${CUDF_NVVM_STATIC_LIBRARY}")
+else()
+  target_link_libraries(cudf PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 if(NOT _absorbed_nvcomp)
   target_link_libraries(cudf PRIVATE ${CUDF_nvcomp_TARGET})

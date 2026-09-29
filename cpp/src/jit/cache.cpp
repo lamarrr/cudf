@@ -10,7 +10,7 @@
 
 #include <cudf_cuda_embed.hpp>
 #include <jit/cache.hpp>
-#include <nvvm.h>
+#include <jit/nvvm.hpp>
 #include <rtcx/rtcx.hpp>
 #include <runtime/context.hpp>
 
@@ -21,7 +21,9 @@
 #include <format>
 #include <fstream>
 #include <future>
+#include <string>
 #include <string_view>
+#include <vector>
 
 namespace CUDF_EXPORT cudf {
 
@@ -491,61 +493,28 @@ kernel_instance={}
   return fut.get();
 }
 
-rtcx::blob get_nvvm_fragment(std::string const& name, std::string const& nvvm_ir)
+rtcx::blob get_nvvm_fragment(std::string_view name, std::string_view nvvm_ir)
 {
   CUDF_FUNC_RANGE();
 
   auto& ctx   = cudf::get_context();
   auto& cache = ctx.rtcx_cache();
-  auto spec   = std::format("NVVM LTO IR\nname={}\narch=compute_{}\n", name, LTO_ARCHITECTURE);
+  auto& nvvm  = jit::nvvm_api::get();
+  auto spec   = std::format("NVVM LTO IR\nname={}\nversion={}\narch=compute_{}\n",
+                          name,
+                          nvvm.version_string(),
+                          LTO_ARCHITECTURE);
 
   XXH3_state_t state;
   XXH3_INITSTATE(&state);
   XXH3_128bits_reset(&state);
   hash(&state, spec);
-  hash(&state, nvvm_ir);
+  hash(&state, std::span{nvvm_ir.data(), nvvm_ir.size()});
 
   auto digest = XXH3_128bits_digest(&state);
   auto key    = rtcx::hash128{digest.high64, digest.low64};
 
-  auto compile = [&] {
-    nvvmProgram program = nullptr;
-    auto check          = [&](nvvmResult result, std::string_view operation) {
-      if (result == NVVM_SUCCESS) { return; }
-      std::string log;
-      std::size_t size = 0;
-      if (program != nullptr && nvvmGetProgramLogSize(program, &size) == NVVM_SUCCESS && size > 0) {
-        log.resize(size);
-        static_cast<void>(nvvmGetProgramLog(program, log.data()));
-      }
-      throw std::runtime_error(
-        std::format("{} failed{}{}", operation, log.empty() ? "" : ": ", log));
-    };
-
-    check(nvvmCreateProgram(&program), "nvvmCreateProgram");
-    try {
-      check(nvvmAddModuleToProgram(program, nvvm_ir.data(), nvvm_ir.size(), name.c_str()),
-            "nvvmAddModuleToProgram");
-      auto architecture             = std::format("-arch=compute_{}", LTO_ARCHITECTURE);
-      char const* verify_options[]  = {architecture.c_str()};
-      char const* compile_options[] = {architecture.c_str(), "-opt=3", "-gen-lto"};
-      check(nvvmVerifyProgram(program, std::size(verify_options), verify_options),
-            "nvvmVerifyProgram");
-      check(nvvmCompileProgram(program, std::size(compile_options), compile_options),
-            "nvvmCompileProgram");
-
-      std::size_t result_size = 0;
-      check(nvvmGetCompiledResultSize(program, &result_size), "nvvmGetCompiledResultSize");
-      auto result = rtcx::byte_buffer::make(result_size);
-      check(nvvmGetCompiledResult(program, reinterpret_cast<char*>(result.data())),
-            "nvvmGetCompiledResult");
-      static_cast<void>(nvvmDestroyProgram(&program));
-      return std::make_shared<rtcx::blob_t>(rtcx::blob_t::from_buffer(std::move(result)));
-    } catch (...) {
-      static_cast<void>(nvvmDestroyProgram(&program));
-      throw;
-    }
-  };
+  auto compile = [&] { return jit::compile_nvvm(name, nvvm_ir, LTO_ARCHITECTURE); };
 
   return cache.get_or_add_blob(key, rtcx::blob_compile_func::from_functor(compile)).get();
 }
