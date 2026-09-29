@@ -78,6 +78,16 @@ struct regex_jit_program_options {
 struct regex_jit_program {
   struct regex_jit_program_impl;
 
+  /**
+   * @brief Creates an operation-specialized regex JIT program
+   *
+   * @param pattern Regex pattern to compile
+   * @param operation Regex API operation implemented by the program
+   * @param options Operation-specific JIT compilation options
+   * @param flags Regex matching flags
+   * @param captures Capture-group behavior
+   * @return Owning pointer to the compiled regex JIT program
+   */
   static std::unique_ptr<regex_jit_program> create(
     std::string_view pattern,
     regex_operation operation,
@@ -90,13 +100,54 @@ struct regex_jit_program {
   regex_jit_program& operator=(regex_jit_program const&) = delete;
   ~regex_jit_program();
 
+  /**
+   * @brief Move-constructs a regex JIT program
+   *
+   * @param other Program to move from
+   */
   regex_jit_program(regex_jit_program&& other) noexcept;
+
+  /**
+   * @brief Move-assigns a regex JIT program
+   *
+   * @param other Program to move from
+   * @return Reference to this program
+   */
   regex_jit_program& operator=(regex_jit_program&& other) noexcept;
 
+  /**
+   * @brief Returns the compiled regex pattern
+   *
+   * @return The compiled regex pattern
+   */
   [[nodiscard]] std::string pattern() const;
+
+  /**
+   * @brief Returns the regex matching flags
+   *
+   * @return The regex matching flags
+   */
   [[nodiscard]] strings::regex_flags flags() const;
+
+  /**
+   * @brief Returns the capture-group behavior
+   *
+   * @return The capture-group behavior
+   */
   [[nodiscard]] strings::capture_groups capture() const;
+
+  /**
+   * @brief Returns the regex API operation implemented by this program
+   *
+   * @return The regex API operation implemented by this program
+   */
   [[nodiscard]] regex_operation operation() const;
+
+  /**
+   * @brief Returns the number of capture groups in the compiled pattern
+   *
+   * @return The number of capture groups in the compiled pattern
+   */
   [[nodiscard]] size_type groups_count() const;
 
  private:

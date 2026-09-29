@@ -36,7 +36,7 @@ namespace cudf::jit {
  */
 class nvvm_api {
  public:
-#define CUDF_NVVM_DECL_MEMBER(name) decltype(nvvm##name) * name = nullptr;
+#define CUDF_NVVM_DECL_MEMBER(name) decltype(nvvm##name)* name = nullptr;
   CUDF_NVVM_FOR_EACH_FUNCTION(CUDF_NVVM_DECL_MEMBER)
 #undef CUDF_NVVM_DECL_MEMBER
 
@@ -72,8 +72,6 @@ class nvvm_api {
  * @param architecture Compute architecture used for the portable LTO fragment
  * @return Compiled LTO IR fragment
  */
-rtcx::blob compile_nvvm(std::string_view name,
-                        std::string_view nvvm_ir,
-                        int32_t architecture);
+rtcx::blob compile_nvvm(std::string_view name, std::string_view nvvm_ir, int32_t architecture);
 
 }  // namespace cudf::jit

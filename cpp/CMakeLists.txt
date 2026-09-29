@@ -507,6 +507,7 @@ rtcx_embed(cudf_cuda_embed COMPRESSION zstd OUTPUT_DIRECTORY "${CMAKE_CURRENT_BI
 
 rtcx_add_embed(regex_ir_nvvm_templates)
 
+# Add an NVVM IR template to the embedded regex template bundle.
 function(add_regex_ir_nvvm_template TEMPLATE_ID TEMPLATE_PATH)
   rtcx_embed_blob(
     regex_ir_nvvm_templates ID ${TEMPLATE_ID} FILE "${CMAKE_CURRENT_SOURCE_DIR}/${TEMPLATE_PATH}"
@@ -1522,14 +1523,8 @@ endif()
 target_link_libraries(
   cudf
   PUBLIC CCCL::CCCL $<BUILD_LOCAL_INTERFACE:BS::thread_pool>
-  PRIVATE $<BUILD_LOCAL_INTERFACE:nvtx3::nvtx3-cpp>
-          $<BUILD_LOCAL_INTERFACE:cuco::cuco>
-          ZLIB::ZLIB
-          kvikio::kvikio
-          ${CUDF_nanoarrow_TARGET}
-          zstd
-          $<BUILD_LOCAL_INTERFACE:xxhash>
-          rtcx::rtcx
+  PRIVATE $<BUILD_LOCAL_INTERFACE:nvtx3::nvtx3-cpp> $<BUILD_LOCAL_INTERFACE:cuco::cuco> ZLIB::ZLIB
+          kvikio::kvikio ${CUDF_nanoarrow_TARGET} zstd $<BUILD_LOCAL_INTERFACE:xxhash> rtcx::rtcx
 )
 
 if(CUDF_STATIC_LINK_NVVM)

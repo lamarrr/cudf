@@ -12,6 +12,7 @@
 #include <cudf/detail/device_scalar.hpp>
 #include <cudf/detail/iterator.cuh>
 #include <cudf/detail/null_mask.hpp>
+#include <cudf/detail/utilities/cuda_memcpy.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/strings/detail/strings_children.cuh>
 #include <cudf/strings/detail/strings_column_factories.cuh>
@@ -22,10 +23,10 @@
 #include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
 
+#include <cuda/iterator>
 #include <cuda/std/utility>
 #include <cuda_runtime_api.h>
 #include <thrust/for_each.h>
-#include <thrust/iterator/counting_iterator.h>
 
 #include <algorithm>
 #include <array>
@@ -400,12 +401,10 @@ span_cache_plan select_span_cache(input_data const& input,
                              static_cast<size_type>(capacity),
                              statistics.data());
   std::array<std::uint64_t, 4> host_statistics{};
-  CUDF_CUDA_TRY(cudaMemcpyAsync(host_statistics.data(),
-                                statistics.data(),
-                                statistics.size() * sizeof(std::uint64_t),
-                                cudaMemcpyDeviceToHost,
-                                stream.get()));
-  CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+  cudf::detail::cuda_memcpy(
+    host_span<std::uint64_t>{host_statistics.data(), host_statistics.size()},
+    device_span<std::uint64_t const>{statistics.data(), statistics.size()},
+    stream);
   auto valid = host_statistics[0];
   if (valid == 0) { return {}; }
   auto average_bytes   = static_cast<double>(host_statistics[1]) / valid;
@@ -647,8 +646,8 @@ std::unique_ptr<column> enumerate_impl(strings_column_view const& input,
     if (cache_plan) {
       auto write_cached = [&](auto* input_offsets) {
         thrust::for_each_n(
-          rmm::exec_policy_nosync(stream),
-          thrust::make_counting_iterator<size_type>(0),
+          rmm::exec_policy_nosync(stream, mr.get_temporary_mr()),
+          cuda::counting_iterator<size_type>{0},
           input.size(),
           cached_enumeration_writer<std::remove_pointer_t<decltype(input_offsets)>>{
             data.chars,
@@ -947,8 +946,8 @@ split_result generate_split_pairs(strings_column_view const& input,
     if (cache_plan) {
       auto write_cached = [&](auto* input_offsets) {
         thrust::for_each_n(
-          rmm::exec_policy_nosync(stream),
-          thrust::make_counting_iterator<size_type>(0),
+          rmm::exec_policy_nosync(stream, mr.get_temporary_mr()),
+          cuda::counting_iterator<size_type>{0},
           input.size(),
           cached_split_writer<std::remove_pointer_t<decltype(input_offsets)>>{data.chars,
                                                                               input_offsets,
