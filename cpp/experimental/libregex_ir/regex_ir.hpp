@@ -37,14 +37,14 @@ struct compile_limits {
  * @brief Regex syntax and compilation settings
  */
 struct compile_options {
-  bool case_insensitive = false;  ///< Enable case-insensitive matching
-  bool multiline        = false;  ///< Make line anchors recognize internal line boundaries
-  bool dot_all          = false;  ///< Allow dot to match configured newline characters
-  bool ascii_classes    = true;   ///< Use ASCII semantics for shorthand character classes
-  bool extended_newline = false;  ///< Recognize the extended Unicode newline set
-  bool find_match_end_observable = true;  ///< Require FIND to produce its end offset
-  character_mode characters          = character_mode::UTF8;  ///< Input character decoding mode
-  compile_limits limits              = compile_limits{};      ///< Compilation resource limits
+  bool case_insensitive          = false;  ///< Enable case-insensitive matching
+  bool multiline                 = false;  ///< Make line anchors recognize internal line boundaries
+  bool dot_all                   = false;  ///< Allow dot to match configured newline characters
+  bool ascii_classes             = true;   ///< Use ASCII semantics for shorthand character classes
+  bool extended_newline          = false;  ///< Recognize the extended Unicode newline set
+  bool find_match_end_observable = true;   ///< Require FIND to produce its end offset
+  character_mode characters      = character_mode::UTF8;  ///< Input character decoding mode
+  compile_limits limits          = compile_limits{};      ///< Compilation resource limits
 };
 
 /**

@@ -498,9 +498,7 @@ rtcx_add_embed(regex_ir_nvvm_templates)
 
 function(add_regex_ir_nvvm_template TEMPLATE_ID TEMPLATE_PATH)
   rtcx_embed_blob(
-    regex_ir_nvvm_templates
-    ID ${TEMPLATE_ID}
-    FILE "${CMAKE_CURRENT_SOURCE_DIR}/${TEMPLATE_PATH}"
+    regex_ir_nvvm_templates ID ${TEMPLATE_ID} FILE "${CMAKE_CURRENT_SOURCE_DIR}/${TEMPLATE_PATH}"
     DEST "${TEMPLATE_PATH}"
   )
 endfunction()
@@ -513,20 +511,19 @@ add_regex_ir_nvvm_template(regex_dfa experimental/libregex_ir/nvvm/dfa.ll.in)
 add_regex_ir_nvvm_template(regex_recursive experimental/libregex_ir/nvvm/recursive.ll.in)
 add_regex_ir_nvvm_template(regex_operations experimental/libregex_ir/nvvm/operations.ll.in)
 add_regex_ir_nvvm_template(kernel_module src/strings/experimental/regex_jit/nvvm/module.ll.in)
-add_regex_ir_nvvm_template(kernel_functions
-                           src/strings/experimental/regex_jit/nvvm/functions.ll.in)
+add_regex_ir_nvvm_template(kernel_functions src/strings/experimental/regex_jit/nvvm/functions.ll.in)
 add_regex_ir_nvvm_template(kernel_fixed src/strings/experimental/regex_jit/nvvm/fixed.ll.in)
-add_regex_ir_nvvm_template(kernel_enumeration
-                           src/strings/experimental/regex_jit/nvvm/enumeration.ll.in)
+add_regex_ir_nvvm_template(
+  kernel_enumeration src/strings/experimental/regex_jit/nvvm/enumeration.ll.in
+)
 add_regex_ir_nvvm_template(kernel_replace src/strings/experimental/regex_jit/nvvm/replace.ll.in)
 add_regex_ir_nvvm_template(kernel_split src/strings/experimental/regex_jit/nvvm/split.ll.in)
-add_regex_ir_nvvm_template(kernel_warp_literal
-                           src/strings/experimental/regex_jit/nvvm/warp_literal.ll.in)
+add_regex_ir_nvvm_template(
+  kernel_warp_literal src/strings/experimental/regex_jit/nvvm/warp_literal.ll.in
+)
 
 rtcx_embed(
-  regex_ir_nvvm_templates
-  COMPRESSION none
-  OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/embed"
+  regex_ir_nvvm_templates COMPRESSION none OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/embed"
 )
 
 rtcx_add_embed(cudf_fragments)
@@ -1504,9 +1501,15 @@ endif()
 target_link_libraries(
   cudf
   PUBLIC CCCL::CCCL $<BUILD_LOCAL_INTERFACE:BS::thread_pool>
-  PRIVATE $<BUILD_LOCAL_INTERFACE:nvtx3::nvtx3-cpp> $<BUILD_LOCAL_INTERFACE:cuco::cuco> ZLIB::ZLIB
-          kvikio::kvikio ${CUDF_nanoarrow_TARGET} zstd $<BUILD_LOCAL_INTERFACE:xxhash>
-          "${CUDAToolkit_LIBRARY_ROOT}/nvvm/lib64/libnvvm.so" rtcx::rtcx
+  PRIVATE $<BUILD_LOCAL_INTERFACE:nvtx3::nvtx3-cpp>
+          $<BUILD_LOCAL_INTERFACE:cuco::cuco>
+          ZLIB::ZLIB
+          kvikio::kvikio
+          ${CUDF_nanoarrow_TARGET}
+          zstd
+          $<BUILD_LOCAL_INTERFACE:xxhash>
+          "${CUDAToolkit_LIBRARY_ROOT}/nvvm/lib64/libnvvm.so"
+          rtcx::rtcx
 )
 
 if(NOT _absorbed_nvcomp)
