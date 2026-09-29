@@ -535,7 +535,6 @@ std::tuple<rtcx::library, rtcx::blob> link_library_uncached(
 
   options.emplace_back("-lto");
   options.emplace_back(std::format("-arch=sm_{}", sm));
-  options.emplace_back("-kernels-used=cudf_kernel_entry");
 
   if (cfg.disable_cuda_cache) { options.emplace_back("--no-cache"); }
 
@@ -584,7 +583,6 @@ cuda_runtime={}
 cuda_driver={}
 arch={}
 bundle={}
-kernels_used=cudf_kernel_entry
 )***",
                           name,
                           runtime,
