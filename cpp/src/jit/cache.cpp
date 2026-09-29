@@ -497,8 +497,7 @@ rtcx::blob get_nvvm_fragment(std::string const& name, std::string const& nvvm_ir
 
   auto& ctx   = cudf::get_context();
   auto& cache = ctx.rtcx_cache();
-  auto sm     = ctx.get_device_properties().compute_capability;
-  auto spec   = std::format("NVVM LTO IR\nname={}\narch=compute_{}\n", name, sm);
+  auto spec   = std::format("NVVM LTO IR\nname={}\narch=compute_{}\n", name, LTO_ARCHITECTURE);
 
   XXH3_state_t state;
   XXH3_INITSTATE(&state);
@@ -527,7 +526,7 @@ rtcx::blob get_nvvm_fragment(std::string const& name, std::string const& nvvm_ir
     try {
       check(nvvmAddModuleToProgram(program, nvvm_ir.data(), nvvm_ir.size(), name.c_str()),
             "nvvmAddModuleToProgram");
-      auto architecture             = std::format("-arch=compute_{}", sm);
+      auto architecture             = std::format("-arch=compute_{}", LTO_ARCHITECTURE);
       char const* verify_options[]  = {architecture.c_str()};
       char const* compile_options[] = {architecture.c_str(), "-opt=3", "-gen-lto"};
       check(nvvmVerifyProgram(program, std::size(verify_options), verify_options),
