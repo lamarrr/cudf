@@ -683,16 +683,14 @@ std::unique_ptr<column> enumerate_impl(strings_column_view const& input,
   }
   auto strings_output = make_strings(pairs, stream, mr);
 
-  rmm::device_buffer null_mask;
-  size_type null_count;
-  if (findall) {
-    null_mask  = cudf::detail::copy_bitmask(input.parent(), stream, mr.get_output_mr());
-    null_count = input.null_count();
-  } else {
+  auto [null_mask, null_count] = [&]() -> std::pair<cuda::device_buffer<std::byte>, size_type> {
+    if (findall) {
+      return {cudf::detail::copy_bitmask(input.parent(), stream, mr.get_output_mr()),
+              input.null_count()};
+    }
     auto converted = cudf::bools_to_mask(validity->view(), stream, mr.get_output_mr());
-    null_mask      = std::move(*converted.first);
-    null_count     = converted.second;
-  }
+    return {std::move(*converted.first), converted.second};
+  }();
   return make_lists_column(
     input.size(), std::move(offsets), std::move(strings_output), null_count, std::move(null_mask));
 }
