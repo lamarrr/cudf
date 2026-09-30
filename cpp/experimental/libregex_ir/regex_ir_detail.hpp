@@ -128,6 +128,35 @@ struct character_predicate {
 };
 
 /**
+ * @brief Select a byte anchor using only the literal's own repeated structure
+ *
+ * For multi-byte literals, the returned byte completes the least-repeated adjacent byte pair.
+ * This avoids assumptions about the input language while making the preceding byte an inexpensive
+ * secondary guard. Single-byte literals return offset zero.
+ *
+ * @param literal Non-empty encoded literal
+ * @return Byte offset of the selected anchor
+ */
+[[nodiscard]] inline std::size_t literal_anchor(std::string_view literal)
+{
+  if (literal.size() < 2U) return 0U;
+  auto best       = std::size_t{0};
+  auto best_count = literal.size();
+  for (std::size_t candidate = 0; candidate + 1U < literal.size(); ++candidate) {
+    auto count = std::size_t{0};
+    for (std::size_t position = 0; position + 1U < literal.size(); ++position) {
+      count += literal[position] == literal[candidate] &&
+               literal[position + 1U] == literal[candidate + 1U];
+    }
+    if (count < best_count) {
+      best       = candidate;
+      best_count = count;
+    }
+  }
+  return best + 1U;
+}
+
+/**
  * @brief Zero-width assertion evaluated at the current input position
  */
 enum class assertion_kind : std::uint8_t {

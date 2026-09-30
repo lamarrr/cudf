@@ -14,6 +14,7 @@
 #include <cudf/detail/null_mask.hpp>
 #include <cudf/detail/utilities/cuda_memcpy.hpp>
 #include <cudf/reduction.hpp>
+#include <cudf/strings/detail/char_tables.hpp>
 #include <cudf/strings/detail/strings_children.cuh>
 #include <cudf/strings/detail/strings_column_factories.cuh>
 #include <cudf/strings/experimental/regex.hpp>
@@ -72,6 +73,7 @@ struct regex_jit_program::regex_jit_program_impl {
   std::array<std::optional<retained_kernel>, kernel_slot_count> kernels;
   regex_ir::executor_kind executor;
   size_type cache_values;
+  bool uses_character_flags;
   std::optional<std::string> validation_error;
 };
 
@@ -111,6 +113,11 @@ struct regex_jit_program_accessor {
 
   static size_type cache_values(regex_jit_program const& prog) { return prog._impl->cache_values; }
 
+  static bool uses_character_flags(regex_jit_program const& prog)
+  {
+    return prog._impl->uses_character_flags;
+  }
+
   static bool has_span_cache(regex_jit_program const& prog)
   {
     return prog._impl->kernels[kernel_slot(kernel_role::SAMPLE, false)].has_value();
@@ -140,14 +147,11 @@ std::uint32_t block_size(regex_ir::operation_kind operation, regex_ir::executor_
   auto literal = executor == regex_ir::executor_kind::SINGLE_BYTE_LITERAL ||
                  executor == regex_ir::executor_kind::PACKED_ASCII_LITERAL ||
                  executor == regex_ir::executor_kind::PACKED_UTF8_LITERAL;
-  // Boolean and direct-literal scans benefit from retaining each thread's sequential input window
-  // in L1. Complex ordered span operations are divergence-limited and need smaller blocks for
-  // occupancy and scheduling.
-  return !literal && (operation == regex_ir::operation_kind::COUNT ||
-                      operation == regex_ir::operation_kind::REPLACE ||
-                      operation == regex_ir::operation_kind::SPLIT)
-           ? 256
-           : 1024;
+  // Replacement compiles for the largest geometry selected at execution. Split and complex count
+  // operations are divergence-limited and need smaller blocks for occupancy and scheduling.
+  if (operation == regex_ir::operation_kind::REPLACE) { return 1024; }
+  auto split = operation == regex_ir::operation_kind::SPLIT;
+  return split || (!literal && operation == regex_ir::operation_kind::COUNT) ? 256 : 1024;
 }
 
 struct input_data {
@@ -268,16 +272,18 @@ retained_kernel compile_kernel(std::string const& matcher,
                                regex_ir::operation_kind operation,
                                regex_ir::executor_kind executor,
                                std::string wrapper,
-                               std::string_view name)
+                               std::string const& name)
 {
+  static std::string const matcher_name{"cudf.experimental.regex.matcher"};
+
   auto threads                      = block_size(operation, executor);
-  auto matcher_fragment             = get_nvvm_fragment("cudf.experimental.regex.matcher", matcher);
+  auto matcher_fragment             = get_nvvm_fragment(matcher_name, matcher);
   auto wrapper_module               = detail::regex_jit::make_module(std::move(wrapper));
-  auto wrapper_fragment             = get_nvvm_fragment(std::string{name}, wrapper_module);
+  auto wrapper_fragment             = get_nvvm_fragment(name, wrapper_module);
   rtcx::memory_fragment fragments[] = {
     {.data = matcher_fragment->view(), .type = rtcx::binary_type::LTO_IR, .name = nullptr},
     {.data = wrapper_fragment->view(), .type = rtcx::binary_type::LTO_IR, .name = nullptr}};
-  auto compiled   = get_lto_linked_kernel(std::string{name}, {}, fragments);
+  auto compiled   = get_lto_linked_kernel(name, {}, fragments);
   auto attributes = cudaFuncAttributes{};
   CUDF_CUDA_TRY(cudaFuncGetAttributes(&attributes, compiled.get().get()));
   auto maximum_threads = attributes.maxThreadsPerBlock;
@@ -288,10 +294,11 @@ retained_kernel compile_kernel(std::string const& matcher,
 }
 
 template <typename... Args>
-void launch(retained_kernel const& prepared,
-            input_data const& input,
-            cuda::stream_ref stream,
-            Args... args)
+void launch_with_threads(retained_kernel const& prepared,
+                         input_data const& input,
+                         cuda::stream_ref stream,
+                         std::uint32_t threads,
+                         Args... args)
 {
   if (input.rows == 0) { return; }
   auto chars      = const_cast<char*>(input.chars);
@@ -299,11 +306,19 @@ void launch(retained_kernel const& prepared,
   auto validity   = const_cast<bitmask_type*>(input.validity);
   auto row_offset = input.row_offset;
   auto rows       = input.rows;
-  auto threads    = prepared.threads;
   auto grid =
     static_cast<std::uint32_t>((static_cast<std::uint32_t>(rows) + threads - 1) / threads);
   prepared.value.launch_with(
     {grid, 1, 1}, {threads, 1, 1}, 0, stream, chars, offsets, validity, row_offset, rows, args...);
+}
+
+template <typename... Args>
+void launch(retained_kernel const& prepared,
+            input_data const& input,
+            cuda::stream_ref stream,
+            Args... args)
+{
+  launch_with_threads(prepared, input, stream, prepared.threads, args...);
 }
 
 template <typename... Args>
@@ -518,12 +533,41 @@ std::unique_ptr<column> fixed_result(strings_column_view const& input,
   auto data          = get_input_data(input, stream);
   auto* warp         = regex_jit_program_accessor::warp_literal_kernel(prog, data.offset64);
   auto non_null_rows = input.size() - input.null_count();
-  auto warp_parallel = non_null_rows > 0 && data.chars_bytes / non_null_rows > 64;
-  if (warp != nullptr && warp_parallel) {
+  auto utf8_literal =
+    regex_jit_program_accessor::executor(prog) == regex_ir::executor_kind::PACKED_UTF8_LITERAL;
+  auto average_bytes       = non_null_rows > 0 ? data.chars_bytes / non_null_rows : 0;
+  auto power_of_two_stride = average_bytes >= 128 && (average_bytes & (average_bytes - 1)) == 0;
+  // Power-of-two row strides give the warp literal reader naturally coalesced candidate rounds.
+  auto warp_parallel =
+    warp != nullptr && non_null_rows > 0 &&
+    (utf8_literal ? average_bytes > 191 || power_of_two_stride : average_bytes > 64);
+  if (warp_parallel) {
     launch_warp_per_row(*warp, data, stream, result->mutable_view().head<void>());
   } else {
     auto& prepared = regex_jit_program_accessor::kernel(prog, kernel_role::PRIMARY, data.offset64);
-    launch(prepared, data, stream, result->mutable_view().head<void>());
+    // The scalar UTF-8 contains loop is latency-bound, while the find loop needs occupancy to
+    // cover a complete scan. Unicode table lookups benefit from smaller blocks than other matchers.
+    auto threads =
+      (utf8_literal && prog.operation() == regex_operation::CONTAINS) || average_bytes <= 64
+        ? std::min(prepared.threads, 256U)
+        : prepared.threads;
+    auto uses_character_flags = regex_jit_program_accessor::uses_character_flags(prog);
+    if (uses_character_flags && prog.operation() == regex_operation::FIND) {
+      threads = std::min(threads, 256U);
+    } else if (uses_character_flags && prog.operation() == regex_operation::COUNT) {
+      threads = std::min(threads, 512U);
+    }
+    if (uses_character_flags) {
+      launch_with_threads(prepared,
+                          data,
+                          stream,
+                          threads,
+                          result->mutable_view().head<void>(),
+                          const_cast<strings::detail::character_flags_table_type*>(
+                            strings::detail::get_character_flags_table(stream)));
+    } else {
+      launch_with_threads(prepared, data, stream, threads, result->mutable_view().head<void>());
+    }
   }
   return result;
 }
@@ -777,12 +821,23 @@ std::unique_ptr<column> replace_impl(strings_column_view const& input,
   if (prog.pattern().empty()) {
     return std::make_unique<column>(input.parent(), stream, mr.get_output_mr());
   }
-  auto sizes      = make_numeric_column(data_type{type_id::INT32},
+  auto sizes         = make_numeric_column(data_type{type_id::INT32},
                                    input.size(),
                                    mask_state::UNALLOCATED,
                                    stream,
                                    mr.get_temporary_mr());
-  auto data       = get_input_data(input, stream);
+  auto data          = get_input_data(input, stream);
+  auto average_bytes = data.chars_bytes / data.rows;
+  auto executor      = regex_jit_program_accessor::executor(prog);
+  auto literal       = executor == regex_ir::executor_kind::SINGLE_BYTE_LITERAL ||
+                 executor == regex_ir::executor_kind::PACKED_ASCII_LITERAL ||
+                 executor == regex_ir::executor_kind::PACKED_UTF8_LITERAL;
+  auto desired_threads = 256U;
+  if (average_bytes <= 32) { desired_threads = literal ? 512U : 1024U; }
+  auto launch_replace = [&](retained_kernel const& prepared, auto... args) {
+    launch_with_threads(
+      prepared, data, stream, std::min(prepared.threads, desired_threads), args...);
+  };
   auto cache_plan = select_span_cache(data, prog, stream, mr.get_temporary_mr());
   std::optional<rmm::device_uvector<std::int64_t>> cache;
   std::optional<rmm::device_uvector<std::uint8_t>> overflow;
@@ -797,19 +852,17 @@ std::unique_ptr<column> replace_impl(strings_column_view const& input,
     match_counts.emplace(input.size(), stream, mr.get_temporary_mr());
     CUDF_CUDA_TRY(cudaMemsetAsync(overflow->data(), 0, overflow->size(), stream.get()));
     auto& size_kernel = regex_jit_program_accessor::cache_size_kernel(prog, data.offset64);
-    launch(size_kernel,
-           data,
-           stream,
-           sizes->mutable_view().head<void>(),
-           cache->data(),
-           cache_plan.capacity,
-           overflow->data(),
-           match_counts->data(),
-           size_overflow.data());
+    launch_replace(size_kernel,
+                   sizes->mutable_view().head<void>(),
+                   cache->data(),
+                   cache_plan.capacity,
+                   overflow->data(),
+                   match_counts->data(),
+                   size_overflow.data());
   } else {
     auto& size_kernel =
       regex_jit_program_accessor::kernel(prog, kernel_role::PRIMARY, data.offset64);
-    launch(size_kernel, data, stream, sizes->mutable_view().head<void>(), size_overflow.data());
+    launch_replace(size_kernel, sizes->mutable_view().head<void>(), size_overflow.data());
   }
   CUDF_EXPECTS(size_overflow.value(stream) == 0,
                "Size of output string exceeds the column size limit",
@@ -822,19 +875,17 @@ std::unique_ptr<column> replace_impl(strings_column_view const& input,
     if (cache_plan) {
       auto& emit_kernel =
         regex_jit_program_accessor::cache_emit_kernel(prog, data.offset64, output_offset64);
-      launch(emit_kernel,
-             data,
-             stream,
-             chars.data(),
-             offsets->view().head<void>(),
-             cache->data(),
-             cache_plan.capacity,
-             overflow->data(),
-             match_counts->data());
+      launch_replace(emit_kernel,
+                     chars.data(),
+                     offsets->view().head<void>(),
+                     cache->data(),
+                     cache_plan.capacity,
+                     overflow->data(),
+                     match_counts->data());
     } else {
       auto& emit_kernel =
         regex_jit_program_accessor::kernel(prog, kernel_role::EMIT, data.offset64, output_offset64);
-      launch(emit_kernel, data, stream, chars.data(), offsets->view().head<void>());
+      launch_replace(emit_kernel, chars.data(), offsets->view().head<void>());
     }
   }
   return make_strings_column(
@@ -1111,27 +1162,28 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
       }
     }
     auto executor            = compiled.executor;
-    auto exact_ascii_literal = std::move(compiled.exact_ascii_literal);
+    auto exact_literal_bytes = std::move(compiled.exact_literal_bytes);
+    auto repeated_builtin    = compiled.repeated_builtin;
     auto matcher             = std::move(compiled.nvvm_ir);
     auto kernels             = std::array<std::optional<retained_kernel>, kernel_slot_count>{};
     auto cache_values        = size_type{0};
     auto kernel_operation    = replacement_operation ? regex_ir::operation_kind::REPLACE : internal;
 
-    auto add_pass = [&](kernel_role role, auto&& make_wrapper, std::string_view name) {
+    auto add_pass = [&](kernel_role role, auto&& make_wrapper, std::string const& name) {
       for (auto offset64 : {false, true}) {
         kernels[kernel_slot(role, offset64)] =
           compile_kernel(matcher, kernel_operation, executor, make_wrapper(offset64), name);
       }
     };
-    auto add_output_offset_pass = [&](
-                                    kernel_role role, auto&& make_wrapper, std::string_view name) {
-      for (auto offset64 : {false, true}) {
-        for (auto output_offset64 : {false, true}) {
-          kernels[kernel_slot(role, offset64, output_offset64)] = compile_kernel(
-            matcher, kernel_operation, executor, make_wrapper(offset64, output_offset64), name);
+    auto add_output_offset_pass =
+      [&](kernel_role role, auto&& make_wrapper, std::string const& name) {
+        for (auto offset64 : {false, true}) {
+          for (auto output_offset64 : {false, true}) {
+            kernels[kernel_slot(role, offset64, output_offset64)] = compile_kernel(
+              matcher, kernel_operation, executor, make_wrapper(offset64, output_offset64), name);
+          }
         }
-      }
-    };
+      };
     ensure_stack_size();
     switch (operation) {
       case regex_operation::CONTAINS:
@@ -1141,17 +1193,18 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
         add_pass(
           kernel_role::PRIMARY,
           [&](bool offset64) {
-            return detail::regex_jit::make_fixed_kernel(offset64, internal, KERNEL_ENTRY);
+            return detail::regex_jit::make_fixed_kernel(
+              offset64, internal, repeated_builtin, KERNEL_ENTRY);
           },
           "cudf.experimental.regex.fixed");
         if (operation == regex_operation::CONTAINS) {
-          if (exact_ascii_literal.has_value()) {
+          if (exact_literal_bytes.has_value()) {
             for (auto offset64 : {false, true}) {
               auto prepared                                             = compile_kernel(matcher,
                                              internal,
                                              executor,
                                              detail::regex_jit::make_warp_literal_contains_kernel(
-                                               offset64, *exact_ascii_literal, KERNEL_ENTRY),
+                                               offset64, *exact_literal_bytes, KERNEL_ENTRY),
                                              "cudf.experimental.regex.warp_literal_contains");
               prepared.threads                                          = 256;
               kernels[kernel_slot(kernel_role::WARP_LITERAL, offset64)] = std::move(prepared);
@@ -1346,8 +1399,13 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
         break;
       }
     }
-    _impl = std::make_unique<regex_jit_program_impl>(regex_jit_program_impl{
-      capture_count, std::move(kernels), executor, cache_values, std::move(validation_error)});
+    _impl =
+      std::make_unique<regex_jit_program_impl>(regex_jit_program_impl{capture_count,
+                                                                      std::move(kernels),
+                                                                      executor,
+                                                                      cache_values,
+                                                                      repeated_builtin.has_value(),
+                                                                      std::move(validation_error)});
   } catch (std::invalid_argument const& error) {
     CUDF_FAIL(error.what());
   }

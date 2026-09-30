@@ -123,3 +123,18 @@ done:
   ret void
 }
 ; END split_size
+
+; BEGIN selected
+  %selected = call i1 @regex_ir_split_row_selected(i1 %valid, i8* %overflow, i32 %row)
+  br i1 %selected, label %setup, label %done
+; END selected
+
+; BEGIN selected_begin
+%selected_begin = add i64 %source_begin, 0
+  %selected_end = call i64 @regex_ir_reverse_split_end(i64* %row_spans, i32 %full_count, i32 %effective_count, i32 %token, i1 %truncated, i64 %source_end)
+; END selected_begin
+
+; BEGIN selected_begin_2
+%selected_begin = add i64 %source_begin, 0
+  %selected_end = call i64 @regex_ir_forward_split_end(i32 %effective_count, i32 %token, i1 %truncated, i64 %size, i64 %source_end)
+; END selected_begin_2

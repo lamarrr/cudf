@@ -39,9 +39,7 @@ inner:
   %candidate = icmp ule i64 %candidate_end, %size
   br i1 %candidate, label %compare, label %inner_done
 compare:
-  %first_ptr = getelementptr i8, i8* %data, i64 %position
-  %first = load i8, i8* %first_ptr, align 1
-  %first_equal = icmp eq i8 %first, @FIRST_BYTE@
+@ANCHOR_CHECK@
 @VERIFY@inner_continue:
   %next_candidate = add nuw i64 %candidate_offset, 1
   %more_candidates = icmp ult i64 %next_candidate, %candidate_limit
@@ -83,3 +81,27 @@ done:
 verify:
 @OFFSETS@@COMPARISONS@  br i1 @MATCHED@, label %local_yes, label %inner_continue
 ; END warp_literal_verify
+
+; BEGIN literal_chunk_ptr_n
+  %literal_chunk_ptr_{0} = bitcast i8* %literal_ptr_{0} to i{1}*
+  %literal_chunk_{0} = load i{1}, i{1}* %literal_chunk_ptr_{0}, align 1
+; END literal_chunk_ptr_n
+
+; BEGIN pivot_ptr
+  %pivot_ptr = getelementptr i8, i8* %data, i64 %position
+  %pivot = load i8, i8* %pivot_ptr, align 1
+  %first_equal = icmp eq i8 %pivot, {}
+; END pivot_ptr
+
+; BEGIN pivot_position
+  %pivot_position = add i64 %position, {0}
+  %pivot_ptr = getelementptr i8, i8* %data, i64 %pivot_position
+  %pivot = load i8, i8* %pivot_ptr, align 1
+  %pivot_equal = icmp eq i8 %pivot, {1}
+  br i1 %pivot_equal, label %anchor_guard, label %inner_continue
+anchor_guard:
+  %guard_position = add i64 %position, {2}
+  %guard_ptr = getelementptr i8, i8* %data, i64 %guard_position
+  %guard = load i8, i8* %guard_ptr, align 1
+  %first_equal = icmp eq i8 %guard, {3}
+; END pivot_position

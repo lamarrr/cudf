@@ -76,7 +76,8 @@ inline std::string render_nvvm_template_text(
 
   for (auto& [token, value] : replacements) {
     if (token.empty() || result.find(token) == std::string::npos) {
-      throw std::invalid_argument("NVVM template replacement token is missing");
+      throw std::invalid_argument(
+        std::format("NVVM template replacement token '{}' is missing", token));
     }
     for (auto position = result.find(token); position != std::string::npos;
          position      = result.find(token, position + value.size())) {
@@ -102,15 +103,7 @@ inline std::string render_nvvm_template_section(
 }
 
 template <typename... Args>
-std::string format_nvvm_template(std::size_t index, Args&&... args)
-{
-  return std::vformat(nvvm_template(index), std::make_format_args(args...));
-}
-
-template <typename... Args>
-std::string format_nvvm_template_section(std::size_t index,
-                                         std::string_view section,
-                                         Args&&... args)
+std::string nvvm_template(std::size_t index, std::string_view section, Args&&... args)
 {
   return std::vformat(nvvm_template_section(index, section), std::make_format_args(args...));
 }

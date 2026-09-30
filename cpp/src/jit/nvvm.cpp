@@ -164,7 +164,7 @@ std::string nvvm_api::version_string() const
   return std::format("{}.{}", version_major_, version_minor_);
 }
 
-rtcx::blob compile_nvvm(std::string_view name, std::string_view nvvm_ir, int32_t architecture)
+rtcx::blob compile_nvvm(std::string const& name, std::string_view nvvm_ir, int32_t architecture)
 {
   auto& nvvm                     = nvvm_api::get();
   nvvmProgram program            = nullptr;
@@ -180,10 +180,9 @@ rtcx::blob compile_nvvm(std::string_view name, std::string_view nvvm_ir, int32_t
     };
 
   check(nvvm.CreateProgram(&program), "nvvmCreateProgram", {});
-  auto module_name = std::string{name};
-  auto output      = rtcx::blob{};
+  auto output = rtcx::blob{};
   try {
-    check(nvvm.AddModuleToProgram(program, nvvm_ir.data(), nvvm_ir.size(), module_name.c_str()),
+    check(nvvm.AddModuleToProgram(program, nvvm_ir.data(), nvvm_ir.size(), name.c_str()),
           "nvvmAddModuleToProgram",
           {});
     check(nvvm.VerifyProgram(program, std::size(verify_options), verify_options),

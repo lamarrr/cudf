@@ -82,6 +82,18 @@ enum class executor_kind : std::uint8_t {
 };
 
 /**
+ * @brief Built-in Unicode character predicate delegated to an embedding adapter
+ */
+enum class builtin_character_class : std::uint8_t {
+  DIGIT,      ///< Unicode digit predicate
+  NOT_DIGIT,  ///< Negated Unicode digit predicate
+  WORD,       ///< Unicode word-character predicate
+  NOT_WORD,   ///< Negated Unicode word-character predicate
+  SPACE,      ///< Unicode whitespace predicate
+  NOT_SPACE,  ///< Negated Unicode whitespace predicate
+};
+
+/**
  * @brief Result of compiling a regular expression
  */
 struct compile_result {
@@ -91,6 +103,8 @@ struct compile_result {
   std::uint32_t executor_states;   ///< Number of states in the selected executor
   std::uint32_t alphabet_classes;  ///< Number of character classes in its alphabet partition
   std::optional<std::string> exact_ascii_literal;  ///< Exact ASCII literal recognized, if any
+  std::optional<std::string> exact_literal_bytes;  ///< Exact encoded literal recognized, if any
+  std::optional<builtin_character_class> repeated_builtin;  ///< Adapted repeated predicate, if any
 };
 
 /**

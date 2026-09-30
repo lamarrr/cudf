@@ -296,3 +296,23 @@ groups_finished:
   %next_output_index = add i64 %output_index, 1
   br label %after_write
 ; END write_findall_whole
+
+; BEGIN group_base
+%group_base = mul i64 %group64, %rows64
+  %row64 = sext i32 %row to i64
+  %pair_index = add i64 %group_base, %row64
+; END group_base
+
+; BEGIN typed_cache
+%typed_cache = bitcast i8* %cache_buffer to i64*
+  %overflow_ptr = getelementptr i8, i8* %overflow, i32 %row
+  call void @regex_ir_cache_captures(i64* %capture_ptr, i64* %typed_cache, i32 %row, i32 %capacity, i32 {}, i64 %count, i8* %overflow_ptr)
+; END typed_cache
+
+; BEGIN overflow_ptr
+%overflow_ptr = getelementptr i8, i8* %overflow, i32 %row
+  %overflow_value = load i8, i8* %overflow_ptr, align 1
+  %did_overflow = icmp ne i8 %overflow_value, 0
+  %selected = and i1 %valid, %did_overflow
+  br i1 %selected, label %setup, label %done
+; END overflow_ptr

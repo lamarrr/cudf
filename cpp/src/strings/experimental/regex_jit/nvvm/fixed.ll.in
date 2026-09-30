@@ -33,7 +33,7 @@ done:
 
 ; BEGIN fixed_count
 
-define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output) nounwind {
+define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output@FLAGS_PARAMETER@) nounwind {
 entry:
   %row = call i32 @regex_ir_row_index()
   %in_bounds = icmp slt i32 %row, %rows
@@ -46,7 +46,7 @@ count:
   %string = call %regex_ir_string @regex_ir_load_string(i8* %chars, i8* %offsets, i32 %physical)
   %data = extractvalue %regex_ir_string %string, 0
   %size = extractvalue %regex_ir_string %string, 1
-  %count64 = call i64 @regex_ir_execute(i8* %data, i64 %size)
+  %count64 = call i64 @regex_ir_execute(i8* %data, i64 %size@FLAGS_ARGUMENT@)
   %value = trunc i64 %count64 to i32
   br label %store
 store_zero:

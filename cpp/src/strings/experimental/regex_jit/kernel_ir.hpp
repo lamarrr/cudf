@@ -36,13 +36,16 @@ struct replacement_piece {
  *
  * @param offset64 Whether input string offsets use 64-bit integers
  * @param operation Regex operation implemented by the kernel
+ * @param repeated_builtin Built-in repeated predicate adapted by the kernel, if any
  * @param kernel_name Exported kernel entry-point name
  * @return Textual NVVM IR for the kernel
  * @throw std::invalid_argument If `kernel_name` is not a valid, non-reserved identifier
  */
-[[nodiscard]] std::string make_fixed_kernel(bool offset64,
-                                            regex_ir::operation_kind operation,
-                                            std::string_view kernel_name);
+[[nodiscard]] std::string make_fixed_kernel(
+  bool offset64,
+  regex_ir::operation_kind operation,
+  std::optional<regex_ir::builtin_character_class> repeated_builtin,
+  std::string_view kernel_name);
 
 /**
  * @brief Generate a warp-per-row kernel for an exact ASCII literal contains operation

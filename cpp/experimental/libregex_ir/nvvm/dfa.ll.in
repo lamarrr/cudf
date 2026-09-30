@@ -19,8 +19,8 @@ entry:
 ; END dfa_boundary_globals
 
 ; BEGIN dfa_unicode_globals
-@{0} = internal addrspace(4) constant [{1} x i32] [{2}], align 4
-@{3} = internal addrspace(4) constant [{1} x i16] [{4}], align 2
+@{0} = internal addrspace(1) constant [{1} x i32] [{2}], align 4
+@{3} = internal addrspace(1) constant [{1} x i16] [{4}], align 2
 ; END dfa_unicode_globals
 
 ; BEGIN dfa_classifier_prefix
@@ -468,3 +468,194 @@ transition:
   br i1 %dead, label %candidate_fail, label %capture_transition
 capture_transition:
 ; END tagged_dfa_find_loop
+
+; BEGIN byte_offset_n
+  %byte_offset_{} = sub i32 %cp, {}
+  %byte_in_{} = icmp ule i32 %byte_offset_{}, {}
+; END byte_offset_n
+
+; BEGIN byte_index
+  %byte_index = zext i32 %cp to i64
+  %byte_class_ptr = getelementptr [256 x i16], [256 x i16] addrspace(4)* @{0}, i64 0, i64 %byte_index
+  %byte_class_i16 = load i16, i16 addrspace(4)* %byte_class_ptr, align 2
+  %byte_class = zext i16 %byte_class_i16 to i32
+  ret i32 %byte_class
+; END byte_index
+
+; BEGIN unicode_le_n
+  %unicode_le_{0} = icmp ule i32 %cp, {1}
+  %unicode_class_{0} = select i1 %unicode_le_{0}, i32 {2}, i32 {3}
+; END unicode_le_n
+
+; BEGIN has_previous
+  %has_previous = icmp ne i64 %position, 0
+  %has_current = icmp ult i64 %position, %size
+  %previous_word_raw = call i1 @{0}(i32 %previous_cp)
+  %current_word_raw = call i1 @{0}(i32 %current_cp)
+  %previous_word = and i1 %has_previous, %previous_word_raw
+  %current_word = and i1 %has_current, %current_word_raw
+  %word_boundary = xor i1 %previous_word, %current_word
+  %not_word_boundary = xor i1 %word_boundary, true
+; END has_previous
+
+; BEGIN current_lf
+  %current_lf = icmp eq i32 %current_cp, 10
+  %current_newline = icmp eq i32 %current_cp, 10
+  %previous_newline = icmp eq i32 %previous_cp, 10
+  %not_mid_crlf = icmp eq i32 0, 0
+; END current_lf
+
+; BEGIN begin_after_newline
+  %begin_after_newline = and i1 %previous_newline, %not_mid_crlf
+  %begin_line = or i1 %at_begin, %begin_after_newline
+; END begin_after_newline
+
+; BEGIN end_at_newline
+  %end_at_newline = and i1 %current_newline, %not_mid_crlf
+  %end_line = or i1 %at_end, %end_at_newline
+; END end_at_newline
+
+; BEGIN next_position
+  %next_position = add i64 %position, %current_width
+  %current_is_final = icmp eq i64 %next_position, %size
+; END next_position
+
+; BEGIN current_cr
+  %current_cr = icmp eq i32 %current_cp, 13
+  %next_cp = call i32 @{0}(i8* %data, i64 %size, i64 %next_position)
+  %next_width = call i64 @{1}(i8* %data, i64 %size, i64 %next_position)
+  %after_next = add i64 %next_position, %next_width
+  %next_lf = icmp eq i32 %next_cp, 10
+  %after_next_is_end = icmp eq i64 %after_next, %size
+  %crlf_tail_0 = and i1 %current_cr, %next_lf
+  %crlf_tail = and i1 %crlf_tail_0, %after_next_is_end
+  %final_sequence = or i1 %current_is_final, %crlf_tail
+; END current_cr
+
+; BEGIN end_final_newline_0
+  %end_final_newline_0 = and i1 %current_newline, %not_mid_crlf
+  %end_final_newline = and i1 %end_final_newline_0, {0}
+  %end_line = or i1 %at_end, %end_final_newline
+; END end_final_newline_0
+
+; BEGIN ascii
+ascii:
+  %ascii_class = call i32 @{0}(i32 %first)
+  br label %transition
+; END ascii
+
+; BEGIN next_state_index
+  %next_state_index = and i32 %next_state, {0}
+  %dead = icmp eq i32 %next_state_index, {1}
+  br i1 %dead, label %reject, label %transition_live
+transition_live:
+; END next_state_index
+
+; BEGIN reject
+reject:
+  ret i1 false
+; END reject
+
+; BEGIN done_assertion
+  %done_assertion = call i1 @{0}(i8* %data, i64 %size, i64 %position, i32 {1}, i1 {2}, i1 {3})
+  %done_result = and i1 %accepted, %done_assertion
+; END done_assertion
+
+; BEGIN branch_br_label_continue
+  br label %continue
+continue:
+  br label %loop
+done:
+  %accept_bits = and i32 %state, 32768
+  %accepted = icmp ne i32 %accept_bits, 0
+{0}  ret i1 {1}
+{2}
+}}
+; END branch_br_label_continue
+
+; BEGIN n_n_n_ptr
+  %{0}_{1}_{2}_ptr = getelementptr i64, i64* %captures, i64 {3}
+  store i64 {4}, i64* %{0}_{1}_{2}_ptr, align 8
+; END n_n_n_ptr
+
+; BEGIN n_n_n_end_ptr
+  %{0}_{1}_{2}_end_ptr = getelementptr i64, i64* %captures, i64 {3}
+  store i64 -1, i64* %{0}_{1}_{2}_end_ptr, align 8
+; END n_n_n_end_ptr
+
+; BEGIN n_done
+{}_done:
+  br label %{}
+; END n_done
+
+; BEGIN start_filter_offset_n
+  %start_filter_offset_{} = sub i32 %start_filter_byte, {}
+  {} = icmp ule i32 %start_filter_offset_{}, {}
+; END start_filter_offset_n
+
+; BEGIN start_filter_advance
+start_filter_advance:
+  %start_filter_seek_start = add nuw i64 %start, 1
+  %start_filter_next = call i64 @regex_ir_seek_byte(i8* %data, i64 %size, i64 %start_filter_seek_start, i32 {})
+  br label %search
+; END start_filter_advance
+
+; BEGIN start_filter_advance_2
+start_filter_advance:
+  %start_filter_next = add nuw i64 %start, 1
+  br label %search
+; END start_filter_advance_2
+
+; BEGIN restart_state_match
+  %restart_state_match = icmp eq i32 %state, {0}
+  %restart_consumed = icmp ugt i64 %position, %start
+  %restart_before_end = icmp ult i64 %position, %size
+  %restart_prefix_candidate = and i1 %restart_state_match, %restart_consumed
+  %restart_prefix = and i1 %restart_prefix_candidate, %restart_before_end
+  %restart_base = select i1 %restart_prefix, i64 %position, i64 %start
+; END restart_state_match
+
+; BEGIN prefix_seek_start
+  %prefix_seek_start = add nuw i64 {}, 1
+  %next_start = call i64 @regex_ir_seek_byte(i8* %data, i64 %size, i64 %prefix_seek_start, i32 {})
+; END prefix_seek_start
+
+; BEGIN capture_n_ptr
+  %capture_{0}_ptr = getelementptr i64, i64* %captures, i64 {0}
+  store i64 -1, i64* %capture_{0}_ptr, align 8
+; END capture_n_ptr
+
+; BEGIN consume
+consume:
+  %next_position = add i64 %position, %character_width
+  %accept_bits = and i32 %encoded, 32768
+  %accepted = icmp ne i32 %accept_bits, 0
+  br i1 %accepted, label %capture_accept, label %continue
+continue:
+  br label %loop
+capture_accept:
+; END consume
+
+; BEGIN literal_chunk_ptr_n
+  %literal_chunk_ptr_{} = bitcast i8* %literal_byte_ptr_{} to i{}*
+  %literal_chunk_{} = load i{}, i{}* %literal_chunk_ptr_{}, align 1
+; END literal_chunk_ptr_n
+
+; BEGIN prefix_seek_start_2
+  %prefix_seek_start = add nuw i64 %start, 1
+  %next_start = call i64 @regex_ir_seek_byte(i8* %data, i64 %size, i64 %prefix_seek_start, i32 {})
+; END prefix_seek_start_2
+
+; BEGIN restart_state_match_2
+  %restart_state_match = icmp eq i32 %state, {0}
+  %restart_consumed = icmp ugt i64 %position, %start
+  %restart_before_end = icmp ult i64 %position, %size
+  %restart_prefix_candidate = and i1 %restart_state_match, %restart_consumed
+  %restart_prefix = and i1 %restart_prefix_candidate, %restart_before_end
+  %restart_base = select i1 %restart_prefix, i64 %position, i64 %start
+; END restart_state_match_2
+
+; BEGIN prefix_seek_start_3
+  %prefix_seek_start = add nuw i64 {}, 1
+  %next_start = call i64 @regex_ir_seek_byte(i8* %data, i64 %size, i64 %prefix_seek_start, i32 {})
+; END prefix_seek_start_3

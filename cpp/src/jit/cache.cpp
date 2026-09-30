@@ -493,7 +493,7 @@ kernel_instance={}
   return fut.get();
 }
 
-rtcx::blob get_nvvm_fragment(std::string_view name, std::string_view nvvm_ir)
+rtcx::blob get_nvvm_fragment(std::string const& name, std::string_view nvvm_ir)
 {
   CUDF_FUNC_RANGE();
 

@@ -72,6 +72,6 @@ class nvvm_api {
  * @param architecture Compute architecture used for the portable LTO fragment
  * @return Compiled LTO IR fragment
  */
-rtcx::blob compile_nvvm(std::string_view name, std::string_view nvvm_ir, int32_t architecture);
+rtcx::blob compile_nvvm(std::string const& name, std::string_view nvvm_ir, int32_t architecture);
 
 }  // namespace cudf::jit

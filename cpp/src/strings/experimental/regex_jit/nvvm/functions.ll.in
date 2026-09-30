@@ -9,6 +9,47 @@ declare i1 @regex_ir_execute(i8*, i64) nounwind readonly
 declare i64 @regex_ir_execute(i8*, i64) nounwind readonly
 ; END matcher_count_declaration
 
+; BEGIN matcher_builtin_count_declaration
+declare i64 @regex_ir_execute(i8*, i64, i8*) nounwind readonly
+; END matcher_builtin_count_declaration
+
+; BEGIN repeated_builtin_adapter
+define i1 @regex_ir_repeated_builtin(i32 %codepoint, i8* %character_flags) alwaysinline nounwind readonly {{
+entry:
+  %in_table = icmp ult i32 %codepoint, 65536
+  br i1 %in_table, label %load, label %classify
+load:
+  %index = zext i32 %codepoint to i64
+  %flag_ptr = getelementptr i8, i8* %character_flags, i64 %index
+  %loaded_flags = load i8, i8* %flag_ptr, align 1
+  br label %classify
+classify:
+  %flags = phi i8 [ %loaded_flags, %load ], [ 0, %entry ]
+  %digit_bits = and i8 %flags, 4
+  %digit = icmp ne i8 %digit_bits, 0
+  %word_bits = and i8 %flags, 15
+  %alphanumeric = icmp ne i8 %word_bits, 0
+  %underscore = icmp eq i32 %codepoint, 95
+  %word = or i1 %alphanumeric, %underscore
+  %space_bits = and i8 %flags, 16
+  %space = icmp ne i8 %space_bits, 0
+  %base_is_digit = icmp ult i8 {0}, 2
+  %base_is_word = icmp ult i8 {0}, 4
+  %word_or_space = select i1 %base_is_word, i1 %word, i1 %space
+  %positive = select i1 %base_is_digit, i1 %digit, i1 %word_or_space
+  %negated_class = and i8 {0}, 1
+  %negated = icmp ne i8 %negated_class, 0
+  %inverted = xor i1 %positive, true
+  %newline = icmp eq i32 %codepoint, 10
+  %nonspace_negated = icmp ult i8 {0}, 4
+  %exclude_newline = and i1 %nonspace_negated, %newline
+  %not_excluded = xor i1 %exclude_newline, true
+  %valid_inverted = and i1 %inverted, %not_excluded
+  %result = select i1 %negated, i1 %valid_inverted, i1 %positive
+  ret i1 %result
+}}
+; END repeated_builtin_adapter
+
 ; BEGIN matcher_find_declaration
 declare i1 @regex_ir_execute(i8*, i64, i64*) nounwind
 ; END matcher_find_declaration

@@ -182,6 +182,63 @@ exit:
 }
 ; END decode_codepoint_utf8
 
+; BEGIN decode_utf8_packed
+define internal i64 @regex_ir_decode_utf8_packed(i8* %data, i64 %size, i64 %pos, i32 %first) alwaysinline nounwind readonly {
+entry:
+  %ascii = icmp ult i32 %first, 128
+  br i1 %ascii, label %invalid_or_single, label %classify
+classify:
+  %prefix2 = and i32 %first, 192
+  %is2 = icmp eq i32 %prefix2, 192
+  %prefix3 = and i32 %first, 224
+  %is3 = icmp eq i32 %prefix3, 224
+  %prefix4 = and i32 %first, 240
+  %is4 = icmp eq i32 %prefix4, 240
+  %continuation = icmp eq i32 %prefix2, 128
+  %two = zext i1 %is2 to i64
+  %three = zext i1 %is3 to i64
+  %four = zext i1 %is4 to i64
+  %continuation_adjustment = zext i1 %continuation to i64
+  %through_two = add i64 1, %two
+  %through_three = add i64 %through_two, %three
+  %through_four = add i64 %through_three, %four
+  %raw_width = sub i64 %through_four, %continuation_adjustment
+  %zero_width = icmp eq i64 %raw_width, 0
+  %required = select i1 %zero_width, i64 1, i64 %raw_width
+  %is_multibyte = icmp ugt i64 %required, 1
+  br i1 %is_multibyte, label %initialize, label %invalid_or_single
+initialize:
+  %mask3 = select i1 %is3, i32 15, i32 7
+  %mask = select i1 %is2, i32 31, i32 %mask3
+  %initial = and i32 %first, %mask
+  br label %loop
+loop:
+  %index = phi i64 [ 1, %initialize ], [ %next_index, %body ]
+  %value = phi i32 [ %initial, %initialize ], [ %combined, %body ]
+  %done = icmp uge i64 %index, %required
+  br i1 %done, label %decoded, label %body
+body:
+  %byte_pos = add i64 %pos, %index
+  %byte_ptr = getelementptr i8, i8* %data, i64 %byte_pos
+  %byte = call i32 @regex_ir_load_byte(i8* %byte_ptr)
+  %payload = and i32 %byte, 63
+  %shifted = shl i32 %value, 6
+  %combined = or i32 %shifted, %payload
+  %next_index = add i64 %index, 1
+  br label %loop
+decoded:
+  %codepoint64 = zext i32 %value to i64
+  %shifted_codepoint = shl i64 %codepoint64, 32
+  %packed = or i64 %shifted_codepoint, %required
+  ret i64 %packed
+invalid_or_single:
+  %first64 = zext i32 %first to i64
+  %shifted_first = shl i64 %first64, 32
+  %single = or i64 %shifted_first, 1
+  ret i64 %single
+}
+; END decode_utf8_packed
+
 ; BEGIN seek_byte
 define internal i64 @regex_ir_seek_byte(i8* %data, i64 %size, i64 %start, i32 %needle) alwaysinline nounwind readonly {
 entry:
@@ -243,7 +300,7 @@ not_found:
 ; END seek_byte
 
 ; BEGIN unicode_class
-define internal i32 @regex_ir_unicode_class(i32 %cp, i32 addrspace(4)* %range_ends, i16 addrspace(4)* %classes, i32 %count) alwaysinline nounwind readonly {
+define internal i32 @regex_ir_unicode_class(i32 %cp, i32 addrspace(1)* %range_ends, i16 addrspace(1)* %classes, i32 %count) alwaysinline nounwind readonly {
 entry:
   br label %search
 search:
@@ -256,8 +313,8 @@ probe:
   %half = lshr i32 %span, 1
   %mid = add i32 %low, %half
   %mid64 = zext i32 %mid to i64
-  %end_ptr = getelementptr i32, i32 addrspace(4)* %range_ends, i64 %mid64
-  %range_end = load i32, i32 addrspace(4)* %end_ptr, align 4
+  %end_ptr = getelementptr i32, i32 addrspace(1)* %range_ends, i64 %mid64
+  %range_end = load i32, i32 addrspace(1)* %end_ptr, align 4
   %before_end = icmp ule i32 %cp, %range_end
   %after_mid = add i32 %mid, 1
   %next_low = select i1 %before_end, i32 %low, i32 %after_mid
@@ -267,8 +324,8 @@ step:
   br label %search
 found:
   %index64 = zext i32 %low to i64
-  %class_ptr = getelementptr i16, i16 addrspace(4)* %classes, i64 %index64
-  %class16 = load i16, i16 addrspace(4)* %class_ptr, align 2
+  %class_ptr = getelementptr i16, i16 addrspace(1)* %classes, i64 %index64
+  %class16 = load i16, i16 addrspace(1)* %class_ptr, align 2
   %class = zext i16 %class16 to i32
   ret i32 %class
 }
@@ -342,8 +399,32 @@ entry:
 copy:
   %source_ptr = getelementptr i8, i8* %source, i64 %begin
   %output_ptr = getelementptr i8, i8* %output, i64 %cursor
-  call void @llvm.memcpy.p0i8.p0i8.i64(i8* align 1 %output_ptr, i8* align 1 %source_ptr, i64 %length, i1 false)
-  br label %done
+  %bulk_length = and i64 %length, -8
+  br label %copy_wide_check
+copy_wide_check:
+  %wide_offset = phi i64 [ 0, %copy ], [ %wide_next, %copy_wide ]
+  %wide_done = icmp uge i64 %wide_offset, %bulk_length
+  br i1 %wide_done, label %copy_tail_check, label %copy_wide
+copy_wide:
+  %wide_source_byte = getelementptr i8, i8* %source_ptr, i64 %wide_offset
+  %wide_source = bitcast i8* %wide_source_byte to i64*
+  %wide_value = load i64, i64* %wide_source, align 1
+  %wide_output_byte = getelementptr i8, i8* %output_ptr, i64 %wide_offset
+  %wide_output = bitcast i8* %wide_output_byte to i64*
+  store i64 %wide_value, i64* %wide_output, align 1
+  %wide_next = add nuw i64 %wide_offset, 8
+  br label %copy_wide_check
+copy_tail_check:
+  %tail_offset = phi i64 [ %bulk_length, %copy_wide_check ], [ %tail_next, %copy_tail ]
+  %tail_done = icmp uge i64 %tail_offset, %length
+  br i1 %tail_done, label %done, label %copy_tail
+copy_tail:
+  %tail_source = getelementptr i8, i8* %source_ptr, i64 %tail_offset
+  %tail_value = load i8, i8* %tail_source, align 1
+  %tail_output = getelementptr i8, i8* %output_ptr, i64 %tail_offset
+  store i8 %tail_value, i8* %tail_output, align 1
+  %tail_next = add nuw i64 %tail_offset, 1
+  br label %copy_tail_check
 done:
   ret i64 %next_cursor
 }
@@ -736,6 +817,52 @@ done:
 declare i1 @llvm.expect.i1(i1, i1)
 ; END llvm_expect_declaration
 
-; BEGIN llvm_memcpy_declaration
-declare void @llvm.memcpy.p0i8.p0i8.i64(i8*, i8*, i64, i1)
-; END llvm_memcpy_declaration
+; BEGIN not_lf
+  %not_lf = icmp ne i32 %cp, 10
+  %not_cr = icmp ne i32 %cp, 13
+  %not_nel = icmp ne i32 %cp, 133
+  %not_ls = icmp ne i32 %cp, 8232
+  %not_ps = icmp ne i32 %cp, 8233
+  %not_crlf = and i1 %not_lf, %not_cr
+  %not_extended_0 = and i1 %not_nel, %not_ls
+  %not_extended_1 = and i1 %not_extended_0, %not_ps
+  %result = and i1 %not_crlf, %not_extended_1
+  ret i1 %result
+; END not_lf
+
+; BEGIN not_lf_2
+  %not_lf = icmp ne i32 %cp, 10
+  ret i1 %not_lf
+; END not_lf_2
+
+; BEGIN n
+  %{0} = icmp uge i32 %cp, {3}
+  %{1} = icmp ule i32 %cp, {4}
+  %{2} = and i1 %{0}, %{1}
+; END n
+
+; BEGIN negated
+  %negated = xor i1 %{}, true
+  ret i1 %negated
+; END negated
+
+; BEGIN check_n
+check_{0}:
+  %byte_pos_{0} = add i64 %pos, {0}
+  %byte_ptr_{0} = getelementptr i8, i8* %data, i64 %byte_pos_{0}
+  %byte_{0} = call i32 @{1}(i8* %byte_ptr_{0})
+  %matches_{0} = icmp eq i32 %byte_{0}, {2}
+  br i1 %matches_{0}, label %{3}, label %fail
+; END check_n
+
+; BEGIN check_n_2
+check_{0}:
+  %cp_{0} = call i32 @{1}(i8* %data, i64 %size, i64 {2})
+  %matches_{0} = icmp eq i32 %cp_{0}, {3}
+; END check_n_2
+
+; BEGIN width_n
+  %width_{0} = call i64 @{2}(i8* %data, i64 %size, i64 {3})
+  %pos_{1} = add i64 {3}, %width_{0}
+  br i1 %matches_{0}, label %check_{1}, label %fail
+; END width_n

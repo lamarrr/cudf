@@ -5,6 +5,8 @@
 
 #include "kernel_ir.hpp"
 
+#include "regex_ir_detail.hpp"
+
 #include <nvvm_templates.hpp>
 
 #include <algorithm>
@@ -19,7 +21,7 @@
 namespace cudf::experimental::detail::regex_jit {
 namespace {
 
-enum class matcher_abi { NONE, BOOLEAN, COUNT, FIND, CAPTURES, REPLACE, SPLIT };
+enum class matcher_abi { NONE, BOOLEAN, COUNT, BUILTIN_COUNT, FIND, CAPTURES, REPLACE, SPLIT };
 
 void replace_all(std::string& text, std::string_view from, std::string_view to)
 {
@@ -47,6 +49,10 @@ std::string common_nvvm(bool offset64, bool pairs, matcher_abi abi)
     case matcher_abi::COUNT:
       result += regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions,
                                                 "matcher_count_declaration");
+      break;
+    case matcher_abi::BUILTIN_COUNT:
+      result += regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions,
+                                                "matcher_builtin_count_declaration");
       break;
     case matcher_abi::FIND:
       result += regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions,
@@ -93,7 +99,7 @@ std::string annotate_kernel(std::string module,
 {
   require_kernel_name(kernel_name);
   replace_all(module, "@KERNEL_ENTRY@", std::format("@{}", kernel_name));
-  module += regex_ir::format_nvvm_template_section(
+  module += regex_ir::nvvm_template(
     regex_ir_nvvm_templates::kernel_functions, "kernel_annotation", signature, kernel_name);
   return module;
 }
@@ -113,7 +119,8 @@ std::string make_warp_literal_contains_kernel(bool offset64,
   if (literal.empty()) { throw std::invalid_argument("literal must not be empty"); }
   auto comparisons = std::string{};
   auto matched     = std::string{};
-  auto offset      = std::size_t{1};
+  auto pivot       = regex_ir::literal_anchor(literal);
+  auto offset      = pivot == 0U ? std::size_t{1} : std::size_t{0};
   auto index       = std::size_t{0};
   while (offset < literal.size()) {
     auto remaining      = literal.size() - offset;
@@ -132,12 +139,11 @@ std::string make_warp_literal_contains_kernel(bool offset64,
                      "  %literal_chunk_{0} = load i8, i8* %literal_ptr_{0}, align 1\n",
                      index);
     } else {
-      std::format_to(std::back_inserter(comparisons),
-                     R"NVVM(  %literal_chunk_ptr_{0} = bitcast i8* %literal_ptr_{0} to i{1}*
-  %literal_chunk_{0} = load i{1}, i{1}* %literal_chunk_ptr_{0}, align 1
-)NVVM",
-                     index,
-                     bits);
+      std::format_to(
+        std::back_inserter(comparisons),
+        "{}",
+        regex_ir::nvvm_template(
+          regex_ir_nvvm_templates::kernel_warp_literal, "literal_chunk_ptr_n", index, bits));
     }
     std::format_to(std::back_inserter(comparisons),
                    "  %literal_equal_{0} = icmp eq i{1} %literal_chunk_{0}, {2}\n",
@@ -158,7 +164,7 @@ std::string make_warp_literal_contains_kernel(bool offset64,
   }
 
   auto offsets = std::string{};
-  offset       = 1;
+  offset       = pivot == 0U ? std::size_t{1} : std::size_t{0};
   for (std::size_t chunk = 0; chunk < index; ++chunk) {
     std::format_to(std::back_inserter(offsets),
                    "  %literal_offset_{0} = add i64 %position, {1}\n",
@@ -176,37 +182,65 @@ std::string make_warp_literal_contains_kernel(bool offset64,
           "warp_literal_verify",
           {{"@OFFSETS@", offsets}, {"@COMPARISONS@", comparisons}, {"@MATCHED@", matched}});
 
+  auto anchor_check = std::string{};
+  if (literal.size() == 1U) {
+    anchor_check = regex_ir::nvvm_template(
+      regex_ir_nvvm_templates::kernel_warp_literal,
+      "pivot_ptr",
+      static_cast<std::uint32_t>(static_cast<std::uint8_t>(literal.front())));
+  } else {
+    anchor_check = regex_ir::nvvm_template(
+      regex_ir_nvvm_templates::kernel_warp_literal,
+      "pivot_position",
+      pivot,
+      static_cast<std::uint32_t>(static_cast<std::uint8_t>(literal[pivot])),
+      pivot - 1U,
+      static_cast<std::uint32_t>(static_cast<std::uint8_t>(literal[pivot - 1U])));
+  }
+
   auto result = common_nvvm(offset64, false, matcher_abi::NONE);
-  result += regex_ir::render_nvvm_template_section(
-    regex_ir_nvvm_templates::kernel_warp_literal,
-    "warp_literal_contains",
-    {{"@LITERAL_SIZE@", std::to_string(literal.size())},
-     {"@FIRST_BYTE@",
-      std::to_string(static_cast<std::uint32_t>(static_cast<std::uint8_t>(literal.front())))},
-     {"@VERIFY@", verify}});
+  result +=
+    regex_ir::render_nvvm_template_section(regex_ir_nvvm_templates::kernel_warp_literal,
+                                           "warp_literal_contains",
+                                           {{"@LITERAL_SIZE@", std::to_string(literal.size())},
+                                            {"@ANCHOR_CHECK@", anchor_check},
+                                            {"@VERIFY@", verify}});
   return annotate_kernel(std::move(result), "i8*, i8*, i32*, i32, i32, i8*", kernel_name);
 }
 
 std::string make_fixed_kernel(bool offset64,
                               regex_ir::operation_kind operation,
+                              std::optional<regex_ir::builtin_character_class> repeated_builtin,
                               std::string_view kernel_name)
 {
   auto abi    = operation == regex_ir::operation_kind::CONTAINS ||
                  operation == regex_ir::operation_kind::MATCHES
                   ? matcher_abi::BOOLEAN
-                : operation == regex_ir::operation_kind::COUNT ? matcher_abi::COUNT
-                                                               : matcher_abi::FIND;
+                : operation == regex_ir::operation_kind::COUNT
+                  ? repeated_builtin.has_value() ? matcher_abi::BUILTIN_COUNT : matcher_abi::COUNT
+                  : matcher_abi::FIND;
   auto result = common_nvvm(offset64, false, abi);
+  if (repeated_builtin.has_value()) {
+    result += regex_ir::nvvm_template(regex_ir_nvvm_templates::kernel_functions,
+                                      "repeated_builtin_adapter",
+                                      static_cast<unsigned>(*repeated_builtin));
+  }
   if (operation == regex_ir::operation_kind::CONTAINS ||
       operation == regex_ir::operation_kind::MATCHES) {
     result +=
       regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_fixed, "fixed_boolean");
   } else if (operation == regex_ir::operation_kind::COUNT) {
-    result += regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_fixed, "fixed_count");
+    result += regex_ir::render_nvvm_template_section(
+      regex_ir_nvvm_templates::kernel_fixed,
+      "fixed_count",
+      {{"@FLAGS_PARAMETER@", repeated_builtin.has_value() ? ", i8* %character_flags" : ""},
+       {"@FLAGS_ARGUMENT@", repeated_builtin.has_value() ? ", i8* %character_flags" : ""}});
   } else {
     result += regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_fixed, "fixed_find");
   }
-  return annotate_kernel(std::move(result), "i8*, i8*, i32*, i32, i32, i8*", kernel_name);
+  auto signature = repeated_builtin.has_value() ? "i8*, i8*, i32*, i32, i32, i8*, i8*"
+                                                : "i8*, i8*, i32*, i32, i32, i8*";
+  return annotate_kernel(std::move(result), signature, kernel_name);
 }
 
 std::string make_capture_kernel(bool offset64,
@@ -225,10 +259,9 @@ std::string make_capture_kernel(bool offset64,
      {"@OUTPUT_GROUPS@", std::to_string(output_groups)},
      {"@COLUMN_SETUP@", column_major ? "%rows64 = sext i32 %rows to i64" : ""},
      {"@PAIR_INDEX@",
-      column_major ? R"NVVM(%group_base = mul i64 %group64, %rows64
-  %row64 = sext i32 %row to i64
-  %pair_index = add i64 %group_base, %row64)NVVM"
-                   : "%pair_index = sext i32 %row to i64"}});
+      column_major
+        ? regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_enumeration, "group_base")
+        : "%pair_index = sext i32 %row to i64"}});
   return annotate_kernel(std::move(result), "i8*, i8*, i32*, i32, i32, i8*", kernel_name);
 }
 
@@ -245,12 +278,10 @@ std::string make_enumeration_size_kernel(bool offset64,
       regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions, "capture_cache");
   }
   auto cache_parameters = cache ? ", i8* %cache_buffer, i32 %capacity, i8* %overflow" : "";
-  auto cache_match      = cache ? std::format(
-                               R"NVVM(%typed_cache = bitcast i8* %cache_buffer to i64*
-  %overflow_ptr = getelementptr i8, i8* %overflow, i32 %row
-  call void @regex_ir_cache_captures(i64* %capture_ptr, i64* %typed_cache, i32 %row, i32 %capacity, i32 {}, i64 %count, i8* %overflow_ptr))NVVM",
-                               capture_slots)
-                                : "";
+  auto cache_match =
+    cache ? regex_ir::nvvm_template(
+              regex_ir_nvvm_templates::kernel_enumeration, "typed_cache", capture_slots)
+          : "";
   result += regex_ir::render_nvvm_template_section(
     regex_ir_nvvm_templates::kernel_enumeration,
     "enumeration_size",
@@ -290,13 +321,10 @@ std::string make_enumeration_emit_kernel(bool offset64,
       {{"@CAPTURE_SLOTS@", std::to_string(capture_slots)}, {"@GROUPS@", std::to_string(groups)}});
   }();
   auto overflow_parameter = overflow_only ? ", i8* %overflow" : "";
-  auto overflow_guard     = overflow_only
-                              ? R"NVVM(%overflow_ptr = getelementptr i8, i8* %overflow, i32 %row
-  %overflow_value = load i8, i8* %overflow_ptr, align 1
-  %did_overflow = icmp ne i8 %overflow_value, 0
-  %selected = and i1 %valid, %did_overflow
-  br i1 %selected, label %setup, label %done)NVVM"
-                              : "br i1 %valid, label %setup, label %done";
+  auto overflow_guard =
+    overflow_only
+      ? regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_enumeration, "overflow_ptr")
+      : "br i1 %valid, label %setup, label %done";
   result +=
     regex_ir::render_nvvm_template_section(regex_ir_nvvm_templates::kernel_enumeration,
                                            "enumeration_emit",
@@ -338,8 +366,6 @@ std::string make_limited_replace_kernel(bool offset64,
     result +=
       regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions, "capture_cache");
   }
-  result += regex_ir::nvvm_template_section(regex_ir_nvvm_templates::regex_functions,
-                                            "llvm_memcpy_declaration");
   result +=
     regex_ir::nvvm_template_section(regex_ir_nvvm_templates::regex_functions, "append_range");
   for (std::size_t index = 0; index < replacement.size(); ++index) {
@@ -358,33 +384,21 @@ std::string make_limited_replace_kernel(bool offset64,
     auto next_cursor = std::format("%cursor_piece_{}", index);
     if (piece.capture.has_value()) {
       auto slot = static_cast<std::int64_t>(*piece.capture) * 2;
-      steps += std::format(
-        R"NVVM(  %capture_begin_ptr_{0} = getelementptr i64, i64* %captures, i64 {2}
-  %capture_end_ptr_{0} = getelementptr i64, i64* %captures, i64 {3}
-  %capture_begin_{0} = load i64, i64* %capture_begin_ptr_{0}, align 8
-  %capture_end_{0} = load i64, i64* %capture_end_ptr_{0}, align 8
-  %capture_has_begin_{0} = icmp sge i64 %capture_begin_{0}, 0
-  %capture_has_end_{0} = icmp sge i64 %capture_end_{0}, 0
-  %capture_present_{0} = and i1 %capture_has_begin_{0}, %capture_has_end_{0}
-  %capture_selected_begin_{0} = select i1 %capture_present_{0}, i64 %capture_begin_{0}, i64 0
-  %capture_selected_end_{0} = select i1 %capture_present_{0}, i64 %capture_end_{0}, i64 0
-  {4} = call i64 @regex_ir_append_range(i8* %data, i64 %capture_selected_begin_{0}, i64 %capture_selected_end_{0}, i8* %output, i64 {5})
-)NVVM",
-        index,
-        capture_slots,
-        slot,
-        slot + 1,
-        next_cursor,
-        cursor);
+      steps += regex_ir::nvvm_template(regex_ir_nvvm_templates::kernel_replace,
+                                       "capture_begin_ptr_n",
+                                       index,
+                                       capture_slots,
+                                       slot,
+                                       slot + 1,
+                                       next_cursor,
+                                       cursor);
     } else if (!piece.literal.empty()) {
-      steps += std::format(
-        R"NVVM(  %literal_{0} = getelementptr [{1} x i8], [{1} x i8]* @regex_ir_replacement_{0}, i32 0, i32 0
-  {2} = call i64 @regex_ir_append_range(i8* %literal_{0}, i64 0, i64 {1}, i8* %output, i64 {3})
-)NVVM",
-        index,
-        piece.literal.size(),
-        next_cursor,
-        cursor);
+      steps += regex_ir::nvvm_template(regex_ir_nvvm_templates::kernel_replace,
+                                       "literal_n",
+                                       index,
+                                       piece.literal.size(),
+                                       next_cursor,
+                                       cursor);
     } else {
       continue;
     }
@@ -500,26 +514,24 @@ std::string make_split_emit_kernel(bool offset64,
     result +=
       regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions, "split_overflow");
   }
-  auto overflow_guard =
-    overflow_only
-      ? R"NVVM(  %selected = call i1 @regex_ir_split_row_selected(i1 %valid, i8* %overflow, i32 %row)
-  br i1 %selected, label %setup, label %done)NVVM"
-      : "  br i1 %valid, label %setup, label %done";
-  auto source_index = std::string{};
-  auto select_span  = std::string{};
+  auto overflow_guard = overflow_only ? regex_ir::nvvm_template_section(
+                                          regex_ir_nvvm_templates::kernel_split, "selected")
+                                      : "  br i1 %valid, label %setup, label %done";
+  auto source_index   = std::string{};
+  auto select_span    = std::string{};
   if (reverse) {
     result +=
       regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions, "split_reverse");
     source_index =
       R"NVVM(%source = call i32 @regex_ir_reverse_split_source(i32 %full_count, i32 %effective_count, i32 %token, i1 %truncated))NVVM";
-    select_span = R"NVVM(%selected_begin = add i64 %source_begin, 0
-  %selected_end = call i64 @regex_ir_reverse_split_end(i64* %row_spans, i32 %full_count, i32 %effective_count, i32 %token, i1 %truncated, i64 %source_end))NVVM";
+    select_span =
+      regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_split, "selected_begin");
   } else {
     result +=
       regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions, "split_forward");
     source_index = "%source = add i32 %token, 0";
-    select_span  = R"NVVM(%selected_begin = add i64 %source_begin, 0
-  %selected_end = call i64 @regex_ir_forward_split_end(i32 %effective_count, i32 %token, i1 %truncated, i64 %size, i64 %source_end))NVVM";
+    select_span =
+      regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_split, "selected_begin_2");
   }
   result +=
     regex_ir::render_nvvm_template_section(regex_ir_nvvm_templates::kernel_split,

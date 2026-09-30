@@ -86,6 +86,13 @@ no:
 }}
 ; END string_equals_line
 
+; BEGIN fixed_ascii_class_at
+define internal zeroext i1 @{0}(i8* %data, i64 %size, i64 %position) nounwind readonly {{
+entry:
+{1}  ret i1 {2}
+}}
+; END fixed_ascii_class_at
+
 ; BEGIN boolean_find_adapter
 define zeroext i1 @{0}(i8* %data, i64 %size) nounwind readonly {{
 entry:
@@ -207,6 +214,38 @@ done:
   ret i64 %count
 }
 ; END count_execute
+
+; BEGIN count_builtin_execute
+define i64 @EXECUTE@(i8* %data, i64 %size, i8* %character_flags) nounwind readonly {
+entry:
+  %match_begin = alloca i64, align 8
+  %match_end = alloca i64, align 8
+  br label %loop
+loop:
+  %search_start = phi i64 [ 0, %entry ], [ %end_value, %nonempty ], [ %empty_next, %advance_empty ]
+  %count = phi i64 [ 0, %entry ], [ %next_count, %nonempty ], [ %next_count, %advance_empty ]
+  %matched = call i1 @FIND_FROM@(i8* %data, i64 %size, i64 %search_start, i64* %match_begin, i64* %match_end, i64* null, i8* %character_flags)
+  br i1 %matched, label %found, label %done
+found:
+  %begin_value = load i64, i64* %match_begin, align 8
+  %end_value = load i64, i64* %match_end, align 8
+  %next_count = add i64 %count, 1
+  %nonempty_match = icmp ne i64 %begin_value, %end_value
+  br i1 %nonempty_match, label %nonempty, label %empty
+nonempty:
+  br label %loop
+empty:
+  %empty_at_end = icmp eq i64 %end_value, %size
+  br i1 %empty_at_end, label %done_after_match, label %advance_empty
+advance_empty:
+  %empty_next = call i64 @ADVANCE@(i8* %data, i64 %size, i64 %end_value, i64 1)
+  br label %loop
+done_after_match:
+  ret i64 %next_count
+done:
+  ret i64 %count
+}
+; END count_builtin_execute
 
 ; BEGIN operation_execute_adapter
 define zeroext i1 @{0}(i8* %data, i64 %size, i64* %span) alwaysinline nounwind {{
@@ -338,3 +377,64 @@ done:
   ret i64 %count
 }}
 ; END word_run_count
+
+; BEGIN branch_br_i1_matched_label_alias_whole_match_la
+  br i1 %matched, label %alias_whole_match, label %done
+alias_whole_match:
+  %whole_begin = load i64, i64* %match_begin, align 8
+  %whole_end = load i64, i64* %match_end, align 8
+; END branch_br_i1_matched_label_alias_whole_match_la
+
+; BEGIN whole_capture_begin_ptr_n
+  %whole_capture_begin_ptr_{0} = getelementptr i64, i64* %captures, i64 {1}
+  %whole_capture_end_ptr_{0} = getelementptr i64, i64* %captures, i64 {2}
+  store i64 %whole_begin, i64* %whole_capture_begin_ptr_{0}, align 8
+  store i64 %whole_end, i64* %whole_capture_end_ptr_{0}, align 8
+; END whole_capture_begin_ptr_n
+
+; BEGIN branch_br_label_done
+  br label %done
+done:
+; END branch_br_label_done
+
+; BEGIN capture_array
+  %capture_array = alloca [{0} x i64], align 8
+  %captures = getelementptr [{0} x i64], [{0} x i64]* %capture_array, i64 0, i64 0
+; END capture_array
+
+; BEGIN replacement_constant_n
+  %replacement_constant_{0} = getelementptr [{1} x i8], [{1} x i8] addrspace(4)* @{2}, i64 0, i64 0
+  %replacement_literal_{0} = addrspacecast i8 addrspace(4)* %replacement_constant_{0} to i8*
+  %replacement_cursor_{0} = call i64 @{3}(i8* %replacement_literal_{0}, i64 0, i64 {1}, i8* %output, i64 {4})
+; END replacement_constant_n
+
+; BEGIN replacement_capture_begin_ptr_n
+  %replacement_capture_begin_ptr_{0} = getelementptr i64, i64* %captures, i64 {1}
+  %replacement_capture_end_ptr_{0} = getelementptr i64, i64* %captures, i64 {2}
+  %replacement_capture_begin_{0} = load i64, i64* %replacement_capture_begin_ptr_{0}, align 8
+  %replacement_capture_end_{0} = load i64, i64* %replacement_capture_end_ptr_{0}, align 8
+  %replacement_capture_has_begin_{0} = icmp ne i64 %replacement_capture_begin_{0}, -1
+  %replacement_capture_has_end_{0} = icmp ne i64 %replacement_capture_end_{0}, -1
+  %replacement_capture_valid_{0} = and i1 %replacement_capture_has_begin_{0}, %replacement_capture_has_end_{0}
+  %replacement_capture_safe_begin_{0} = select i1 %replacement_capture_valid_{0}, i64 %replacement_capture_begin_{0}, i64 0
+  %replacement_capture_safe_end_{0} = select i1 %replacement_capture_valid_{0}, i64 %replacement_capture_end_{0}, i64 0
+  %replacement_cursor_{0} = call i64 @{3}(i8* %data, i64 %replacement_capture_safe_begin_{0}, i64 %replacement_capture_safe_end_{0}, i8* %output, i64 {4})
+; END replacement_capture_begin_ptr_n
+
+; BEGIN n
+{}:
+  %matched_{} = call i1 @{}(i8* %data, i64 %size)
+; END n
+
+; BEGIN fixed_ascii_load_byte
+  %position_{0} = add i64 %position, {0}
+  %ptr_{0} = getelementptr i8, i8* %data, i64 %position_{0}
+  %byte_{0} = load i8, i8* %ptr_{0}, align 1
+  %value_{0} = zext i8 %byte_{0} to i32
+; END fixed_ascii_load_byte
+
+; BEGIN fixed_ascii_range
+  %range_ge_{0}_{1} = icmp uge i32 %value_{0}, {2}
+  %range_le_{0}_{1} = icmp ule i32 %value_{0}, {3}
+  %{4} = and i1 %range_ge_{0}_{1}, %range_le_{0}_{1}
+; END fixed_ascii_range

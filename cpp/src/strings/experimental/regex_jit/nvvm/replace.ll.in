@@ -327,3 +327,21 @@ done:
   ret void
 }
 ; END replace_size
+
+; BEGIN capture_begin_ptr_n
+  %capture_begin_ptr_{0} = getelementptr i64, i64* %captures, i64 {2}
+  %capture_end_ptr_{0} = getelementptr i64, i64* %captures, i64 {3}
+  %capture_begin_{0} = load i64, i64* %capture_begin_ptr_{0}, align 8
+  %capture_end_{0} = load i64, i64* %capture_end_ptr_{0}, align 8
+  %capture_has_begin_{0} = icmp sge i64 %capture_begin_{0}, 0
+  %capture_has_end_{0} = icmp sge i64 %capture_end_{0}, 0
+  %capture_present_{0} = and i1 %capture_has_begin_{0}, %capture_has_end_{0}
+  %capture_selected_begin_{0} = select i1 %capture_present_{0}, i64 %capture_begin_{0}, i64 0
+  %capture_selected_end_{0} = select i1 %capture_present_{0}, i64 %capture_end_{0}, i64 0
+  {4} = call i64 @regex_ir_append_range(i8* %data, i64 %capture_selected_begin_{0}, i64 %capture_selected_end_{0}, i8* %output, i64 {5})
+; END capture_begin_ptr_n
+
+; BEGIN literal_n
+  %literal_{0} = getelementptr [{1} x i8], [{1} x i8]* @regex_ir_replacement_{0}, i32 0, i32 0
+  {2} = call i64 @regex_ir_append_range(i8* %literal_{0}, i64 0, i64 {1}, i8* %output, i64 {3})
+; END literal_n
