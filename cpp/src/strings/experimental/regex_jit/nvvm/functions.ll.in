@@ -1,16 +1,27 @@
 ; SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 ; SPDX-License-Identifier: Apache-2.0
 
+; BEGIN workspace_entry
+  %workspace_row = call i32 @regex_ir_row_index()
+  %workspace_rows = sub i32 %tile_end, %tile_begin
+  %workspace_active = icmp ult i32 %workspace_row, %workspace_rows
+  br i1 %workspace_active, label %workspace_ready, label %done
+workspace_ready:
+  %workspace_row64 = zext i32 %workspace_row to i64
+  %workspace_offset = mul i64 %workspace_row64, {0}
+  %workspace = getelementptr i8, i8* %scratch, i64 %workspace_offset
+; END workspace_entry
+
 ; BEGIN matcher_boolean_declaration
-declare i1 @regex_ir_execute(i8*, i64) nounwind readonly
+declare i1 @regex_ir_execute(@workspace@i8*, i64) nounwind readonly
 ; END matcher_boolean_declaration
 
 ; BEGIN matcher_count_declaration
-declare i64 @regex_ir_execute(i8*, i64) nounwind readonly
+declare i64 @regex_ir_execute(@workspace@i8*, i64) nounwind readonly
 ; END matcher_count_declaration
 
 ; BEGIN matcher_builtin_count_declaration
-declare i64 @regex_ir_execute(i8*, i64, i8*) nounwind readonly
+declare i64 @regex_ir_execute(@workspace@i8*, i64, i8*) nounwind readonly
 ; END matcher_builtin_count_declaration
 
 ; BEGIN repeated_builtin_adapter
@@ -51,21 +62,21 @@ classify:
 ; END repeated_builtin_adapter
 
 ; BEGIN matcher_find_declaration
-declare i1 @regex_ir_execute(i8*, i64, i64*) nounwind
+declare i1 @regex_ir_execute(@workspace@i8*, i64, i64*) nounwind
 ; END matcher_find_declaration
 
 ; BEGIN matcher_captures_declaration
-declare i1 @regex_ir_execute(i8*, i64, i64, i64*) nounwind
+declare i1 @regex_ir_execute(@workspace@i8*, i64, i64, i64*) nounwind
 ; END matcher_captures_declaration
 
 ; BEGIN matcher_replace_declaration
-declare i64 @regex_ir_execute(i8*, i64, i8*) nounwind
+declare i64 @regex_ir_execute(@workspace@i8*, i64, i8*) nounwind
 ; END matcher_replace_declaration
 
 ; BEGIN kernel_annotation
-@llvm.used = appending global [1 x i8*] [i8* bitcast (void ({0})* @{1} to i8*)], section "llvm.metadata"
+@llvm.used = appending global [1 x i8*] [i8* bitcast (void (@workspace_types@{0})* @{1} to i8*)], section "llvm.metadata"
 !nvvm.annotations = !{{!900000}}
-!900000 = !{{void ({0})* @{1}, !"kernel", i32 1}}
+!900000 = !{{void (@workspace_types@{0})* @{1}, !"kernel", i32 1}}
 ; END kernel_annotation
 
 ; BEGIN core
@@ -240,11 +251,11 @@ entry:
 ; END span_cache_sample
 
 ; BEGIN split_execute
-declare i64 @regex_ir_split_execute_limited(i8*, i64, i64*, i64, i64, i8*) nounwind
+declare i64 @regex_ir_split_execute_limited(@workspace@i8*, i64, i64*, i64, i64, i8*) nounwind
 ; END split_execute
 
 ; BEGIN split_cached
-define internal i64 @regex_ir_split_cached(i8* %data, i64 %size, i8* %cache_buffer, i32 %row, i32 %capacity, i8* %overflow, i64 %maxsplit) alwaysinline nounwind {
+define internal i64 @regex_ir_split_cached(@workspace@i8* %data, i64 %size, i8* %cache_buffer, i32 %row, i32 %capacity, i8* %overflow, i64 %maxsplit) alwaysinline nounwind {
 entry:
   %typed_cache = bitcast i8* %cache_buffer to i64*
   %row64 = zext i32 %row to i64
@@ -254,7 +265,7 @@ entry:
   %row_base = shl i64 %row_fields, 1
   %row_spans = getelementptr i64, i64* %typed_cache, i64 %row_base
   %overflow_ptr = getelementptr i8, i8* %overflow, i32 %row
-  %count = call i64 @regex_ir_split_execute_limited(i8* %data, i64 %size, i64* %row_spans, i64 %maxsplit, i64 %fields_per_row64, i8* %overflow_ptr)
+  %count = call i64 @regex_ir_split_execute_limited(@workspace@i8* %data, i64 %size, i64* %row_spans, i64 %maxsplit, i64 %fields_per_row64, i8* %overflow_ptr)
   ret i64 %count
 }
 ; END split_cached

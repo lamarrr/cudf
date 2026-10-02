@@ -135,40 +135,40 @@ entry:
 ; END word_run_span
 
 ; BEGIN boolean_count_adapter
-define i64 @{0}(i8* %data, i64 %size) alwaysinline nounwind readonly {{
+define i64 @{0}(@workspace@i8* %data, i64 %size) alwaysinline nounwind readonly {{
 entry:
-  %matched = call i1 @{1}(i8* %data, i64 %size)
+  %matched = call i1 @{1}(@workspace@i8* %data, i64 %size)
   %count = zext i1 %matched to i64
   ret i64 %count
 }}
 ; END boolean_count_adapter
 
 ; BEGIN find_execute
-define zeroext i1 @{0}(i8* %data, i64 %size, i64* %span) nounwind {{
+define zeroext i1 @{0}(@workspace@i8* %data, i64 %size, i64* %span) nounwind {{
 entry:
   %match_begin = getelementptr i64, i64* %span, i64 0
   %match_end = getelementptr i64, i64* %span, i64 1
-  %matched = call i1 @{1}(i8* %data, i64 %size, i64 0, i64* %match_begin, i64* %match_end, i64* null)
+  %matched = call i1 @{1}(@workspace@i8* %data, i64 %size, i64 0, i64* %match_begin, i64* %match_end, i64* null)
   ret i1 %matched
 }}
 ; END find_execute
 
 ; BEGIN find_all_execute
-define zeroext i1 @{0}(i8* %data, i64 %size, i64 %search_start, i64* %span) nounwind {{
+define zeroext i1 @{0}(@workspace@i8* %data, i64 %size, i64 %search_start, i64* %span) nounwind {{
 entry:
   %match_begin = getelementptr i64, i64* %span, i64 0
   %match_end = getelementptr i64, i64* %span, i64 1
-  %matched = call i1 @{1}(i8* %data, i64 %size, i64 %search_start, i64* %match_begin, i64* %match_end, i64* null)
+  %matched = call i1 @{1}(@workspace@i8* %data, i64 %size, i64 %search_start, i64* %match_begin, i64* %match_end, i64* null)
   ret i1 %matched
 }}
 ; END find_all_execute
 
 ; BEGIN capture_execute
-define zeroext i1 @{0}(i8* %data, i64 %size, i64 %search_start, i64* %captures) nounwind {{
+define zeroext i1 @{0}(@workspace@i8* %data, i64 %size, i64 %search_start, i64* %captures) nounwind {{
 entry:
   %match_begin = getelementptr i64, i64* %captures, i64 0
   %match_end = getelementptr i64, i64* %captures, i64 1
-  %matched = call i1 @{1}(i8* %data, i64 %size, i64 %search_start, i64* %match_begin, i64* %match_end, i64* %captures)
+  %matched = call i1 @{1}(@workspace@i8* %data, i64 %size, i64 %search_start, i64* %match_begin, i64* %match_end, i64* %captures)
 {2}
   ret i1 %matched
 }}
@@ -176,7 +176,7 @@ entry:
 
 ; BEGIN boolean_alternation_execute
 
-define zeroext i1 @{0}(i8* %data, i64 %size) nounwind readonly {{
+define zeroext i1 @{0}({2}i8* %data, i64 %size) nounwind {{
 {1}yes:
   ret i1 true
 }}
@@ -184,7 +184,7 @@ define zeroext i1 @{0}(i8* %data, i64 %size) nounwind readonly {{
 
 ; BEGIN count_execute
 
-define i64 @EXECUTE@(i8* %data, i64 %size) nounwind readonly {
+define i64 @EXECUTE@(@workspace@i8* %data, i64 %size) nounwind readonly {
 entry:
   %match_begin = alloca i64, align 8
   %match_end = alloca i64, align 8
@@ -192,7 +192,7 @@ entry:
 loop:
   %search_start = phi i64 [ 0, %entry ], [ %end_value, %nonempty ], [ %empty_next, %advance_empty ]
   %count = phi i64 [ 0, %entry ], [ %next_count, %nonempty ], [ %next_count, %advance_empty ]
-  %matched = call i1 @FIND_FROM@(i8* %data, i64 %size, i64 %search_start, i64* %match_begin, i64* %match_end, i64* null)
+  %matched = call i1 @FIND_FROM@(@workspace@i8* %data, i64 %size, i64 %search_start, i64* %match_begin, i64* %match_end, i64* null)
   br i1 %matched, label %found, label %done
 found:
   %begin_value = load i64, i64* %match_begin, align 8
@@ -248,9 +248,9 @@ done:
 ; END count_builtin_execute
 
 ; BEGIN operation_execute_adapter
-define zeroext i1 @{0}(i8* %data, i64 %size, i64* %span) alwaysinline nounwind {{
+define zeroext i1 @{0}(@workspace@i8* %data, i64 %size, i64* %span) alwaysinline nounwind {{
 entry:
-  %matched = call i1 @{1}(i8* %data, i64 %size)
+  %matched = call i1 @{1}(@workspace@i8* %data, i64 %size)
   br i1 %matched, label %store, label %done
 store:
   store i64 0, i64* %span, align 8
@@ -261,7 +261,7 @@ done:
 ; END operation_execute_adapter
 
 ; BEGIN replace_execute
-define i64 @{0}(i8* %data, i64 %size, i8* %output) nounwind {{
+define i64 @{0}(@workspace@i8* %data, i64 %size, i8* %output) nounwind {{
 entry:
   %match_begin = alloca i64, align 8
   %match_end = alloca i64, align 8
@@ -271,7 +271,7 @@ loop:
   %search_start = phi i64 [ 0, %entry ], [ %match_end_value, %nonempty ], [ %advanced_start, %advance_empty ]
   %copied = phi i64 [ 0, %entry ], [ %match_end_value, %nonempty ], [ %match_end_value, %advance_empty ]
   %cursor = phi i64 [ 0, %entry ], [ %replacement_cursor, %nonempty ], [ %replacement_cursor, %advance_empty ]
-  %matched = call i1 @{2}(i8* %data, i64 %size, i64 %search_start, i64* %match_begin, i64* %match_end, i64* {3})
+  %matched = call i1 @{2}(@workspace@i8* %data, i64 %size, i64 %search_start, i64* %match_begin, i64* %match_end, i64* {3})
   br i1 %matched, label %found, label %no_match
 found:
   %match_begin_value = load i64, i64* %match_begin, align 8
@@ -304,7 +304,7 @@ finish:
 ; END replacement_capture_step
 
 ; BEGIN split_execute
-define i64 @regex_ir_split_execute_limited(i8* %data, i64 %size, i64* %spans, i64 %maxsplit, i64 %span_capacity, i8* %overflow) nounwind {{
+define i64 @regex_ir_split_execute_limited(@workspace@i8* %data, i64 %size, i64* %spans, i64 %maxsplit, i64 %span_capacity, i8* %overflow) nounwind {{
 entry:
   %match_begin = alloca i64, align 8
   %match_end = alloca i64, align 8
@@ -313,7 +313,7 @@ loop:
   %search_start = phi i64 [ 0, %entry ], [ %match_end_value, %nonempty ], [ %advanced_start, %advance_empty ]
   %copied = phi i64 [ 0, %entry ], [ %match_end_value, %nonempty ], [ %match_end_value, %advance_empty ]
   %field_count = phi i64 [ 0, %entry ], [ %next_count, %nonempty ], [ %next_count, %advance_empty ]
-  %matched = call i1 @{1}(i8* %data, i64 %size, i64 %search_start, i64* %match_begin, i64* %match_end, i64* null)
+  %matched = call i1 @{1}(@workspace@i8* %data, i64 %size, i64 %search_start, i64* %match_begin, i64* %match_end, i64* null)
   br i1 %matched, label %found, label %no_match
 found:
   %match_begin_value = load i64, i64* %match_begin, align 8
@@ -351,9 +351,9 @@ finish:
   ret i64 %result_count
 }}
 
-define i64 @{0}(i8* %data, i64 %size, i64* %spans) nounwind {{
+define i64 @{0}(@workspace@i8* %data, i64 %size, i64* %spans) nounwind {{
 entry:
-  %result = call i64 @regex_ir_split_execute_limited(i8* %data, i64 %size, i64* %spans, i64 -1, i64 -1, i8* null)
+  %result = call i64 @regex_ir_split_execute_limited(@workspace@i8* %data, i64 %size, i64* %spans, i64 -1, i64 -1, i8* null)
   ret i64 %result
 }}
 ; END split_execute
@@ -423,7 +423,7 @@ done:
 
 ; BEGIN n
 {}:
-  %matched_{} = call i1 @{}(i8* %data, i64 %size)
+  %matched_{} = call i1 @{}({}i8* %data, i64 %size)
 ; END n
 
 ; BEGIN fixed_ascii_load_byte

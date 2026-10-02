@@ -3,9 +3,10 @@
 
 ; BEGIN span_cache_sample_split
 
-define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i32 %samples, i32 %capacity, i8* %statistics) nounwind {
+define void @KERNEL_ENTRY@(@workspace_parameters@i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i32 %samples, i32 %capacity, i8* %statistics) nounwind {
 entry:
-  %sample = call i32 @regex_ir_row_index()
+@workspace_entry@
+  %sample = @row_index@
   %in_bounds = icmp slt i32 %sample, %samples
   br i1 %in_bounds, label %select, label %done
 select:
@@ -22,7 +23,7 @@ sample_row:
   %string = call %regex_ir_string @regex_ir_load_string(i8* %chars, i8* %offsets, i32 %physical)
   %data = extractvalue %regex_ir_string %string, 0
   %size = extractvalue %regex_ir_string %string, 1
-  %fields = call i64 @regex_ir_split_execute_limited(i8* %data, i64 %size, i64* null, i64 @MATCH_LIMIT@, i64 -1, i8* null)
+  %fields = call i64 @regex_ir_split_execute_limited(@workspace@i8* %data, i64 %size, i64* null, i64 @MATCH_LIMIT@, i64 -1, i8* null)
   %matches = sub i64 %fields, 1
   br label %record
 record:
@@ -35,9 +36,10 @@ done:
 
 ; BEGIN split_emit
 
-define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output, i8* %effective_offsets, i8* %full_offsets, i64* %spans@OVERFLOW_PARAMETER@) nounwind {
+define void @KERNEL_ENTRY@(@workspace_parameters@i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output, i8* %effective_offsets, i8* %full_offsets, i64* %spans@OVERFLOW_PARAMETER@) nounwind {
 entry:
-  %row = call i32 @regex_ir_row_index()
+@workspace_entry@
+  %row = @row_index@
   %in_bounds = icmp slt i32 %row, %rows
   br i1 %in_bounds, label %work, label %done
 work:
@@ -65,7 +67,7 @@ setup:
   %full_begin64 = sext i32 %full_begin to i64
   %span_base_index = shl i64 %full_begin64, 1
   %row_spans = getelementptr i64, i64* %spans, i64 %span_base_index
-  %written_fields = call i64 @regex_ir_split_execute_limited(i8* %data, i64 %size, i64* %row_spans, i64 @MAXSPLIT@, i64 -1, i8* null)
+  %written_fields = call i64 @regex_ir_split_execute_limited(@workspace@i8* %data, i64 %size, i64* %row_spans, i64 @MAXSPLIT@, i64 -1, i8* null)
   %typed_output = getelementptr i8, i8* %output, i64 0
   %effective_begin64 = sext i32 %effective_begin to i64
   %truncated = icmp sgt i32 %full_count, %effective_count
@@ -95,9 +97,10 @@ done:
 ; BEGIN split_size
 ; specialized maxsplit: @MAXSPLIT@
 
-define void @KERNEL_ENTRY@(i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output@CACHE_PARAMETERS@) nounwind {
+define void @KERNEL_ENTRY@(@workspace_parameters@i8* %chars, i8* %offsets, i32* %validity, i32 %row_offset, i32 %rows, i8* %output@CACHE_PARAMETERS@) nounwind {
 entry:
-  %row = call i32 @regex_ir_row_index()
+@workspace_entry@
+  %row = @row_index@
   %in_bounds = icmp slt i32 %row, %rows
   br i1 %in_bounds, label %work, label %done
 work:

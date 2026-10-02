@@ -43,8 +43,10 @@ struct compile_options {
   bool ascii_classes             = true;   ///< Use ASCII semantics for shorthand character classes
   bool extended_newline          = false;  ///< Recognize the extended Unicode newline set
   bool find_match_end_observable = true;   ///< Require FIND to produce its end offset
-  character_mode characters      = character_mode::UTF8;  ///< Input character decoding mode
-  compile_limits limits          = compile_limits{};      ///< Compilation resource limits
+  std::optional<std::uint32_t>
+    extract_capture_group;                           ///< One-based observable group, or all groups
+  character_mode characters = character_mode::UTF8;  ///< Input character decoding mode
+  compile_limits limits     = compile_limits{};      ///< Compilation resource limits
 };
 
 /**
@@ -65,7 +67,7 @@ enum class operation_kind : std::uint8_t {
  * @brief Matching executor selected by the compiler
  */
 enum class executor_kind : std::uint8_t {
-  RECURSIVE_THOMPSON,                ///< Ordered recursive Thompson-NFA executor
+  ITERATIVE_THOMPSON,                ///< Ordered, bounded-worklist Thompson-NFA executor
   STRING_OPERATIONS,                 ///< Generated composition of specialized string operations
   WORD_RUN,                          ///< Specialized boundary-delimited word-run executor
   SINGLE_BYTE_LITERAL,               ///< Specialized single-byte literal executor
@@ -95,6 +97,12 @@ enum class builtin_character_class : std::uint8_t {
 
 /**
  * @brief Result of compiling a regular expression
+ *
+ * If `workspace_bytes` is nonzero, the generated executor takes an additional
+ * leading `i8*` argument pointing to that many bytes of eight-byte-aligned
+ * writable device storage. Concurrent workers must use disjoint storage;
+ * sequential calls may reuse it without initialization. Zero leaves the
+ * operation-specific signature unchanged.
  */
 struct compile_result {
   std::string nvvm_ir;             ///< Textual operation-specialized NVVM IR
@@ -105,6 +113,8 @@ struct compile_result {
   std::optional<std::string> exact_ascii_literal;  ///< Exact ASCII literal recognized, if any
   std::optional<std::string> exact_literal_bytes;  ///< Exact encoded literal recognized, if any
   std::optional<builtin_character_class> repeated_builtin;  ///< Adapted repeated predicate, if any
+  std::size_t workspace_bytes =
+    0;  ///< Temporary bytes per worker; zero means no external workspace
 };
 
 /**

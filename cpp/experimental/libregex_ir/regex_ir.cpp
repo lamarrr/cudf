@@ -2735,6 +2735,14 @@ class nvvm_ir_renderer {
     require_identifier(public_execute_function_, "execute_function");
     whole_match_captures_ = whole_match_captures();
     capture_slots_        = live_capture_slots();
+    if (ir_.control.result == result_shape::CAPTURES && ir_.options.extract_capture_group) {
+      for (auto& block : ir_.blocks) {
+        std::erase_if(block.instructions, [&](instruction const& item) {
+          auto* capture = std::get_if<write_capture>(&item);
+          return capture && capture->capture_index != *ir_.options.extract_capture_group;
+        });
+      }
+    }
     if (!whole_match_captures_.empty()) {
       for (auto& block : ir_.blocks) {
         std::erase_if(block.instructions, [&](instruction const& item) {
@@ -2862,8 +2870,8 @@ class nvvm_ir_renderer {
         !deterministic_.has_value()) {
       mandatory_ascii_literal_ = mandatory_ascii_literal();
     }
-    auto executor      = executor_kind::RECURSIVE_THOMPSON;
-    auto executor_name = std::string_view{"recursive Thompson"};
+    auto executor      = executor_kind::ITERATIVE_THOMPSON;
+    auto executor_name = std::string_view{"iterative Thompson"};
     if (string_operations_.has_value()) {
       executor      = executor_kind::STRING_OPERATIONS;
       executor_name = "generated string operations";
@@ -2945,7 +2953,10 @@ class nvvm_ir_renderer {
           utf8_literal_pivot_.has_value() || ascii_literal_.has_value() ||
           (glushkov_.has_value() && glushkov_->fixed_match_bytes.has_value() &&
            glushkov_->start_byte.has_value())) {
-        emit_function_section("seek_byte");
+        auto ascii_boolean = ir_.control.result == result_shape::BOOLEAN &&
+                             ir_.control.scan_input && ascii_literal_.has_value() &&
+                             ascii_literal_->size() >= 8U;
+        emit_function_section(ascii_boolean ? "seek_byte_words" : "seek_byte");
       }
       auto unicode_classifier =
         (glushkov_.has_value() && glushkov_->alphabet.unicode_intervals.size() > 8U) ||
@@ -3044,12 +3055,11 @@ class nvvm_ir_renderer {
           emit_deterministic_find_from(*deterministic_);
         }
       } else {
-        emit_can_peek();
+        prepare_thompson();
         emit_is_word();
         emit_previous_position();
         emit_assertion();
         emit_predicate_helpers();
-        emit_literal_helpers();
         emit_blocks();
       }
       if (boolean_result) {
@@ -3085,14 +3095,25 @@ class nvvm_ir_renderer {
     auto alphabet_classes = deterministic_.has_value() ? deterministic_->class_count
                             : glushkov_.has_value()    ? glushkov_->alphabet.class_count
                                                        : std::uint32_t{0};
-    return {output_.take(),
+    auto module           = output_.take();
+    auto replace          = [&](std::string_view token, std::string_view value) {
+      for (auto pos = module.find(token); pos != std::string::npos;
+           pos      = module.find(token, pos + value.size())) {
+        module.replace(pos, token.size(), value);
+      }
+    };
+    replace("@workspace@", workspace_bytes_ != 0 ? "i8* %workspace, " : "");
+    if (workspace_bytes_ != 0) replace("nounwind readonly", "nounwind");
+    if (thompson_) executor_states = static_cast<std::uint32_t>(thompson_->nodes.size());
+    return {std::move(module),
             ir_.capture_count,
             executor,
             executor_states,
             alphabet_classes,
             std::move(exact_ascii_literal_metadata_),
             std::move(exact_literal_bytes_),
-            repeated_builtin_};
+            repeated_builtin_,
+            workspace_bytes_};
   }
 
  private:
@@ -3111,10 +3132,6 @@ class nvvm_ir_renderer {
     if (suffix == "advance") {
       return ir_.options.characters == character_mode::BYTES ? "regex_ir_advance_bytes"
                                                              : "regex_ir_advance_utf8";
-    }
-    if (suffix == "can_peek") {
-      return ir_.options.characters == character_mode::BYTES ? "regex_ir_can_peek_bytes"
-                                                             : "regex_ir_can_peek_utf8";
     }
     if (suffix == "is_word" && !uses_unicode_word_boundaries()) { return "regex_ir_is_ascii_word"; }
     if (suffix == "extended_newline_flags") { return "regex_ir_extended_newline_flags"; }
@@ -3483,7 +3500,7 @@ class nvvm_ir_renderer {
    *
    * The direct executor is deliberately restricted to the default, non-multiline LF semantics.
    * In that dialect only the final logical line can match, so scanning every candidate through
-   * the recursive Thompson executor is unnecessary. Regex metacharacters and escapes in the
+   * the general Thompson executor is unnecessary. Regex metacharacters and escapes in the
    * literal are rejected until the structural IR analysis can prove the same shape.
    *
    * @return literal prefix when the operation can use the final-line tail executor
@@ -3880,6 +3897,8 @@ class nvvm_ir_renderer {
     std::vector<bool> live(static_cast<std::size_t>(ir_.capture_count + 1U) * 2U, false);
     if (ir_.control.result == result_shape::CAPTURES) {
       for (std::uint32_t capture = 1; capture <= ir_.capture_count; ++capture) {
+        if (ir_.options.extract_capture_group && capture != *ir_.options.extract_capture_group)
+          continue;
         if (std::find(whole_match_captures_.begin(), whole_match_captures_.end(), capture) !=
             whole_match_captures_.end()) {
           continue;
@@ -4783,19 +4802,6 @@ class nvvm_ir_renderer {
   }
 
   /**
-   * @brief emits the helper that checks whether a requested number of characters is available
-   */
-  void emit_can_peek()
-  {
-    auto function = name("can_peek");
-    auto width    = name("decode_width");
-    output_.emit("{}",
-                 regex_ir::nvvm_template(
-                   regex_ir_nvvm_templates::regex_functions, "can_peek", function, width));
-    output_.blank();
-  }
-
-  /**
    * @brief reports whether the program evaluates a Unicode word boundary
    *
    * @return true when a boundary assertion needs cuDF's Unicode word table
@@ -4981,83 +4987,6 @@ class nvvm_ir_renderer {
   }
 
   /**
-   * @brief emits a code-point comparison helper for every literal instruction
-   */
-  void emit_literal_helpers()
-  {
-    auto can_peek  = name("can_peek");
-    auto decode    = name("decode_codepoint");
-    auto width     = name("decode_width");
-    auto load_byte = name("load_byte");
-    for (auto& block : ir_.blocks) {
-      for (auto& instruction : block.instructions) {
-        auto* literal = std::get_if<match_literal>(&instruction);
-        if (literal == nullptr) continue;
-        auto function = name(std::format("literal_{}", block.id));
-        auto ascii    = !literal->value.empty() &&
-                     std::all_of(literal->value.begin(), literal->value.end(), [](char32_t value) {
-                       return value <= 0x7f;
-                     });
-        if (ascii) {
-          output_.emit("{}",
-                       regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_functions,
-                                               "ascii_literal_prefix",
-                                               function,
-                                               literal->value.size()));
-          for (std::size_t index = 0; index < literal->value.size(); ++index) {
-            auto success =
-              index + 1 == literal->value.size() ? "success" : std::format("check_{}", index + 1);
-            output_.emit("{}",
-                         regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_functions,
-                                                 "check_n",
-                                                 index,
-                                                 load_byte,
-                                                 static_cast<std::uint32_t>(literal->value[index]),
-                                                 success));
-          }
-          output_.emit("{}",
-                       regex_ir::nvvm_template_section(regex_ir_nvvm_templates::regex_functions,
-                                                       "literal_suffix"));
-          output_.blank();
-          continue;
-        }
-
-        output_.emit("{}",
-                     regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_functions,
-                                             "unicode_literal_prefix",
-                                             function,
-                                             can_peek,
-                                             literal->value.size()));
-        for (std::size_t index = 0; index < literal->value.size(); ++index) {
-          auto position = index == 0 ? "%pos" : std::format("%pos_{}", index);
-          output_.emit("{}",
-                       regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_functions,
-                                               "check_n_2",
-                                               index,
-                                               decode,
-                                               position,
-                                               static_cast<std::uint32_t>(literal->value[index])));
-          if (index + 1 == literal->value.size()) {
-            output_.emit("  br i1 %matches_{}, label %success, label %fail", index);
-          } else {
-            output_.emit("{}",
-                         regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_functions,
-                                                 "width_n",
-                                                 index,
-                                                 index + 1,
-                                                 width,
-                                                 position));
-          }
-        }
-        output_.emit("{}",
-                     regex_ir::nvvm_template_section(regex_ir_nvvm_templates::regex_functions,
-                                                     "literal_suffix"));
-        output_.blank();
-      }
-    }
-  }
-
-  /**
    * @brief emits constant byte arrays used by a specialized replacement executor
    */
   void emit_replacement_globals()
@@ -5075,198 +5004,380 @@ class nvvm_ir_renderer {
   }
 
   /**
-   * @brief emits the recursive dispatcher that executes the instruction block graph
+   * @brief Emit a conservative first-byte seeker for non-nullable scanning fallbacks.
+   *
+   * Assertions are ignored when finding the first consuming states, giving a
+   * superset of possible starts. Predicate and UTF-8 lead-byte boundaries
+   * partition membership into constant intervals. Continuation bytes are never
+   * candidates in Unicode mode; full matching still checks every assertion.
    */
-  void emit_blocks()
+  void emit_thompson_start_seeker(deterministic_nfa_graph const& graph)
   {
-    // one recursive dispatcher represents cyclic block graphs without forward declarations
-    auto function = name("run_block");
-    std::string cases;
-    for (auto& block : ir_.blocks) {
-      std::format_to(
-        std::back_inserter(cases), "    i32 {}, label %b{}_op_0\n", block.id, block.id);
+    if (!ir_.control.scan_input || begins_at_input_start() || prefix_seek_byte_) return;
+
+    std::vector<std::size_t> first, pending{graph.entry};
+    std::vector<bool> visited(graph.nodes.size());
+    while (!pending.empty()) {
+      auto id = pending.back();
+      pending.pop_back();
+      if (visited[id]) continue;
+      visited[id] = true;
+      auto& node  = graph.nodes[id];
+      if (node.accepts) return;  // A nullable expression may match without a byte.
+      if (node.consumes)
+        first.push_back(id);
+      else
+        pending.insert(pending.end(), node.targets.begin(), node.targets.end());
     }
+    if (first.empty() || first.size() > 8U) return;
+
+    std::vector<char32_t> points;
+    for (char32_t cp = 0; cp < 256; ++cp)
+      points.push_back(cp);
+    for (char32_t cp = 0x80; cp < 0x800; cp += 64)
+      points.push_back(cp);
+    for (char32_t cp = 0x800; cp < 0x10000; cp += 4096)
+      points.push_back(cp);
+    points.push_back(0x10000);
+    for (char32_t cp = 0x40000; cp <= 0x100000; cp += 0x40000)
+      points.push_back(cp);
+    for (auto cp : {8232U, 8233U, 8234U})
+      points.push_back(cp);
+    for (auto id : first) {
+      for (auto range : graph.nodes[id].predicate.ranges) {
+        points.push_back(range.first);
+        if (range.last < 0x10ffff) points.push_back(range.last + 1);
+      }
+    }
+    std::array<std::uint64_t, 4> bitmap{};
+    for (auto cp : points) {
+      if (cp > 255 && ir_.options.characters == character_mode::BYTES) continue;
+      if (!std::any_of(first.begin(), first.end(), [&](auto id) {
+            return graph.nodes[id].predicate.matches(cp);
+          }))
+        continue;
+      auto byte = ir_.options.characters == character_mode::BYTES || cp < 128
+                    ? static_cast<std::uint32_t>(cp)
+                  : cp < 0x800   ? 0xc0U | (cp >> 6)
+                  : cp < 0x10000 ? 0xe0U | (cp >> 12)
+                                 : 0xf0U | (cp >> 18);
+      bitmap[byte / 64] |= std::uint64_t{1} << (byte % 64);
+    }
+    auto candidates = std::size_t{0};
+    for (auto word : bitmap)
+      candidates += std::popcount(word);
+    if (candidates == 0 || candidates > 32U) return;
+    candidate_seeker_ = true;
+    output_.emit(
+      "{}",
+      nvvm_template_section(regex_ir_nvvm_templates::regex_functions, "llvm_expect_declaration"));
     output_.emit("{}",
-                 regex_ir::nvvm_template(
-                   regex_ir_nvvm_templates::regex_recursive, "run_block_prefix", function, cases));
-    for (auto& block : ir_.blocks)
-      emit_block(block);
-    output_.emit("{}",
-                 regex_ir::nvvm_template_section(regex_ir_nvvm_templates::regex_recursive,
-                                                 "run_block_suffix"));
-    output_.blank();
+                 nvvm_template(regex_ir_nvvm_templates::regex_thompson,
+                               "candidate_functions",
+                               name("candidate_byte"),
+                               bitmap[0],
+                               bitmap[1],
+                               bitmap[2],
+                               bitmap[3],
+                               name("seek_candidates")));
   }
 
   /**
-   * @brief emits one block's instructions and prioritized successor attempts
-   *
-   * @param block instruction block to lower into NVVM IR
+   * @brief Normalize the fallback into single-code-point states with ordered edges.
    */
-  void emit_block(instruction_block const& block)
+  void prepare_thompson()
   {
-    auto prefix                 = std::format("b{}", block.id);
-    std::size_t operation_index = 0;
-    bool returned               = false;
-    for (auto& item : block.instructions) {
-      output_.emit("{}_op_{}:", prefix, operation_index);
-      auto next = std::format("{}_op_{}", prefix, operation_index + 1);
-      if (auto* peek = std::get_if<can_peek>(&item)) {
-        auto* next_literal =
-          operation_index + 1 < block.instructions.size()
-            ? std::get_if<match_literal>(&block.instructions[operation_index + 1])
-            : nullptr;
-        auto fused_ascii_literal =
-          next_literal != nullptr && next_literal->value.size() == peek->characters &&
-          std::all_of(next_literal->value.begin(), next_literal->value.end(), [](char32_t value) {
-            return value <= 0x7f;
-          });
-        if (fused_ascii_literal) {
-          // the ASCII literal helper performs one byte-count bounds check for the fused sequence
-          output_.emit("  br label %{}", next);
-        } else {
-          output_.emit("{}",
-                       regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_recursive,
-                                               "n_pos_n",
-                                               prefix,
-                                               operation_index,
-                                               name("can_peek"),
-                                               peek->characters,
-                                               next));
+    thompson_ = make_deterministic_graph(ir_);
+    if (!thompson_) { throw std::invalid_argument("unsupported Thompson instruction graph"); }
+    auto& graph = *thompson_;
+    emit_thompson_start_seeker(graph);
+    ir_.blocks.clear();
+    ir_.entry = static_cast<block_id>(graph.entry);
+    for (std::size_t id = 0; id < graph.nodes.size(); ++id) {
+      auto& node = graph.nodes[id];
+      instruction_block block;
+      block.id = static_cast<block_id>(id);
+      if (node.capture) block.instructions.emplace_back(*node.capture);
+      if (node.assertion) block.instructions.emplace_back(test_assertion{*node.assertion});
+      if (node.consumes) {
+        block.instructions.emplace_back(can_peek{1});
+        block.instructions.emplace_back(read_character{});
+        block.instructions.emplace_back(match_character{node.predicate});
+        block.instructions.emplace_back(advance_cursor{1});
+      }
+      if (node.accepts) {
+        block.instructions.emplace_back(emit_accept{});
+        ir_.accept = block.id;
+      }
+      for (std::size_t edge = 0; edge < node.targets.size(); ++edge) {
+        block.successors.push_back(
+          {static_cast<block_id>(node.targets[edge]), static_cast<std::uint32_t>(edge)});
+      }
+      ir_.blocks.push_back(std::move(block));
+    }
+  }
+
+  /**
+   * @brief Emit ordered Thompson execution with pattern-bounded worklists.
+   *
+   * Each state is expanded at most once per input position. The first arrival
+   * wins, including its capture history. Acceptance removes lower-priority
+   * threads but allows higher-priority consuming threads to continue.
+   */
+  void emit_blocks()
+  {
+    auto& graph = *thompson_;
+    std::string scan_cases, scan_bodies, single_cases, single_bodies;
+    std::string low_inputs, high_inputs;
+    std::vector<character_predicate const*> eligible_predicates;
+    for (std::size_t start = 0; start < graph.nodes.size(); ++start) {
+      auto& branch = graph.nodes[start];
+      if (branch.consumes || branch.capture || branch.assertion || branch.accepts ||
+          branch.targets.size() != 2U)
+        continue;
+      auto consume = branch.targets[0];
+      auto& loop   = graph.nodes[consume];
+      if (!loop.consumes || loop.capture || loop.assertion || loop.accepts ||
+          loop.targets.size() != 1U || loop.targets[0] != start)
+        continue;
+      // Every nonempty suffix must start outside the repeated class; nullable
+      // suffixes may accept at the final greedy boundary. Assertions and cycles
+      // conservatively disable skipping.
+      auto disjoint = [&](character_predicate const& other) {
+        std::vector<char32_t> points{0, 10, 11, 13, 14, 133, 134, 8232, 8233, 8234};
+        for (auto* predicate : std::array<character_predicate const*, 2>{&loop.predicate, &other}) {
+          for (auto range : predicate->ranges) {
+            points.push_back(range.first);
+            if (range.last < 0x10ffff) points.push_back(range.last + 1);
+          }
         }
-      } else if (std::holds_alternative<read_character>(item)) {
-        output_.emit("  br label %{}", next);
-      } else if (auto* capture = std::get_if<write_capture>(&item)) {
-        auto slot = static_cast<std::size_t>(capture->capture_index) * 2U +
-                    (capture->action == capture_action::END ? 1U : 0U);
-        if (std::find(capture_slots_.begin(), capture_slots_.end(), slot) == capture_slots_.end()) {
-          output_.emit("  br label %{}", next);
-          ++operation_index;
+        return std::none_of(points.begin(), points.end(), [&](auto cp) {
+          return loop.predicate.matches(cp) && other.matches(cp);
+        });
+      };
+      std::vector<std::uint8_t> visited(graph.nodes.size());
+      std::size_t proof_steps = 0;
+      auto safe               = [&](auto&& self, std::size_t state) -> bool {
+        if (++proof_steps > 256U) return false;
+        if (visited[state] == 1) return false;
+        if (visited[state] == 2) return true;
+        auto& node = graph.nodes[state];
+        if (node.assertion) return false;
+        if (node.consumes) return disjoint(node.predicate);
+        if (node.accepts) return true;
+        visited[state] = 1;
+        for (auto target : node.targets)
+          if (!self(self, target)) return false;
+        visited[state] = 2;
+        return true;
+      };
+      if (!safe(safe, branch.targets[1])) continue;
+      eligible_predicates.push_back(&loop.predicate);
+      scan_cases += std::format("    i64 {}, label %multi_run_{}\n", start, start);
+      single_cases += std::format("    i64 {}, label %run_{}\n", start, start);
+      single_bodies += nvvm_template(regex_ir_nvvm_templates::regex_thompson,
+                                     "scan_case",
+                                     start,
+                                     name(std::format("predicate_{}", consume)));
+      std::uint64_t low = 0, high = 0;
+      for (char32_t cp = 0; cp < 128; ++cp)
+        if (loop.predicate.matches(cp)) {
+          if (cp < 64)
+            low |= std::uint64_t{1} << cp;
+          else
+            high |= std::uint64_t{1} << (cp - 64);
+        }
+      scan_bodies +=
+        nvvm_template(regex_ir_nvvm_templates::regex_thompson, "multi_scan_case", start, low, high);
+      if (!low_inputs.empty()) {
+        low_inputs += ", ";
+        high_inputs += ", ";
+      }
+      low_inputs += std::format("[ %low_{0}, %multi_run_{0} ]", start);
+      high_inputs += std::format("[ %high_{0}, %multi_run_{0} ]", start);
+    }
+    // Multiple loops can skip together only if their ASCII predicates overlap.
+    // Otherwise emit the original single-frontier helper and call signature,
+    // leaving its generated code unchanged rather than adding a runtime check.
+    auto multi_run = false;
+    for (std::size_t i = 0; i < eligible_predicates.size(); ++i)
+      for (std::size_t j = i + 1; j < eligible_predicates.size(); ++j)
+        for (char32_t cp = 0; cp < 128; ++cp)
+          multi_run |= eligible_predicates[i]->matches(cp) && eligible_predicates[j]->matches(cp);
+    output_.emit("{}",
+                 multi_run ? nvvm_template(regex_ir_nvvm_templates::regex_thompson,
+                                           "run_scanner",
+                                           name("scan_run"),
+                                           scan_cases,
+                                           scan_bodies,
+                                           capture_slots_.size() + 1U,
+                                           single_cases,
+                                           single_bodies,
+                                           low_inputs,
+                                           high_inputs)
+                           : nvvm_template(regex_ir_nvvm_templates::regex_thompson,
+                                           "single_run_scanner",
+                                           name("scan_run"),
+                                           single_cases,
+                                           single_bodies));
+    auto states = graph.nodes.size();
+    auto record = capture_slots_.size() + 1U;
+    std::vector<bool> frontier_targets(states);
+    auto closure_capacity = std::size_t{1};
+    for (auto& node : graph.nodes) {
+      if (node.consumes) {
+        for (auto target : node.targets)
+          frontier_targets[target] = true;
+      } else if (node.targets.size() > 1U) {
+        closure_capacity += node.targets.size() - 1U;
+      }
+    }
+    // Only consuming successors enter a frontier. The closure stack contains
+    // lower-priority epsilon branches; the highest-priority edge is expanded
+    // directly. Both bounds depend solely on the graph, never input length.
+    auto other =
+      std::max<std::size_t>(1, std::count(frontier_targets.begin(), frontier_targets.end(), true)) *
+      record;
+    auto stack        = other * 2U;
+    auto active       = stack + closure_capacity * record;
+    auto seen         = active + record;
+    auto bitset_words = (states + 63U) / 64U;
+    auto queued       = seen + bitset_words;
+    auto bytes        = (queued + bitset_words) * sizeof(std::int64_t);
+    workspace_bytes_  = bytes > 32768U ? bytes : 0U;
+    auto copy         = name("copy_thread");
+    output_.emit("{}",
+                 nvvm_template(regex_ir_nvvm_templates::regex_thompson, "copy", copy, record));
+    std::string cases, body, initial, accepted;
+    for (std::size_t index = 0; index < capture_slots_.size(); ++index) {
+      initial += nvvm_template(regex_ir_nvvm_templates::regex_thompson,
+                               "initial_capture",
+                               index,
+                               capture_slots_[index],
+                               index + 1U);
+      accepted += nvvm_template(regex_ir_nvvm_templates::regex_thompson,
+                                "accepted_capture",
+                                index,
+                                capture_slots_[index],
+                                index + 1U);
+    }
+    for (std::size_t id = 0; id < states; ++id) {
+      auto& node = graph.nodes[id];
+      std::format_to(std::back_inserter(cases), "    i64 {}, label %state_{}\n", id, id);
+      std::format_to(std::back_inserter(body), "state_{}:\n", id);
+      if (node.capture) {
+        auto slot = node.capture->capture_index * 2U +
+                    (node.capture->action == capture_action::END ? 1U : 0U);
+        auto write = [&](std::size_t target, std::string_view value) {
+          auto found = std::find(capture_slots_.begin(), capture_slots_.end(), target);
+          if (found == capture_slots_.end()) return;
+          body += nvvm_template(regex_ir_nvvm_templates::regex_thompson,
+                                "capture",
+                                id,
+                                target,
+                                std::distance(capture_slots_.begin(), found) + 1,
+                                value);
+        };
+        write(slot, "%pos");
+        if (node.capture->action == capture_action::BEGIN) write(slot + 1U, "-1");
+      }
+      if (node.assertion) {
+        body += nvvm_template(regex_ir_nvvm_templates::regex_thompson,
+                              "assertion",
+                              id,
+                              name("assertion"),
+                              static_cast<std::uint32_t>(*node.assertion),
+                              ir_.options.multiline ? "true" : "false",
+                              ir_.options.extended_newline ? "true" : "false");
+      }
+      if (node.accepts) {
+        body += ir_.control.require_end
+                  ? nvvm_template(regex_ir_nvvm_templates::regex_thompson, "accept_end", id)
+                  : std::string{"  br label %accept\n"};
+        continue;
+      }
+      if (node.consumes) {
+        body += nvvm_template(regex_ir_nvvm_templates::regex_thompson,
+                              "consume",
+                              id,
+                              name(std::format("predicate_{}", id)));
+      }
+      for (std::size_t index = 0; index < node.targets.size(); ++index) {
+        // Closure uses a LIFO worklist; enqueue consuming successors in forward
+        // priority order, epsilon successors in reverse order.
+        auto target = node.targets[node.consumes ? index : node.targets.size() - index - 1U];
+        if (!node.consumes && index + 1U == node.targets.size()) {
+          // Tail-expand the highest-priority epsilon edge without copying its
+          // capture record through the closure stack. The visited check still
+          // terminates nullable cycles.
+          body += nvvm_template(regex_ir_nvvm_templates::regex_thompson, "direct", id, target);
           continue;
         }
-        auto reset = std::string{};
-        if (capture->action == capture_action::BEGIN) {
-          reset = regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_recursive,
-                                          "n_capture_end_ptr_n",
-                                          prefix,
-                                          operation_index,
-                                          slot + 1U);
-        }
-        output_.emit("{}",
-                     regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_recursive,
-                                             "n_capture_pos_n",
-                                             prefix,
-                                             operation_index,
-                                             slot,
-                                             reset,
-                                             next));
-      } else if (std::holds_alternative<match_character>(item)) {
-        output_.emit("{}",
-                     regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_recursive,
-                                             "n_match_pos_n",
-                                             prefix,
-                                             operation_index,
-                                             name(std::format("predicate_{}", block.id)),
-                                             next));
-      } else if (std::holds_alternative<match_literal>(item)) {
-        output_.emit("{}",
-                     regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_recursive,
-                                             "n_literal_pos_n",
-                                             prefix,
-                                             operation_index,
-                                             name(std::format("literal_{}", block.id)),
-                                             next));
-      } else if (auto* advance = std::get_if<advance_cursor>(&item)) {
-        auto* previous_literal =
-          operation_index > 0 ? std::get_if<match_literal>(&block.instructions[operation_index - 1])
-                              : nullptr;
-        auto matched_ascii_literal = previous_literal != nullptr &&
-                                     previous_literal->value.size() == advance->characters &&
-                                     std::all_of(previous_literal->value.begin(),
-                                                 previous_literal->value.end(),
-                                                 [](char32_t value) { return value <= 0x7f; });
-        if (matched_ascii_literal) {
-          output_.emit("{}",
-                       regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_recursive,
-                                               "n_advance_pos_n",
-                                               prefix,
-                                               operation_index,
-                                               advance->characters,
-                                               next));
-        } else {
-          output_.emit("{}",
-                       regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_recursive,
-                                               "n_advance_pos_n_2",
-                                               prefix,
-                                               operation_index,
-                                               name("advance"),
-                                               advance->characters,
-                                               next));
-        }
-      } else if (auto* assertion = std::get_if<test_assertion>(&item)) {
-        output_.emit("{}",
-                     regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_recursive,
-                                             "n_assert_pos_n",
-                                             prefix,
-                                             operation_index,
-                                             name("assertion"),
-                                             static_cast<std::uint32_t>(assertion->kind),
-                                             next,
-                                             ir_.options.multiline ? "true" : "false",
-                                             ir_.options.extended_newline ? "true" : "false"));
-      } else if (std::holds_alternative<emit_accept>(item)) {
-        if (ir_.control.require_end) {
-          output_.emit("{}",
-                       regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_recursive,
-                                               "n_accept_pos",
-                                               prefix,
-                                               prefix,
-                                               prefix,
-                                               prefix));
-        } else {
-          output_.emit("  ret i1 true");
-        }
-        returned = true;
+        body += nvvm_template(regex_ir_nvvm_templates::regex_thompson,
+                              node.consumes ? "enqueue" : "push",
+                              std::format("{}_{}", id, index),
+                              record,
+                              copy,
+                              target);
       }
-      ++operation_index;
+      if (node.consumes || node.targets.empty()) body += "  br label %pop\n";
     }
+    auto storage =
+      workspace_bytes_ == 0
+        ? nvvm_template(regex_ir_nvvm_templates::regex_thompson, "local_storage", bytes)
+        : std::string{
+            nvvm_template_section(regex_ir_nvvm_templates::regex_thompson, "external_storage")};
+    output_.emit("{}",
+                 nvvm_template(regex_ir_nvvm_templates::regex_thompson,
+                               "run",
+                               name("run_block"),
+                               states <= 256U && workspace_bytes_ == 0 ? "alwaysinline" : "",
+                               storage,
+                               other,
+                               stack,
+                               active,
+                               seen,
+                               queued,
+                               initial,
+                               bitset_words,
+                               record,
+                               copy,
+                               cases,
+                               body,
+                               accepted,
+                               name("advance"),
+                               name("scan_run"),
+                               name("decode_codepoint"),
+                               multi_run ? "i64* %current" : "i64 %front_state"));
+  }
 
-    if (returned) return;
-    output_.emit("{}_op_{}:", prefix, operation_index);
-    auto edges = block.successors;
-    std::stable_sort(edges.begin(), edges.end(), [](auto& left, auto& right) {
-      return left.priority < right.priority;
-    });
-    if (edges.empty()) {
-      output_.emit("  br label %return_fail");
-      return;
-    }
-    output_.emit("  %{}_saved = load i64, i64* %position, align 8", prefix);
-    for (auto slot : capture_slots_) {
-      output_.emit("{}",
-                   regex_ir::nvvm_template(
-                     regex_ir_nvvm_templates::regex_recursive, "n_saved_capture_n", prefix, slot));
-    }
-    output_.emit("  br label %{}_attempt_0", prefix);
-    for (std::size_t index = 0; index < edges.size(); ++index) {
-      auto failure = index + 1 < edges.size() ? std::format("{}_attempt_{}", prefix, index + 1)
-                                              : std::string{"return_fail"};
-      output_.emit("{}",
-                   regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_recursive,
-                                           "n_attempt_n",
-                                           prefix,
-                                           index,
-                                           name("run_block"),
-                                           edges[index].target,
-                                           failure));
-      for (auto slot : capture_slots_) {
-        output_.emit("  store i64 %{}_saved_capture_value_{}, i64* %{}_saved_capture_{}, align 8",
-                     prefix,
-                     slot,
-                     prefix,
-                     slot);
-      }
-      output_.emit("  br label %{}", failure);
-    }
+  /**
+   * @brief Render the start filter with its actual predicate, not a dummy literal.
+   */
+  std::string start_candidate_test(std::string_view byte) const
+  {
+    return candidate_seeker_
+             ? std::format("call i1 @{}(i32 {})", name("candidate_byte"), byte)
+             : std::format(
+                 "icmp eq i32 {}, {}", byte, static_cast<std::uint32_t>(prefix_seek_byte_.value()));
+  }
+
+  /**
+   * @brief Name the selected literal or first-byte-bitmap seeking function.
+   */
+  std::string start_seeker_name() const
+  {
+    return candidate_seeker_ ? name("seek_candidates") : "regex_ir_seek_byte";
+  }
+
+  /**
+   * @brief Supply the literal argument only to the literal seeking function.
+   */
+  std::string start_seeker_arguments() const
+  {
+    return candidate_seeker_
+             ? std::string{}
+             : std::format(", i32 {}", static_cast<std::uint32_t>(prefix_seek_byte_.value()));
   }
 
   /**
@@ -5274,14 +5385,12 @@ class nvvm_ir_renderer {
    */
   void emit_execute()
   {
-    auto run_block  = name("run_block");
-    auto advance    = name("advance");
-    auto multiplier = static_cast<std::uint64_t>(ir_.blocks.size()) * 8U + 32U;
+    auto run_block = name("run_block");
+    auto advance   = name("advance");
     output_.emit("{}",
-                 regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_recursive,
+                 regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_thompson,
                                          "boolean_execute_prefix",
-                                         options_.execute_function,
-                                         multiplier));
+                                         options_.execute_function));
     auto mandatory_filter =
       mandatory_ascii_literal_.has_value() && ir_.control.scan_input && !begins_at_input_start();
     if (mandatory_filter) {
@@ -5293,7 +5402,7 @@ class nvvm_ir_renderer {
     auto initial_predecessor = mandatory_filter ? "%mandatory_filter_done" : "%entry";
     if (!ir_.control.scan_input || begins_at_input_start()) {
       output_.emit("{}",
-                   regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_recursive,
+                   regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_thompson,
                                            "store_store_i64_0_i64_position_align_8",
                                            run_block,
                                            ir_.entry));
@@ -5302,27 +5411,29 @@ class nvvm_ir_renderer {
     }
 
     auto prefix = prefix_seek_byte_;
-    if (prefix.has_value()) {
+    if (prefix.has_value() || candidate_seeker_) {
       auto hint =
         std::string{R"NVVM(  %candidate_likely = call i1 @llvm.expect.i1(i1 %candidate, i1 false)
 )NVVM"};
       output_.emit("{}",
-                   regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_recursive,
-                                           "recursive_execute_prefix_search",
+                   regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_thompson,
+                                           "thompson_execute_prefix_search",
                                            name("load_byte"),
-                                           static_cast<std::uint32_t>(*prefix),
+                                           start_candidate_test("%start_byte"),
                                            hint,
                                            "%candidate_likely",
                                            run_block,
                                            ir_.entry,
-                                           initial_predecessor));
+                                           initial_predecessor,
+                                           start_seeker_name(),
+                                           start_seeker_arguments()));
       output_.blank();
       return;
     }
 
     output_.emit("{}",
-                 regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_recursive,
-                                         "recursive_execute_suffix",
+                 regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_thompson,
+                                         "thompson_execute_suffix",
                                          run_block,
                                          ir_.entry,
                                          advance,
@@ -5963,32 +6074,30 @@ class nvvm_ir_renderer {
     auto function         = name("find_from");
     auto run_block        = name("run_block");
     auto advance          = name("advance");
-    auto multiplier       = static_cast<std::uint64_t>(ir_.blocks.size()) * 8U + 32U;
     auto mandatory_filter = mandatory_ascii_literal_.has_value()
-                              ? regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_recursive,
+                              ? regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_thompson,
                                                         "mandatory_at_begin",
                                                         name("mandatory_literal_present"))
                               : std::string{"  br label %search\n"};
     auto initial_predecessor =
       mandatory_ascii_literal_.has_value() ? "%mandatory_filter_done" : "%entry";
     output_.emit("{}",
-                 regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_recursive,
+                 regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_thompson,
                                          "find_from_prefix",
                                          function,
-                                         multiplier,
                                          mandatory_filter,
                                          initial_predecessor));
 
     auto prefix = required_ascii_prefix();
-    if (prefix.has_value()) {
+    if (prefix.has_value() || candidate_seeker_) {
       auto hint = std::string{
         R"NVVM(  %prefix_likely = call i1 @llvm.expect.i1(i1 %prefix_candidate, i1 false)
 )NVVM"};
       output_.emit("{}",
-                   regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_recursive,
+                   regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_thompson,
                                            "branch_br_i1_in_range_label_prefix_end_label_no",
                                            name("load_byte"),
-                                           static_cast<std::uint32_t>(*prefix),
+                                           start_candidate_test("%prefix_byte"),
                                            hint,
                                            "%prefix_likely"));
     } else {
@@ -5998,47 +6107,47 @@ class nvvm_ir_renderer {
     output_.emit("initialize:");
     if (ir_.control.result == result_shape::CAPTURES) {
       output_.emit("{}",
-                   regex_ir::nvvm_template_section(regex_ir_nvvm_templates::regex_recursive,
+                   regex_ir::nvvm_template_section(regex_ir_nvvm_templates::regex_thompson,
                                                    "find_capture_ptr_0"));
     }
     for (auto slot : capture_slots_) {
       output_.emit("{}",
                    regex_ir::nvvm_template(
-                     regex_ir_nvvm_templates::regex_recursive, "find_capture_ptr_n", slot));
+                     regex_ir_nvvm_templates::regex_thompson, "find_capture_ptr_n", slot));
     }
     if (ir_.control.result == result_shape::CAPTURES) {
       output_.emit("  store i64 %start, i64* %find_capture_ptr_0, align 8");
     }
     auto captures = uses_capture_buffer() ? "%captures" : "null";
     output_.emit("{}",
-                 regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_recursive,
+                 regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_thompson,
                                          "store_store_i64_start_i64_position_align_8",
                                          run_block,
                                          ir_.entry,
                                          captures));
-    if (prefix.has_value()) {
+    if (prefix.has_value() || candidate_seeker_) {
       output_.emit("  br i1 %at_end, label %no, label %continue");
     } else {
       output_.emit(
-        "{}", regex_ir::nvvm_template_section(regex_ir_nvvm_templates::regex_recursive, "at_end"));
+        "{}", regex_ir::nvvm_template_section(regex_ir_nvvm_templates::regex_thompson, "at_end"));
     }
     auto next_candidate =
-      prefix_seek_byte_.has_value()
-        ? regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_recursive,
+      prefix_seek_byte_.has_value() || candidate_seeker_
+        ? regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_thompson,
                                   "prefix_seek_start",
-                                  static_cast<std::uint32_t>(*prefix_seek_byte_))
+                                  start_seeker_name(),
+                                  start_seeker_arguments())
         : std::format(
             R"NVVM(  %next_start = call i64 @{}(i8* %data, i64 %size, i64 %start, i64 1))NVVM",
             advance);
-    output_.emit("{}",
-                 regex_ir::nvvm_template(
-                   regex_ir_nvvm_templates::regex_recursive, "continue", next_candidate));
+    output_.emit(
+      "{}",
+      regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_thompson, "continue", next_candidate));
     if (ir_.control.result == result_shape::CAPTURES) {
       output_.emit("  store i64 %accepted_end, i64* %find_capture_ptr_1, align 8");
     }
     output_.emit(
-      "{}",
-      regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_recursive, "return_ret_i1_true"));
+      "{}", regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_thompson, "return_ret_i1_true"));
     output_.blank();
   }
 
@@ -6257,9 +6366,12 @@ class nvvm_ir_renderer {
   std::optional<std::size_t> utf8_literal_pivot_           = std::nullopt;
   std::optional<std::string> mandatory_ascii_literal_      = std::nullopt;
   std::optional<std::uint8_t> prefix_seek_byte_            = std::nullopt;
+  bool candidate_seeker_                                   = false;
   std::vector<std::uint32_t> whole_match_captures_         = std::vector<std::uint32_t>{};
   std::vector<std::size_t> capture_slots_                  = std::vector<std::size_t>{};
-  source_buffer output_                                    = source_buffer{};
+  std::optional<deterministic_nfa_graph> thompson_;
+  std::size_t workspace_bytes_ = 0;
+  source_buffer output_        = source_buffer{};
 };
 
 std::string_view module_body(std::string_view module)
@@ -6316,6 +6428,8 @@ std::optional<compile_result> render_large_boolean_alternation(
 
   std::string result;
   std::vector<std::string> functions;
+  std::vector<bool> uses_workspace;
+  std::size_t workspace_bytes = 0;
   functions.reserve(alternatives.size());
   for (std::size_t index = 0; index < alternatives.size(); ++index) {
     auto branch_options                       = options;
@@ -6328,6 +6442,8 @@ std::optional<compile_result> render_large_boolean_alternation(
     auto generated = nested.has_value()
                        ? std::move(*nested)
                        : nvvm_ir_renderer(alternatives[index], branch_options).render();
+    uses_workspace.push_back(generated.workspace_bytes != 0);
+    workspace_bytes = std::max(workspace_bytes, generated.workspace_bytes);
     if (index == 0) {
       result = module_without_metadata(generated.nvvm_ir);
     } else {
@@ -6339,8 +6455,12 @@ std::optional<compile_result> render_large_boolean_alternation(
   std::string branches;
   for (std::size_t index = 0; index < functions.size(); ++index) {
     auto label = index == 0 ? std::string{"entry"} : std::format("alternative_{}", index);
-    branches += regex_ir::nvvm_template(
-      regex_ir_nvvm_templates::regex_operations, "n", label, index, functions[index]);
+    branches += regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_operations,
+                                        "n",
+                                        label,
+                                        index,
+                                        functions[index],
+                                        uses_workspace[index] ? "i8* %workspace, " : "");
     if (index + 1U < functions.size()) {
       branches +=
         std::format("  br i1 %matched_{}, label %yes, label %alternative_{}\n", index, index + 1U);
@@ -6351,7 +6471,8 @@ std::optional<compile_result> render_large_boolean_alternation(
   result += regex_ir::nvvm_template(regex_ir_nvvm_templates::regex_operations,
                                     "boolean_alternation_execute",
                                     options.execute_function,
-                                    branches);
+                                    branches,
+                                    workspace_bytes ? "i8* %workspace, " : "");
   result +=
     regex_ir::nvvm_template_section(regex_ir_nvvm_templates::regex_functions, "module_metadata");
   return compile_result{std::move(result),
@@ -6361,7 +6482,8 @@ std::optional<compile_result> render_large_boolean_alternation(
                         0,
                         std::nullopt,
                         std::nullopt,
-                        std::nullopt};
+                        std::nullopt,
+                        workspace_bytes};
 }
 
 }  // namespace

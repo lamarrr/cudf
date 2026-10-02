@@ -27,9 +27,10 @@ struct replacement_piece {
  * @brief Complete a generated kernel wrapper as a standalone NVVM module
  *
  * @param kernel Operation-specific kernel wrapper
+ * @param workspace_bytes Temporary matcher storage per worker, or zero for local storage
  * @return A complete textual NVVM module suitable for independent LTO compilation
  */
-[[nodiscard]] std::string make_module(std::string kernel);
+[[nodiscard]] std::string make_module(std::string kernel, std::size_t workspace_bytes = 0);
 
 /**
  * @brief Generate a fixed-width output kernel

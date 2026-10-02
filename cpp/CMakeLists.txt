@@ -520,7 +520,7 @@ add_regex_ir_nvvm_template(regex_functions experimental/libregex_ir/nvvm/functio
 add_regex_ir_nvvm_template(regex_literals experimental/libregex_ir/nvvm/literals.ll.in)
 add_regex_ir_nvvm_template(regex_glushkov experimental/libregex_ir/nvvm/glushkov.ll.in)
 add_regex_ir_nvvm_template(regex_dfa experimental/libregex_ir/nvvm/dfa.ll.in)
-add_regex_ir_nvvm_template(regex_recursive experimental/libregex_ir/nvvm/recursive.ll.in)
+add_regex_ir_nvvm_template(regex_thompson experimental/libregex_ir/nvvm/thompson.ll.in)
 add_regex_ir_nvvm_template(regex_operations experimental/libregex_ir/nvvm/operations.ll.in)
 add_regex_ir_nvvm_template(kernel_module src/strings/experimental/regex_jit/nvvm/module.ll.in)
 add_regex_ir_nvvm_template(kernel_functions src/strings/experimental/regex_jit/nvvm/functions.ll.in)

@@ -106,8 +106,23 @@ std::string annotate_kernel(std::string module,
 
 }  // namespace
 
-std::string make_module(std::string wrapper)
+std::string make_module(std::string wrapper, std::size_t workspace_bytes)
 {
+  auto external = workspace_bytes != 0;
+  replace_all(wrapper, "@workspace@", external ? "i8* %workspace, " : "");
+  replace_all(wrapper,
+              "@workspace_parameters@",
+              external ? "i8* %scratch, i32 %tile_begin, i32 %tile_end, " : "");
+  replace_all(wrapper, "@workspace_types@", external ? "i8*, i32, i32, " : "");
+  replace_all(wrapper,
+              "@row_index@",
+              external ? "add i32 %workspace_row, %tile_begin" : "call i32 @regex_ir_row_index()");
+  auto entry = external
+                 ? regex_ir::nvvm_template(
+                     regex_ir_nvvm_templates::kernel_functions, "workspace_entry", workspace_bytes)
+                 : std::string{};
+  replace_all(wrapper, "@workspace_entry@", entry);
+  if (external) replace_all(wrapper, "nounwind readonly", "nounwind");
   return regex_ir::render_nvvm_template(regex_ir_nvvm_templates::kernel_module,
                                         {{"@WRAPPER@", wrapper}});
 }
@@ -489,8 +504,8 @@ std::string make_split_size_kernel(bool offset64,
   auto cache_parameters = cache ? ", i8* %cache_buffer, i32 %capacity, i8* %overflow" : "";
   auto split_call =
     cache
-      ? R"NVVM(  %count64 = call i64 @regex_ir_split_cached(i8* %data, i64 %size, i8* %cache_buffer, i32 %row, i32 %capacity, i8* %overflow, i64 @MAXSPLIT@))NVVM"
-      : R"NVVM(  %count64 = call i64 @regex_ir_split_execute_limited(i8* %data, i64 %size, i64* null, i64 @MAXSPLIT@, i64 -1, i8* null))NVVM";
+      ? R"NVVM(  %count64 = call i64 @regex_ir_split_cached(@workspace@i8* %data, i64 %size, i8* %cache_buffer, i32 %row, i32 %capacity, i8* %overflow, i64 @MAXSPLIT@))NVVM"
+      : R"NVVM(  %count64 = call i64 @regex_ir_split_execute_limited(@workspace@i8* %data, i64 %size, i64* null, i64 @MAXSPLIT@, i64 -1, i8* null))NVVM";
   result += regex_ir::render_nvvm_template_section(regex_ir_nvvm_templates::kernel_split,
                                                    "split_size",
                                                    {{"@CACHE_PARAMETERS@", cache_parameters},
