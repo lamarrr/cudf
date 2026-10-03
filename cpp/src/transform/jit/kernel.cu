@@ -12,6 +12,7 @@
 #include <cudf/strings/string_view.cuh>
 #include <cudf/types.hpp>
 #include <cudf/utilities/bit.hpp>
+#include <cudf/utilities/traits.hpp>
 #include <cudf/wrappers/durations.hpp>
 #include <cudf/wrappers/timestamps.hpp>
 
@@ -57,6 +58,10 @@ extern "C" __device__ transform_type transform;
 
 }  // namespace lto
 
+template <typename T>
+inline constexpr bool is_fixed_width_repr_compatible =
+  cudf::is_fixed_width<T>() && cudf::is_rep_layout_compatible<T>();
+
 /// @brief The generic transform kernel. Supports all types and nullability combinations.
 template <bool is_null_aware, bool has_user_data, typename InputAccessors, typename OutputAccessors>
 __device__ void transform_kernel(size_type row_size,
@@ -70,7 +75,7 @@ __device__ void transform_kernel(size_type row_size,
   auto stride       = detail::grid_1d::grid_stride();
   auto thread_error = errc::SUCCESS;
 
-  auto operation = [&]<typename Args>(thread_index_type row, Args args) {
+  auto operation = [&](thread_index_type row, auto... args) {
     // TODO: static assert invocable
     auto func = [&](auto... a) {
       if constexpr (!cuda::std::is_void_v<decltype(GENERIC_TRANSFORM_OP(a...))>) {
@@ -82,32 +87,54 @@ __device__ void transform_kernel(size_type row_size,
     };
 
     if constexpr (has_user_data) {
-      return cuda::std::apply(func, cuda::std::tuple_cat(cuda::std::tuple{user_data, row}, args));
+      return func(user_data, row, args...);
     } else {
-      return cuda::std::apply(func, args);
+      return func(args...);
     }
   };
 
   if constexpr (!is_null_aware) {
+    constexpr auto all_fixed_width_repr_compatible = []<typename... A>() {
+      return (is_fixed_width_repr_compatible<typename A::element_type> && ...);
+    };
+    constexpr bool direct_access = InputAccessors::map(all_fixed_width_repr_compatible) &&
+                                   OutputAccessors::map(all_fixed_width_repr_compatible);
+
     for (auto row = start; row < row_size; row += stride) {
       if (stencil != nullptr && !bit_is_set(stencil, row)) { continue; }
 
-      auto ins = InputAccessors::map(
-        [&]<typename... A>() { return cuda::std::tuple{A::element(input_cols, row)...}; });
+      if constexpr (direct_access) {
+        // Expand column pointers and input loads directly into the UDF arguments.
+        auto row_error = InputAccessors::map([&]<typename... I>() {
+          return OutputAccessors::map([&]<typename... O>() {
+            return operation(
+              row,
+              (O::column(output_cols).template data<typename O::element_type>() + row)...,
+              I::column(input_cols)
+                .template data<typename I::element_type>()[I::map_index(row)]...);
+          });
+        });
 
-      auto outs = OutputAccessors::map(
-        [&]<typename... A>() { return cuda::std::tuple{A::output_arg(output_cols, row)...}; });
+        thread_error = cuda::std::max(thread_error, row_error);
+      } else {
+        auto ins = InputAccessors::map(
+          [&]<typename... A>() { return cuda::std::tuple{A::element(input_cols, row)...}; });
 
-      auto out_ptrs =
-        cuda::std::apply([&](auto&... args) { return cuda::std::tuple{&args...}; }, outs);
+        auto outs = OutputAccessors::map(
+          [&]<typename... A>() { return cuda::std::tuple{A::output_arg(output_cols, row)...}; });
 
-      auto row_error = operation(row, cuda::std::tuple_cat(out_ptrs, ins));
+        auto out_ptrs =
+          cuda::std::apply([&](auto&... args) { return cuda::std::tuple{&args...}; }, outs);
 
-      OutputAccessors::map([&]<typename... A>() {
-        (A::assign(output_cols, row, cuda::std::get<A::index>(outs)), ...);
-      });
+        auto row_error = cuda::std::apply([&](auto... args) { return operation(row, args...); },
+                                          cuda::std::tuple_cat(out_ptrs, ins));
 
-      thread_error = cuda::std::max(thread_error, row_error);
+        OutputAccessors::map([&]<typename... A>() {
+          (A::assign(output_cols, row, cuda::std::get<A::index>(outs)), ...);
+        });
+
+        thread_error = cuda::std::max(thread_error, row_error);
+      }
     }
   } else {
     // Keep every lane in a warp on the same loop iteration when writing validity.
@@ -126,7 +153,8 @@ __device__ void transform_kernel(size_type row_size,
       auto out_ptrs =
         cuda::std::apply([&](auto&... args) { return cuda::std::tuple{&args...}; }, outs);
 
-      auto row_error = operation(row, cuda::std::tuple_cat(out_ptrs, ins));
+      auto row_error = cuda::std::apply([&](auto... args) { return operation(row, args...); },
+                                        cuda::std::tuple_cat(out_ptrs, ins));
 
       OutputAccessors::map([&]<typename... A>() {
         (A::assign(output_cols, row, *cuda::std::get<A::index>(outs)), ...);
