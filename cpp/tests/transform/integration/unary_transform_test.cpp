@@ -35,6 +35,7 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/iterator.cuh>
+#include <cudf/dictionary/dictionary_factories.hpp>
 #include <cudf/dictionary/encode.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
@@ -1189,7 +1190,7 @@ TEST_F(StringOperationTest, OutputOffsetted)
   auto c = cudf::test::strings_column_wrapper{"1", "2", "3", "4", "5", "6"};
 
   std::string cuda = R"***(
-    __device__ void concat(cuda::std::span<char> * out, cudf::string_view a, cudf::string_view b, cudf::string_view c){
+    __device__ void concat(cudf::mutable_string_view * out, cudf::string_view a, cudf::string_view b, cudf::string_view c){
       auto iter = out->data();
       memcpy(iter, a.data(), a.size_bytes());
       iter += a.size_bytes();
@@ -1247,7 +1248,7 @@ TEST_F(StringOperationTest, OutputOffsettedMixed)
   auto c = cudf::test::strings_column_wrapper{"1", "2", "3", "4", "5", "67"};
 
   std::string cuda = R"***(
-    __device__ void concat(int32_t * ab_size, cuda::std::span<char> * out, bool * is_odd, cudf::string_view a, cudf::string_view b, cudf::string_view c){
+    __device__ void concat(int32_t * ab_size, cudf::mutable_string_view * out, bool * is_odd, cudf::string_view a, cudf::string_view b, cudf::string_view c){
       auto iter = out->data();
       auto begin = iter;
       memcpy(iter, a.data(), a.size_bytes());
@@ -1887,7 +1888,7 @@ cudf::transform_output list_output(cudf::data_type type = cudf::data_type{cudf::
 }
 
 constexpr auto copy_udf = R"(
-__device__ void transform(cuda::std::span<int32_t>* output, cuda::std::span<int32_t const> input)
+__device__ void transform(cudf::list_element<int32_t>* output, cudf::list_element<int32_t const> input)
 {
   for (size_t index = 0; index < input.size(); ++index) { (*output)[index] = input[index]; }
 }
@@ -1901,8 +1902,8 @@ std::unique_ptr<cudf::table> transform_lists(
   std::optional<cudf::size_type> row_count = std::nullopt)
 {
   std::string udf = null_aware ? R"(
-__device__ void transform(cuda::std::optional<cuda::std::span<int32_t>>* output,
-                          cuda::std::optional<cuda::std::span<int32_t const>> input)
+__device__ void transform(cuda::std::optional<cudf::list_element<int32_t>>* output,
+                          cuda::std::optional<cudf::list_element<int32_t const>> input)
 {
   if (!input || (!input->empty() && (*input)[0] == 7)) {
     *output = cuda::std::nullopt;
@@ -1924,6 +1925,39 @@ __device__ void transform(cuda::std::optional<cuda::std::span<int32_t>>* output,
 
 struct ListOperationTest : cudf::test::BaseFixture {};
 
+TEST_F(ListOperationTest, DictionaryListKeys)
+{
+  auto keys = make_lists({{}, {1, -2}, {7}});
+  offsets_type indices{1, 0, 2, 1};
+  auto dictionary = cudf::make_dictionary_column(keys->view(), indices);
+  auto sliced     = cudf::slice(dictionary->view(), {1, 4}).front();
+  std::array<cudf::transform_input, 1> inputs{sliced};
+  std::array output{list_output()};
+  auto expected = make_lists({{}, {7}, {1, -2}});
+  auto result   = transform_lists(inputs, output, list_offsets({0, 0, 1, 3}));
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(result->get_column(0), expected->view());
+
+  auto scalar = cudf::slice(dictionary->view(), {0, 1}).front();
+  inputs[0]   = cudf::scalar_column_view{scalar};
+  expected    = make_lists({{1, -2}, {1, -2}, {1, -2}});
+  result      = transform_lists(inputs, output, list_offsets({0, 2, 4, 6}), false, 3);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(result->get_column(0), expected->view());
+}
+
+TEST_F(ListOperationTest, NullAwareDictionaryListKeys)
+{
+  auto keys = make_lists({{}, {1, -2}, {7}});
+  offsets_type indices{{1, 0, 2, 1}, {true, true, true, false}};
+  auto dictionary = cudf::make_dictionary_column(keys->view(), indices);
+  std::array<cudf::transform_input, 1> inputs{dictionary->view()};
+  std::array output{list_output()};
+  auto result = transform_lists(inputs, output, list_offsets({0, 2, 2, 3, 5}), true);
+  std::array<bool, 4> validity{true, true, false, false};
+  auto expected  = make_lists({{1, -2}, {}, {}, {}}, validity);
+  auto canonical = cudf::purge_nonempty_nulls(result->get_column(0).view());
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(canonical->view(), expected->view());
+}
+
 TEST_F(ListOperationTest, DecimalChild)
 {
   auto input = cudf::make_lists_column(
@@ -1936,8 +1970,8 @@ TEST_F(ListOperationTest, DecimalChild)
   std::array<cudf::transform_input, 1> inputs{input->view()};
   std::array outputs{list_output(input->view().child(1).type())};
   auto result = cudf::transform(R"(
-__device__ void transform(cuda::std::span<__int128_t>* output,
-                          cuda::std::span<__int128_t const> input)
+__device__ void transform(cudf::list_element<__int128_t>* output,
+                          cudf::list_element<__int128_t const> input)
 {
   for (size_t i = 0; i < input.size(); ++i) { (*output)[i] = input[i]; }
 }
@@ -1958,7 +1992,7 @@ TEST_F(ListOperationTest, SizeScanThenEncode)
   std::array<cudf::transform_input, 1> inputs{input->view()};
   std::array size_output{cudf::transform_output{cudf::data_type{cudf::type_id::INT32}}};
   auto sizes  = cudf::transform(R"(
-__device__ void transform(int32_t* size, cuda::std::span<int32_t const> input) { *size = input.size(); }
+__device__ void transform(int32_t* size, cudf::list_element<int32_t const> input) { *size = input.size(); }
 )",
                                cudf::udf_source_type::CUDA,
                                cudf::null_aware::NO,
@@ -2051,12 +2085,12 @@ TEST_F(ListOperationTest, MixedListStringAndFixedWidthOutputs)
   supplied.push_back(nullptr);
   supplied.push_back(offsets_type{0, 2, 2, 3}.release());
   auto result   = cudf::transform(R"(
-__device__ void transform(cuda::std::span<int32_t>* first, cuda::std::span<char>* text,
-                          int32_t* size, cuda::std::span<int32_t>* second,
-                          cuda::std::span<int32_t const> input)
+__device__ void transform(cudf::list_element<int32_t>* first, cudf::mutable_string_view* text,
+                          int32_t* size, cudf::list_element<int32_t>* second,
+                          cudf::list_element<int32_t const> input)
 {
   *size = input.size();
-  (*text)[0] = 'a' + input.size();
+  text->data()[0] = 'a' + input.size();
   for (size_t index = 0; index < input.size(); ++index) {
     (*first)[index] = input[index]; (*second)[index] = -input[index];
   }
@@ -2139,6 +2173,13 @@ TEST_F(ListOperationTest, RejectsUnsupportedListChildren)
   cudf::test::lists_column_wrapper<cudf::string_view> strings{{"a", "b"}};
   inputs[0] = static_cast<cudf::column_view>(strings);
   EXPECT_THROW(transform_lists(inputs, output, list_offsets({0, 2})), std::invalid_argument);
+  offsets_type indices{0};
+  for (auto const& keys :
+       {input->view(), nested->view(), static_cast<cudf::column_view>(strings)}) {
+    auto dictionary = cudf::make_dictionary_column(keys, indices);
+    inputs[0]       = dictionary->view();
+    EXPECT_THROW(transform_lists(inputs, output, list_offsets({0, 2})), std::invalid_argument);
+  }
 }
 
 }  // namespace transformation

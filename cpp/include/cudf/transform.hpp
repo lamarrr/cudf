@@ -34,9 +34,8 @@ namespace CUDF_EXPORT cudf {
 
 /**
  * @brief Typedef for inputs to the transform function. Each input can be either a column or a
- * scalar column. Lists with fixed-width children without null elements are supported by CUDA
- * and LTO UDFs as `cuda::std::span<T const>`, or optional spans for null-aware UDFs. T is the
- * device storage type (integer coefficients for decimal children). Parent nulls are supported.
+ * scalar column. Fixed-width list rows use `cudf::list_element<T const>` in CUDA and LTO UDFs,
+ * where T is the child storage type. Null-aware UDFs receive optional list elements.
  */
 using transform_input = std::variant<column_view, scalar_column_view>;
 
@@ -52,21 +51,10 @@ struct transform_output {
     output_nullability::PRESERVE;  ///< Signifies if a null mask should be created for the output
                                    ///< column
 
-  /**
-   * @brief Fixed-width element type for a LIST output; unset for other output types.
-   *
-   * List outputs require supplied INT32 offsets with row_count + 1 entries, starting at zero
-   * and nondecreasing. To produce variable-length lists, first measure row lengths, scan them
-   * into offsets, then run an encoding transform with those offsets.
-   * The UDF receives a pointer to a mutable span
-   * of the element's device storage type, or an optional span for null-aware UDFs. The span
-   * covers the allocated row range; write in-place without changing its pointer or size.
-   * Supplied offsets are retained, including ranges reserved for null rows. Size null rows to
-   * zero for canonical output; `purge_nonempty_nulls` can normalize reserved null ranges.
-   * The output child owns its storage and contains no null elements. Decimal spans contain
-   * integer coefficients, while list_element_type retains the decimal scale metadata.
-   */
-  std::optional<data_type> list_element_type = std::nullopt;
+  // LIST UDF outputs receive cudf::list_element<T>* (optional when null-aware), initialized
+  // from supplied offsets. Write the elements in place without changing the row range.
+  std::optional<data_type> list_element_type =
+    std::nullopt;  ///< The element type for LIST outputs, if applicable
 };
 
 /**
@@ -287,9 +275,9 @@ struct transform_program {
  * this case.
  * @throws std::invalid_argument if any of the output or input types are not supported.
  * CUDA-supported input types include fixed-width, string, dictionary, and lists with fixed-width
- * children without null elements. PTX-supported input types are integrals, floats, and their
- * dictionary types. CUDA-supported output types are fixed-width, STRING, and fixed-width LIST.
- * PTX-supported output types are integrals and floats.
+ * children without null elements, including such lists used as dictionary keys. PTX-supported input
+ * types are integrals, floats, and their dictionary types. CUDA-supported output types are
+ * fixed-width, STRING, and fixed-width LIST. PTX-supported output types are integrals and floats.
  * @throws std::invalid_argument if output offsets are provided for outputs other than strings or
  * lists, or if the number of output offsets does not match the number of output columns.
  * @throws cudf::evaluation_error if the UDF produces an error during execution.
@@ -306,6 +294,9 @@ struct transform_program {
  * @param outputs       Specification of the output columns to be created
  * @param output_offsets For string and list output columns, offsets can be preallocated and passed
  * in. String offsets avoid compaction; list offsets are required and allocate the child storage.
+ * String UDF outputs with supplied offsets receive `cudf::mutable_string_view*` (optional when
+ * null-aware), initialized to the allocated byte range. Write the bytes in place without changing
+ * the view's pointer or size.
  * @param row_size The row size of the transform operation. If not provided, it is inferred from the
  * input columns.
  * @param stream        CUDA stream used for device memory operations and kernel launches

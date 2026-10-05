@@ -165,8 +165,27 @@ struct mutable_strings_column {
   bitmask_type* null_mask() { return _col->mutable_view().null_mask(); }
 };
 
+struct mutable_lists_column_view {
+  mutable_column_view _view;
+
+  auto to_device(cuda::stream_ref stream) const
+  {
+    return mutable_column_device_view::create(_view, stream);
+  }
+};
+
 // Lists retain the supplied offsets and own the directly written child.
-struct mutable_lists_column : mutable_strings_column {};
+struct mutable_lists_column {
+  std::unique_ptr<column> _col;
+
+  auto mutable_view() const { return mutable_lists_column_view{_col->mutable_view()}; }
+
+  void set_null_count(size_type count) { _col->set_null_count(count); }
+
+  bool nullable() const { return _col->nullable(); }
+
+  bitmask_type* null_mask() { return _col->mutable_view().null_mask(); }
+};
 
 using input_column_view = transform_input;
 using output_column     = std::
@@ -223,6 +242,8 @@ void launch(cudf::kernel const& kernel,
 
 std::string get_element_type_name(transform_input_spec const& spec, bool use_physical_type);
 
+std::string reflect_input_element(transform_input_spec const& spec, bool use_physical_type);
+
 struct element_type_name_fn {
   template <typename T>
   std::string operator()(transform_input_spec const& spec, bool use_physical_type) const
@@ -239,7 +260,7 @@ struct element_type_name_fn {
     return std::format(
       "cudf::dictionary_element<{}, {}>",
       get_element_type_name(spec.children.at(dictionary_indices_column_index), use_physical_type),
-      get_element_type_name(spec.children.at(dictionary_keys_column_index), use_physical_type));
+      reflect_input_element(spec.children.at(dictionary_keys_column_index), use_physical_type));
   }
 
   template <typename T>
@@ -274,7 +295,7 @@ std::string reflect_input_element(transform_input_spec const& spec, bool use_phy
                    is_fixed_width(data_type{spec.children[1].type}),
                  "List inputs require INT32 offsets and a fixed-width child",
                  std::invalid_argument);
-    return std::format("cuda::std::span<{} const>", list_storage_name(spec.children[1].type));
+    return std::format("cudf::list_element<{} const>", list_storage_name(spec.children[1].type));
   }
   return get_element_type_name(spec, use_physical_type);
 }
@@ -286,10 +307,10 @@ std::string reflect_output_element(transform_output_spec const& spec, bool use_p
                    is_fixed_width(data_type{spec.children[1].type}) && spec.has_offsets,
                  "List outputs require supplied INT32 offsets and a fixed-width child",
                  std::invalid_argument);
-    return std::format("cuda::std::span<{}>", list_storage_name(spec.children[1].type));
+    return std::format("cudf::list_element<{}>", list_storage_name(spec.children[1].type));
   }
   if (spec.type == type_id::STRING) {
-    return spec.has_offsets ? "cuda::std::span<char>" : "cudf::string_view";
+    return spec.has_offsets ? "cudf::mutable_string_view" : "cudf::string_view";
   }
   return get_element_type_name(transform_input_spec{.type = spec.type}, use_physical_type);
 }
@@ -949,18 +970,21 @@ void perform_checks(std::variant<udf_source_type, lto_binary_type> source_type,
                  std::invalid_argument);
   }
 
-  static constexpr auto is_input_value_supported = [](auto const& c) {
+  static constexpr auto is_input_value_supported = [](auto const& self,
+                                                      column_view const& c) -> bool {
+    if (is_dictionary(c.type())) {
+      return c.num_children() == 2 &&
+             is_index_type(c.child(dictionary_indices_column_index).type()) &&
+             self(self, c.child(dictionary_keys_column_index));
+    }
     return is_fixed_width(c.type()) || c.type().id() == type_id::STRING ||
-           is_dictionary(c.type()) ||
            (c.type().id() == type_id::LIST && c.num_children() == 2 &&
             c.child(0).type().id() == type_id::INT32 && is_fixed_width(c.child(1).type()) &&
             !c.child(1).has_nulls());
   };
   static constexpr auto is_supported_input_type = [&](auto const& c) {
     auto col = std::visit([](auto const& c) { return as_column_view(c); }, c);
-    return is_input_value_supported(col) ||
-           (is_dictionary(col.type()) &&
-            is_input_value_supported(col.child(dictionary_keys_column_index)));
+    return is_input_value_supported(is_input_value_supported, col);
   };
   CUDF_EXPECTS(
     std::none_of(
@@ -1182,7 +1206,7 @@ auto make_outputs(null_aware is_null_aware,
       }
       auto col = make_lists_column(
         row_size, std::move(output_offsets[i]), std::move(child), 0, std::move(null_mask));
-      cols.emplace_back(mutable_lists_column{{std::move(col)}});
+      cols.emplace_back(mutable_lists_column{std::move(col)});
     } else if (output.type.id() == type_id::STRING) {
       if (output_offsets.empty() || output_offsets[i] == nullptr) {
         auto col = string_views_column::make(row_size, std::move(null_mask), 0, stream, mr);
