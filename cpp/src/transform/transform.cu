@@ -278,16 +278,6 @@ std::string get_element_type_name(transform_input_spec const& spec, bool use_phy
     data_type{spec.type}, element_type_name_fn{}, spec, use_physical_type);
 }
 
-std::string list_storage_name(type_id type)
-{
-  switch (type) {
-    case type_id::DECIMAL32: return "int32_t";
-    case type_id::DECIMAL64: return "int64_t";
-    case type_id::DECIMAL128: return "__int128_t";
-    default: return type_to_name(data_type{type});
-  }
-}
-
 std::string reflect_input_element(transform_input_spec const& spec, bool use_physical_type)
 {
   if (spec.type == type_id::LIST) {
@@ -295,7 +285,8 @@ std::string reflect_input_element(transform_input_spec const& spec, bool use_phy
                    is_fixed_width(data_type{spec.children[1].type}),
                  "List inputs require INT32 offsets and a fixed-width child",
                  std::invalid_argument);
-    return std::format("cudf::list_element<{} const>", list_storage_name(spec.children[1].type));
+    return std::format("cudf::list_element<{} const>",
+                       reflect_input_element(spec.children[1], use_physical_type));
   }
   return get_element_type_name(spec, use_physical_type);
 }
@@ -307,7 +298,8 @@ std::string reflect_output_element(transform_output_spec const& spec, bool use_p
                    is_fixed_width(data_type{spec.children[1].type}) && spec.has_offsets,
                  "List outputs require supplied INT32 offsets and a fixed-width child",
                  std::invalid_argument);
-    return std::format("cudf::list_element<{}>", list_storage_name(spec.children[1].type));
+    return std::format("cudf::list_element<{}>",
+                       reflect_output_element(spec.children[1], use_physical_type));
   }
   if (spec.type == type_id::STRING) {
     return spec.has_offsets ? "cudf::mutable_string_view" : "cudf::string_view";
@@ -331,18 +323,23 @@ std::string reflect_output_value_type(transform_output_spec const& spec, bool us
 
 std::string reflect_input_column(transform_input_spec const& spec)
 {
-  if (spec.type == type_id::LIST) { return "cudf::jit::lists_column_device_view"; }
-  return "cudf::column_device_view_core";
+  if (spec.type == type_id::LIST) {
+    return "cudf::jit::lists_column_device_view";
+  } else {
+    return "cudf::column_device_view_core";
+  }
 }
 
 std::string reflect_output_column(transform_output_spec const& spec)
 {
-  if (spec.type == type_id::LIST) { return "cudf::jit::mutable_lists_column_device_view"; }
   if (spec.type == type_id::STRING) {
     return spec.has_offsets ? "cudf::jit::mutable_strings_column_device_view"
                             : "cudf::jit::mutable_vector_device_view";
+  } else if (spec.type == type_id::LIST) {
+    return "cudf::jit::mutable_lists_column_device_view";
+  } else {
+    return "cudf::mutable_column_device_view_core";
   }
-  return "cudf::mutable_column_device_view_core";
 }
 
 auto reflect(std::variant<udf_source_type, lto_binary_type> source_type,
