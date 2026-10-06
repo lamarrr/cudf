@@ -60,7 +60,7 @@ __device__ void transform_kernel(size_type row_size,
                                  mutable_column_device_view_core const* __restrict__ output_cols,
                                  int32_t* __restrict__ max_error)
 {
-  auto operation = [&]<typename Args>(size_type row, Args args) {
+  auto operation = [&]<typename Args>(thread_index_type row, Args args) {
     auto func = [&](auto... a) {
       if constexpr (!cuda::std::is_void_v<decltype(GENERIC_TRANSFORM_OP(a...))>) {
         return static_cast<cudf::errc>(GENERIC_TRANSFORM_OP(a...));

@@ -6,7 +6,9 @@
 #pragma once
 
 #include <cudf/column/column_device_view_base.cuh>
+#include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/detail/utilities/grid_1d.cuh>
+#include <cudf/detail/utilities/integer_utils.hpp>
 #include <cudf/errc.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/bit.hpp>
@@ -43,10 +45,8 @@ __device__ void transform_kernel(size_type row_size,
   auto const stride = grid_1d::grid_stride();
   auto thread_error = errc::SUCCESS;
 
-  for (auto row = start;; row += stride) {
-    if constexpr (!IsNullAware) {
-      if (row >= row_size) { break; }
-
+  if constexpr (!IsNullAware) {
+    for (auto row = start; row < row_size; row += stride) {
       if (stencil != nullptr && !bit_is_set(stencil, row)) { continue; }
 
       auto ins = InputAccessors::map(
@@ -65,13 +65,14 @@ __device__ void transform_kernel(size_type row_size,
       });
 
       thread_error = cuda::std::max(thread_error, row_error);
-    } else {
-      auto const active_mask = __ballot_sync(0xFFFF'FFFFu, row < row_size);
+    }
+  } else {
+    // Keep every lane in a warp on the same loop iteration when writing validity.
+    auto const warp_padded_size =
+      util::round_up_safe<thread_index_type>(row_size, detail::warp_size);
 
-      // fully inactive warp, break the loop
-      if (active_mask == 0) { break; }
-
-      // partially active warp, continue to next warp iteration if row is out of bounds
+    for (auto row = start; row < warp_padded_size; row += stride) {
+      auto const active_mask = __ballot_sync(0xffff'ffffu, row < row_size);
       if (row >= row_size) { continue; }
 
       auto ins = InputAccessors::map(
