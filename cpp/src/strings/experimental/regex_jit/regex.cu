@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "device/pair.cuh"
 #include "jit/cache.hpp"
 #include "kernel_ir.hpp"
 #include "regex_ir.hpp"
@@ -31,6 +32,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <format>
 #include <limits>
@@ -52,13 +54,13 @@ struct retained_kernel {
 };
 
 enum class kernel_role : std::uint8_t {
-  PRIMARY,
-  EMIT,
-  CACHE_SIZE,
-  CACHE_EMIT,
-  SAMPLE,
-  WARP_LITERAL,
-  COUNT
+  PRIMARY      = 0,
+  EMIT         = 1,
+  CACHE_SIZE   = 2,
+  CACHE_EMIT   = 3,
+  SAMPLE       = 4,
+  WARP_LITERAL = 5,
+  COUNT        = 6
 };
 
 constexpr auto kernel_slot_count = static_cast<std::size_t>(kernel_role::COUNT) * 4U;
@@ -137,7 +139,12 @@ struct regex_jit_program_accessor {
 
 namespace {
 
-using pair_t = strings::detail::string_index_pair;
+using pair_t     = strings::detail::string_index_pair;
+using jit_pair_t = detail::regex_jit::device::string_pair;
+static_assert(sizeof(jit_pair_t) == sizeof(pair_t));
+static_assert(alignof(jit_pair_t) == alignof(pair_t));
+static_assert(offsetof(jit_pair_t, first) == offsetof(pair_t, first));
+static_assert(offsetof(jit_pair_t, second) == offsetof(pair_t, second));
 
 inline constexpr std::string_view KERNEL_ENTRY = "cudf_kernel_entry";
 
@@ -149,6 +156,12 @@ std::uint32_t block_size(regex_ir::operation_kind operation, regex_ir::executor_
   // Replacement compiles for the largest geometry selected at execution. Split and complex count
   // operations are divergence-limited and need smaller blocks for occupancy and scheduling.
   if (operation == regex_ir::operation_kind::REPLACE) { return 1024; }
+  // Capture frontiers diverge by row. Smaller blocks spread their work across
+  // more multiprocessors and reduce delays from long-running rows.
+  if (operation == regex_ir::operation_kind::EXTRACT &&
+      executor == regex_ir::executor_kind::ITERATIVE_THOMPSON) {
+    return 256;
+  }
   auto split = operation == regex_ir::operation_kind::SPLIT;
   return split || (!literal && operation == regex_ir::operation_kind::COUNT) ? 256 : 1024;
 }
@@ -267,10 +280,22 @@ retained_kernel compile_kernel(std::string const& matcher,
 {
   static std::string const matcher_name{"cudf.experimental.regex.matcher"};
 
-  auto threads          = block_size(operation, executor);
-  auto matcher_fragment = get_nvvm_fragment(matcher_name, matcher);
-  auto wrapper_module   = detail::regex_jit::make_module(std::move(wrapper), workspace_bytes);
-  auto wrapper_fragment = get_nvvm_fragment(name, wrapper_module);
+  auto threads                  = block_size(operation, executor);
+  char const* include_names[]   = {"regex_ir_generated.cuh"};
+  char const* matcher_headers[] = {matcher.c_str()};
+  auto matcher_fragment         = get_kernel_fragment(matcher_name,
+                                              "cudf/cpp/experimental/libregex_ir/executor.cu",
+                                              include_names,
+                                              matcher_headers,
+                                                      {});
+  auto wrapper_module = detail::regex_jit::make_module(std::move(wrapper), workspace_bytes);
+  char const* wrapper_headers[] = {wrapper_module.c_str()};
+  auto wrapper_fragment =
+    get_kernel_fragment(name,
+                        "cudf/cpp/src/strings/experimental/regex_jit/jit/kernel.cu",
+                        include_names,
+                        wrapper_headers,
+                        {});
   rtcx::memory_fragment fragments[] = {
     {.data = matcher_fragment->view(), .type = rtcx::binary_type::LTO_IR, .name = nullptr},
     {.data = wrapper_fragment->view(), .type = rtcx::binary_type::LTO_IR, .name = nullptr}};
@@ -570,6 +595,9 @@ std::unique_ptr<column> fixed_result(strings_column_view const& input,
       (utf8_literal && prog.operation() == regex_operation::CONTAINS) || average_bytes <= 64
         ? std::min(prepared.threads, 256U)
         : prepared.threads;
+    // Small batches need enough blocks to spread across the device, including short rows.
+    constexpr auto small_batch_rows = size_type{65536};
+    if (data.rows <= small_batch_rows) { threads = std::min(threads, std::uint32_t{256}); }
     auto uses_character_flags = regex_jit_program_accessor::uses_character_flags(prog);
     if (uses_character_flags && prog.operation() == regex_operation::FIND) {
       threads = std::min(threads, 256U);
@@ -626,7 +654,12 @@ std::unique_ptr<table> extract_impl(strings_column_view const& input,
   rmm::device_uvector<pair_t> pairs(pair_count, stream, mr.get_temporary_mr());
   auto data      = get_input_data(input, stream);
   auto& prepared = regex_jit_program_accessor::kernel(prog, kernel_role::PRIMARY, data.offset64);
-  launch(prepared, data, stream, mr.get_temporary_mr(), pairs.data());
+  auto threads   = prepared.threads;
+  if (regex_jit_program_accessor::executor(prog) == regex_ir::executor_kind::ITERATIVE_THOMPSON &&
+      data.chars_bytes / data.rows <= 256) {
+    threads = 128;
+  }
+  launch_with_threads(prepared, data, stream, threads, mr.get_temporary_mr(), pairs.data());
 
   std::vector<device_span<pair_t const>> spans;
   spans.reserve(groups);
@@ -785,7 +818,7 @@ std::vector<replacement_piece> parse_backref_replacement(std::string_view replac
   auto uses_backslash = false;
   for (std::size_t index = 0; index + 1 < replacement.size(); ++index) {
     if (replacement[index] == '\\' &&
-        std::isdigit(static_cast<unsigned char>(replacement[index + 1])) != 0) {
+        std::isdigit(static_cast<std::uint8_t>(replacement[index + 1])) != 0) {
       uses_backslash = true;
       break;
     }
@@ -803,20 +836,20 @@ std::vector<replacement_piece> parse_backref_replacement(std::string_view replac
     auto capture_begin = std::string_view::npos;
     auto capture_end   = std::string_view::npos;
     if (uses_backslash && replacement[position] == '\\' && position + 1 < replacement.size() &&
-        std::isdigit(static_cast<unsigned char>(replacement[position + 1])) != 0) {
+        std::isdigit(static_cast<std::uint8_t>(replacement[position + 1])) != 0) {
       capture_begin = position + 1;
       capture_end   = capture_begin;
       while (capture_end < replacement.size() &&
-             std::isdigit(static_cast<unsigned char>(replacement[capture_end])) != 0) {
+             std::isdigit(static_cast<std::uint8_t>(replacement[capture_end])) != 0) {
         ++capture_end;
       }
     } else if (!uses_backslash && replacement[position] == '$' &&
                position + 3 < replacement.size() && replacement[position + 1] == '{' &&
-               std::isdigit(static_cast<unsigned char>(replacement[position + 2])) != 0) {
+               std::isdigit(static_cast<std::uint8_t>(replacement[position + 2])) != 0) {
       capture_begin = position + 2;
       capture_end   = capture_begin;
       while (capture_end < replacement.size() &&
-             std::isdigit(static_cast<unsigned char>(replacement[capture_end])) != 0) {
+             std::isdigit(static_cast<std::uint8_t>(replacement[capture_end])) != 0) {
         ++capture_end;
       }
       if (capture_end == replacement.size() || replacement[capture_end] != '}') {
@@ -865,7 +898,8 @@ std::unique_ptr<column> replace_impl(strings_column_view const& input,
   auto literal       = executor == regex_ir::executor_kind::SINGLE_BYTE_LITERAL ||
                  executor == regex_ir::executor_kind::PACKED_ASCII_LITERAL ||
                  executor == regex_ir::executor_kind::PACKED_UTF8_LITERAL;
-  auto desired_threads = 256U;
+  // Long complex replacements benefit from independently scheduled blocks.
+  auto desired_threads = !literal && average_bytes >= 384 ? 128U : 256U;
   if (average_bytes <= 32) { desired_threads = literal ? 512U : 1024U; }
   auto launch_replace = [&](retained_kernel const& prepared, auto... args) {
     launch_with_threads(prepared,
@@ -1214,7 +1248,7 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
     auto executor            = compiled.executor;
     auto exact_literal_bytes = std::move(compiled.exact_literal_bytes);
     auto repeated_builtin    = compiled.repeated_builtin;
-    auto matcher             = std::move(compiled.nvvm_ir);
+    auto matcher             = std::move(compiled.cuda_source);
     auto kernels             = std::array<std::optional<retained_kernel>, kernel_slot_count>{};
     auto cache_values        = size_type{0};
     auto kernel_operation    = replacement_operation ? regex_ir::operation_kind::REPLACE : internal;

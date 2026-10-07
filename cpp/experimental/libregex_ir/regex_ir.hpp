@@ -17,8 +17,8 @@ namespace regex_ir {
  * @brief Unit used to decode and match input characters
  */
 enum class character_mode : std::uint8_t {
-  UTF8,   ///< Decode input as UTF-8 code points
-  BYTES,  ///< Match individual input bytes
+  UTF8  = 0,  ///< Decode input as UTF-8 code points
+  BYTES = 1,  ///< Match individual input bytes
 };
 
 /**
@@ -53,59 +53,59 @@ struct compile_options {
  * @brief Regex API implemented by generated code
  */
 enum class operation_kind : std::uint8_t {
-  CONTAINS,  ///< Test whether the input contains a match
-  MATCHES,   ///< Test whether a match begins at the start of the input
-  COUNT,     ///< Count non-overlapping matches
-  EXTRACT,   ///< Extract capture groups from a match
-  FIND,      ///< Find the span of a match
-  FIND_ALL,  ///< Find successive whole-match spans beginning at a supplied byte offset
-  REPLACE,   ///< Replace matching spans
-  SPLIT,     ///< Split input around matching spans
+  CONTAINS = 0,  ///< Test whether the input contains a match
+  MATCHES  = 1,  ///< Test whether a match begins at the start of the input
+  COUNT    = 2,  ///< Count non-overlapping matches
+  EXTRACT  = 3,  ///< Extract capture groups from a match
+  FIND     = 4,  ///< Find the span of a match
+  FIND_ALL = 5,  ///< Find successive whole-match spans beginning at a supplied byte offset
+  REPLACE  = 6,  ///< Replace matching spans
+  SPLIT    = 7,  ///< Split input around matching spans
 };
 
 /**
  * @brief Matching executor selected by the compiler
  */
 enum class executor_kind : std::uint8_t {
-  ITERATIVE_THOMPSON,                ///< Ordered, bounded-worklist Thompson-NFA executor
-  STRING_OPERATIONS,                 ///< Generated composition of specialized string operations
-  WORD_RUN,                          ///< Specialized boundary-delimited word-run executor
-  SINGLE_BYTE_LITERAL,               ///< Specialized single-byte literal executor
-  PACKED_ASCII_LITERAL,              ///< Specialized packed ASCII literal executor
-  PACKED_UTF8_LITERAL,               ///< Pivoted packed-byte exact UTF-8 literal executor
-  UTF8_KMP_LITERAL,                  ///< Exact UTF-8 literal executor with byte-domain KMP fallback
-  GLUSHKOV,                          ///< Position-automaton executor
-  STREAMING_PRIORITIZED_GLUSHKOV,    ///< Streaming prioritized position-automaton executor
-  DETERMINISTIC,                     ///< Deterministic finite-automaton executor
-  ASSERTION_AWARE_DETERMINISTIC,     ///< Deterministic executor with zero-width assertions
-  PRIORITIZED_DETERMINISTIC,         ///< Deterministic executor preserving branch priority
-  TAGGED_PRIORITIZED_DETERMINISTIC,  ///< Prioritized deterministic executor with captures
-  BOOLEAN_ALTERNATION,               ///< Dispatcher over separately compiled boolean branches
+  ITERATIVE_THOMPSON   = 0,  ///< Ordered, bounded-worklist Thompson-NFA executor
+  STRING_OPERATIONS    = 1,  ///< Generated composition of specialized string operations
+  WORD_RUN             = 2,  ///< Specialized boundary-delimited word-run executor
+  SINGLE_BYTE_LITERAL  = 3,  ///< Specialized single-byte literal executor
+  PACKED_ASCII_LITERAL = 4,  ///< Specialized packed ASCII literal executor
+  PACKED_UTF8_LITERAL  = 5,  ///< Pivoted packed-byte exact UTF-8 literal executor
+  UTF8_KMP_LITERAL     = 6,  ///< Exact UTF-8 literal executor with byte-domain KMP fallback
+  GLUSHKOV             = 7,  ///< Position-automaton executor
+  STREAMING_PRIORITIZED_GLUSHKOV   = 8,   ///< Streaming prioritized position-automaton executor
+  DETERMINISTIC                    = 9,   ///< Deterministic finite-automaton executor
+  ASSERTION_AWARE_DETERMINISTIC    = 10,  ///< Deterministic executor with zero-width assertions
+  PRIORITIZED_DETERMINISTIC        = 11,  ///< Deterministic executor preserving branch priority
+  TAGGED_PRIORITIZED_DETERMINISTIC = 12,  ///< Prioritized deterministic executor with captures
+  BOOLEAN_ALTERNATION              = 13,  ///< Dispatcher over separately compiled boolean branches
 };
 
 /**
  * @brief Built-in Unicode character predicate delegated to an embedding adapter
  */
 enum class builtin_character_class : std::uint8_t {
-  DIGIT,      ///< Unicode digit predicate
-  NOT_DIGIT,  ///< Negated Unicode digit predicate
-  WORD,       ///< Unicode word-character predicate
-  NOT_WORD,   ///< Negated Unicode word-character predicate
-  SPACE,      ///< Unicode whitespace predicate
-  NOT_SPACE,  ///< Negated Unicode whitespace predicate
+  DIGIT     = 0,  ///< Unicode digit predicate
+  NOT_DIGIT = 1,  ///< Negated Unicode digit predicate
+  WORD      = 2,  ///< Unicode word-character predicate
+  NOT_WORD  = 3,  ///< Negated Unicode word-character predicate
+  SPACE     = 4,  ///< Unicode whitespace predicate
+  NOT_SPACE = 5,  ///< Negated Unicode whitespace predicate
 };
 
 /**
  * @brief Result of compiling a regular expression
  *
  * If `workspace_bytes` is nonzero, the generated executor takes an additional
- * leading `i8*` argument pointing to that many bytes of eight-byte-aligned
+ * leading `char*` argument pointing to that many bytes of eight-byte-aligned
  * writable device storage. Concurrent workers must use disjoint storage;
  * sequential calls may reuse it without initialization. Zero leaves the
  * operation-specific signature unchanged.
  */
 struct compile_result {
-  std::string nvvm_ir;             ///< Textual operation-specialized NVVM IR
+  std::string cuda_source;         ///< Operation-specialized CUDA C++ source; requires executor.cuh
   std::uint32_t capture_count;     ///< Number of explicit capture groups
   executor_kind executor;          ///< Executor selected for the pattern and operation
   std::uint32_t executor_states;   ///< Number of states in the selected executor
@@ -118,7 +118,7 @@ struct compile_result {
 };
 
 /**
- * @brief Compile a regular expression into operation-specialized NVVM IR
+ * @brief Compile a regular expression into operation-specialized CUDA C++ source
  *
  * `replacement` is required for `REPLACE` and rejected for every other
  * operation. Compilation failures are reported as `std::invalid_argument`.
@@ -127,7 +127,7 @@ struct compile_result {
  * @param operation Operation implemented by the generated entry point
  * @param replacement Replacement template for `REPLACE`
  * @param options Regex syntax, character-mode, and resource-limit options
- * @return Generated NVVM IR and executor metadata
+ * @return Generated CUDA C++ source and executor metadata
  */
 [[nodiscard]] compile_result compile(std::string_view pattern,
                                      operation_kind operation,

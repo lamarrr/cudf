@@ -24,11 +24,11 @@ struct replacement_piece {
 };
 
 /**
- * @brief Complete a generated kernel wrapper as a standalone NVVM module
+ * @brief Complete the generated definitions for the column-wrapper compilation entry point
  *
  * @param kernel Operation-specific kernel wrapper
  * @param workspace_bytes Temporary matcher storage per worker, or zero for local storage
- * @return A complete textual NVVM module suitable for independent LTO compilation
+ * @return Generated header source included after the stable kernel runtime and PCH boundary
  */
 [[nodiscard]] std::string make_module(std::string kernel, std::size_t workspace_bytes = 0);
 
@@ -39,7 +39,7 @@ struct replacement_piece {
  * @param operation Regex operation implemented by the kernel
  * @param repeated_builtin Built-in repeated predicate adapted by the kernel, if any
  * @param kernel_name Exported kernel entry-point name
- * @return Textual NVVM IR for the kernel
+ * @return CUDA C++ source for the kernel
  * @throw std::invalid_argument If `kernel_name` is not a valid, non-reserved identifier
  */
 [[nodiscard]] std::string make_fixed_kernel(
@@ -54,7 +54,7 @@ struct replacement_piece {
  * @param offset64 Whether input string offsets use 64-bit integers
  * @param literal Non-empty ASCII literal to search for
  * @param kernel_name Exported kernel entry-point name
- * @return Textual NVVM IR for the kernel
+ * @return CUDA C++ source for the kernel
  */
 [[nodiscard]] std::string make_warp_literal_contains_kernel(bool offset64,
                                                             std::string_view literal,
@@ -69,7 +69,7 @@ struct replacement_piece {
  * @param output_groups Number of capture groups to emit
  * @param column_major Whether output spans are grouped by capture instead of input row
  * @param kernel_name Exported kernel entry-point name
- * @return Textual NVVM IR for the kernel
+ * @return CUDA C++ source for the kernel
  */
 [[nodiscard]] std::string make_capture_kernel(bool offset64,
                                               std::int32_t capture_slots,
@@ -87,7 +87,7 @@ struct replacement_piece {
  * @param require_match Whether rows without a match produce no output entry
  * @param cache Whether to cache bounded match spans for the emission pass
  * @param kernel_name Exported kernel entry-point name
- * @return Textual NVVM IR for the sizing kernel
+ * @return CUDA C++ source for the sizing kernel
  */
 [[nodiscard]] std::string make_enumeration_size_kernel(bool offset64,
                                                        std::int32_t capture_slots,
@@ -105,7 +105,7 @@ struct replacement_piece {
  * @param findall Whether to emit whole-match spans instead of capture spans
  * @param overflow_only Whether to process only rows that overflowed the span cache
  * @param kernel_name Exported kernel entry-point name
- * @return Textual NVVM IR for the emission kernel
+ * @return CUDA C++ source for the emission kernel
  */
 [[nodiscard]] std::string make_enumeration_emit_kernel(bool offset64,
                                                        std::int32_t capture_slots,
@@ -125,7 +125,7 @@ struct replacement_piece {
  * @param capture_slots Number of capture-boundary values available from the matcher
  * @param max_replace_count Maximum replacements performed per input row
  * @param kernel_name Exported kernel entry-point name
- * @return Textual NVVM IR for the replacement kernel
+ * @return CUDA C++ source for the replacement kernel
  */
 [[nodiscard]] std::string make_limited_replace_kernel(
   bool offset64,
@@ -152,7 +152,7 @@ struct replacement_piece {
  * @param emit Whether to emit output bytes instead of only computing sizes
  * @param output_offset64 Whether output string offsets use 64-bit integers
  * @param kernel_name Exported kernel entry-point name
- * @return Textual NVVM IR for the replacement kernel
+ * @return CUDA C++ source for the replacement kernel
  */
 [[nodiscard]] std::string make_replace_kernel(bool offset64,
                                               bool emit,
@@ -166,7 +166,7 @@ struct replacement_piece {
  * @param maxsplit Maximum splits per row; a non-positive value means unlimited
  * @param cache Whether to cache bounded field spans for the emission pass
  * @param kernel_name Exported kernel entry-point name
- * @return Textual NVVM IR for the split sizing kernel
+ * @return CUDA C++ source for the split sizing kernel
  */
 [[nodiscard]] std::string make_split_size_kernel(bool offset64,
                                                  std::int32_t maxsplit,
@@ -181,7 +181,7 @@ struct replacement_piece {
  * @param maxsplit Maximum splits per row; a non-positive value means unlimited
  * @param overflow_only Whether to process only rows that overflowed the span cache
  * @param kernel_name Exported kernel entry-point name
- * @return Textual NVVM IR for the split emission kernel
+ * @return CUDA C++ source for the split emission kernel
  */
 [[nodiscard]] std::string make_split_emit_kernel(bool offset64,
                                                  bool reverse,
@@ -197,7 +197,7 @@ struct replacement_piece {
  * @param capture_slots Number of capture-boundary values available from the matcher
  * @param match_limit Maximum matches sampled from each row; a non-positive value means unlimited
  * @param kernel_name Exported kernel entry-point name
- * @return Textual NVVM IR for the sampling kernel
+ * @return CUDA C++ source for the sampling kernel
  */
 [[nodiscard]] std::string make_span_cache_sample_kernel(bool offset64,
                                                         bool split,

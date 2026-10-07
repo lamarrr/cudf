@@ -379,13 +379,17 @@ struct instruction_ir {
 };
 
 /**
- * @brief Options controlling CUDA-oriented NVVM IR generation
+ * @brief Options controlling CUDA C++ source generation
  */
-struct nvvm_ir_codegen_options {
-  std::string symbol_prefix       = "regex_ir_sym";      ///< Prefix for internal symbols
-  std::string execute_function    = "regex_ir_execute";  ///< Public matcher function name
-  bool emit_general_functions     = true;   ///< Whether to emit the shared regex helper module
-  bool emit_all_general_functions = false;  ///< Whether alternation branches require every helper
+struct cuda_codegen_options {
+  std::string symbol_prefix    = "regex_ir_sym";      ///< Prefix for internal symbols
+  std::string execute_function = "regex_ir_execute";  ///< Public matcher function name
 };
+
+/** @brief Validate the operation-specialized instruction graph. */
+void verify(instruction_ir const& ir);
+
+/** @brief Apply instruction graph optimizations before executor analysis. */
+instruction_ir optimize(instruction_ir ir, optimization_options const& options);
 
 }  // namespace regex_ir

@@ -2,583 +2,431 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-
 #include "kernel_ir.hpp"
 
-#include "regex_ir_detail.hpp"
-
-#include <nvvm_templates.hpp>
+#include <cuda_abi.hpp>
+#include <regex_ir_detail.hpp>
 
 #include <algorithm>
 #include <cctype>
-#include <cstdint>
 #include <format>
-#include <iterator>
 #include <stdexcept>
-#include <string>
-#include <utility>
 
 namespace cudf::experimental::detail::regex_jit {
 namespace {
+using regex_ir::matcher_abi;
 
-enum class matcher_abi { NONE, BOOLEAN, COUNT, BUILTIN_COUNT, FIND, CAPTURES, REPLACE, SPLIT };
-
-void replace_all(std::string& text, std::string_view from, std::string_view to)
+std::string preamble(bool offset64, std::optional<matcher_abi> abi = std::nullopt)
 {
-  for (auto position = text.find(from); position != std::string::npos;
-       position      = text.find(from, position + to.size())) {
-    text.replace(position, from.size(), to);
-  }
-}
+  std::string result =
+    std::format(R"CUDA(using namespace cudf::experimental::detail::regex_jit::device;
 
-std::string common_nvvm(bool offset64, bool pairs, matcher_abi abi)
-{
-  auto result =
-    std::string{regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions, "core")};
-  replace_all(result, "@INPUT_OFFSET64@", offset64 ? "true" : "false");
-  if (pairs) {
-    result +=
-      regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions, "write_pair");
-  }
-  switch (abi) {
-    case matcher_abi::NONE: break;
-    case matcher_abi::BOOLEAN:
-      result += regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions,
-                                                "matcher_boolean_declaration");
-      break;
-    case matcher_abi::COUNT:
-      result += regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions,
-                                                "matcher_count_declaration");
-      break;
-    case matcher_abi::BUILTIN_COUNT:
-      result += regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions,
-                                                "matcher_builtin_count_declaration");
-      break;
-    case matcher_abi::FIND:
-      result += regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions,
-                                                "matcher_find_declaration");
-      break;
-    case matcher_abi::CAPTURES:
-      result += regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions,
-                                                "matcher_captures_declaration");
-      break;
-    case matcher_abi::REPLACE:
-      result += regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions,
-                                                "matcher_replace_declaration");
-      break;
-    case matcher_abi::SPLIT:
-      result +=
-        regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions, "split_execute");
-      break;
+    using input_offset = {};
+)CUDA",
+                offset64 ? "i64" : "i32");
+  if (abi) {
+    auto symbol =
+      *abi == matcher_abi::LIMITED_SPLIT ? "regex_ir_split_execute_limited" : "regex_ir_execute";
+    result += std::format(R"CUDA(#if CUDF_REGEX_WORKSPACE_BYTES
+{};
+#else
+{};
+#endif
+)CUDA",
+                          regex_ir::matcher_signature(*abi, symbol, true),
+                          regex_ir::matcher_signature(*abi, symbol, false));
+    auto spec = regex_ir::layout(*abi);
+    result += std::format(
+      R"CUDA(
+struct matcher {{
+  __device__ static {} call(char* workspace, char const* data, i64 size{})
+  {{
+    return {}(RX_MATCHER_ARGUMENT data, size{});
+  }}
+}};
+)CUDA",
+      spec.result,
+      spec.parameters,
+      symbol,
+      spec.arguments);
   }
   return result;
 }
 
-void require_kernel_name(std::string_view kernel_name)
+std::string entry(std::string source,
+                  std::string_view name,
+                  std::string_view parameters,
+                  std::string_view body)
 {
-  auto first_is_valid = [](unsigned char character) {
-    return std::isalpha(character) != 0 || character == '_';
-  };
-  auto rest_is_valid = [&](unsigned char character) {
-    return first_is_valid(character) || std::isdigit(character) != 0;
-  };
-  if (kernel_name.empty() || !first_is_valid(static_cast<unsigned char>(kernel_name.front())) ||
-      !std::all_of(kernel_name.begin() + 1, kernel_name.end(), [&](char character) {
-        return rest_is_valid(static_cast<unsigned char>(character));
-      })) {
+  if (name.empty() || !(std::isalpha(static_cast<std::uint8_t>(name[0])) || name[0] == '_') ||
+      !std::all_of(name.begin() + 1, name.end(), [](std::uint8_t character) {
+        return std::isalnum(character) || character == '_';
+      }))
     throw std::invalid_argument("kernel_name must be a valid source identifier");
-  }
-  if (kernel_name.starts_with("llvm.") || kernel_name.starts_with("nvvm.")) {
-    throw std::invalid_argument("kernel_name uses a reserved identifier");
-  }
+  source += std::format(
+    R"CUDA(
+extern "C" __global__ void {}(RX_KERNEL_PARAMETERS char const* chars,
+                                           input_offset const* offsets,
+                                           u32 const* validity,
+                                           i32 row_offset,
+                                           i32 rows{})
+{{
+  RX_WORKER
+  column<input_offset> strings{{chars, offsets, validity, row_offset, rows}};
+  {}
+}}
+)CUDA",
+    name,
+    parameters,
+    body);
+  return source;
 }
 
-std::string annotate_kernel(std::string module,
-                            std::string_view signature,
-                            std::string_view kernel_name)
+std::string bytes(std::string_view value)
 {
-  require_kernel_name(kernel_name);
-  replace_all(module, "@KERNEL_ENTRY@", std::format("@{}", kernel_name));
-  module += regex_ir::nvvm_template(
-    regex_ir_nvvm_templates::kernel_functions, "kernel_annotation", signature, kernel_name);
-  return module;
+  std::string result;
+  for (std::uint8_t character : value)
+    result += std::format("{},", std::uint32_t(character));
+  return result;
 }
 
+std::string_view output_type(bool offset64) { return offset64 ? "i64" : "i32"; }
 }  // namespace
 
 std::string make_module(std::string wrapper, std::size_t workspace_bytes)
 {
-  auto external = workspace_bytes != 0;
-  replace_all(wrapper, "@workspace@", external ? "i8* %workspace, " : "");
-  replace_all(wrapper,
-              "@workspace_parameters@",
-              external ? "i8* %scratch, i32 %tile_begin, i32 %tile_end, " : "");
-  replace_all(wrapper, "@workspace_types@", external ? "i8*, i32, i32, " : "");
-  replace_all(wrapper,
-              "@row_index@",
-              external ? "add i32 %workspace_row, %tile_begin" : "call i32 @regex_ir_row_index()");
-  auto entry = external
-                 ? regex_ir::nvvm_template(
-                     regex_ir_nvvm_templates::kernel_functions, "workspace_entry", workspace_bytes)
-                 : std::string{};
-  replace_all(wrapper, "@workspace_entry@", entry);
-  if (external) replace_all(wrapper, "nounwind readonly", "nounwind");
-  return regex_ir::render_nvvm_template(regex_ir_nvvm_templates::kernel_module,
-                                        {{"@WRAPPER@", wrapper}});
+  return std::format(R"CUDA(#define CUDF_REGEX_WORKSPACE_BYTES {}
+#if CUDF_REGEX_WORKSPACE_BYTES
+#define RX_KERNEL_PARAMETERS char* scratch, i32 tile_begin, i32 tile_end,
+#define RX_MATCHER_ARGUMENT workspace,
+#define RX_WORKER \
+  worker worker_state{{scratch, tile_begin, tile_end, CUDF_REGEX_WORKSPACE_BYTES}};
+#else
+#define RX_KERNEL_PARAMETERS
+#define RX_MATCHER_ARGUMENT
+#define RX_WORKER worker worker_state{{}};
+#endif
+{}
+)CUDA",
+                     workspace_bytes,
+                     wrapper);
+}
+
+std::string make_fixed_kernel(bool offset64,
+                              regex_ir::operation_kind op,
+                              std::optional<regex_ir::builtin_character_class> builtin,
+                              std::string_view name)
+{
+  bool const boolean =
+    op == regex_ir::operation_kind::CONTAINS || op == regex_ir::operation_kind::MATCHES;
+  auto abi    = boolean ? matcher_abi::BOOLEAN
+                : op == regex_ir::operation_kind::COUNT
+                  ? builtin ? matcher_abi::BUILTIN_COUNT : matcher_abi::COUNT
+                  : matcher_abi::FIND;
+  auto source = preamble(offset64, abi);
+  if (builtin) {
+    std::string_view predicate;
+    bool negated         = false;
+    bool exclude_newline = false;
+    switch (*builtin) {
+      case regex_ir::builtin_character_class::NOT_DIGIT: negated = true; [[fallthrough]];
+      case regex_ir::builtin_character_class::DIGIT:
+        predicate       = "(bits & digit_mask) != 0";
+        exclude_newline = true;
+        break;
+      case regex_ir::builtin_character_class::NOT_WORD: negated = true; [[fallthrough]];
+      case regex_ir::builtin_character_class::WORD:
+        predicate       = "(bits & word_mask) != 0 || code_point == '_'";
+        exclude_newline = true;
+        break;
+      case regex_ir::builtin_character_class::NOT_SPACE: negated = true; [[fallthrough]];
+      case regex_ir::builtin_character_class::SPACE: predicate = "(bits & space_mask) != 0"; break;
+    }
+    std::string ascii_check;
+    if (*builtin == regex_ir::builtin_character_class::WORD ||
+        *builtin == regex_ir::builtin_character_class::NOT_WORD) {
+      ascii_check = std::format(
+        R"CUDA(if (code_point < 128) {{
+  bool positive = ((code_point | 32U) - 'a') < 26U || (code_point - '0') < 10U || code_point == '_';
+  return {};
+}})CUDA",
+        negated ? "!positive && code_point != '\\n'" : "positive");
+    } else if (*builtin == regex_ir::builtin_character_class::DIGIT ||
+               *builtin == regex_ir::builtin_character_class::NOT_DIGIT) {
+      ascii_check = std::format(
+        R"CUDA(if (code_point < 128) {{ bool positive = (code_point - '0') < 10U; return {}; }})CUDA",
+        negated ? "!positive && code_point != '\\n'" : "positive");
+    }
+    source += std::format(
+      R"CUDA(extern "C" __device__ bool regex_ir_repeated_builtin(u32 code_point, char const* flags) {{
+      {}
+      constexpr u32 digit_mask = 4;
+      constexpr u32 word_mask = 15;
+      constexpr u32 space_mask = 16;
+      u32 bits = code_point < 0x10000 ? static_cast<u8>(flags[code_point]) : 0;
+      bool positive = {};
+      return {};
+    }}
+)CUDA",
+      ascii_check,
+      predicate,
+      negated ? exclude_newline ? "!positive && code_point != '\\n'" : "!positive" : "positive");
+  }
+  return entry(source,
+               name,
+               builtin ? ", void* output, char const* flags" : ", void* output",
+               std::format("fixed<matcher, {}, {}>(worker_state, strings, output{});",
+                           boolean                                 ? "fixed_output_kind::BOOLEAN"
+                           : op == regex_ir::operation_kind::COUNT ? "fixed_output_kind::COUNT"
+                                                                   : "fixed_output_kind::FIND",
+                           builtin.has_value(),
+                           builtin ? ", flags" : ""));
 }
 
 std::string make_warp_literal_contains_kernel(bool offset64,
                                               std::string_view literal,
-                                              std::string_view kernel_name)
+                                              std::string_view name)
 {
-  if (literal.empty()) { throw std::invalid_argument("literal must not be empty"); }
-  auto comparisons = std::string{};
-  auto matched     = std::string{};
-  auto pivot       = regex_ir::literal_anchor(literal);
-  auto offset      = pivot == 0U ? std::size_t{1} : std::size_t{0};
-  auto index       = std::size_t{0};
-  while (offset < literal.size()) {
+  if (literal.empty()) throw std::invalid_argument("literal must not be empty");
+  auto source = preamble(offset64);
+  auto pivot  = regex_ir::literal_anchor(literal);
+  source += std::format(
+    R"CUDA(struct literal {{
+  static constexpr i64 size   = {};
+  static constexpr i32 pivot  = {};
+  static constexpr u32 anchor = {};
+  __device__ static bool matches(input input_value, i64 pos)
+  {{
+    if (input_value.byte(pos) != {}U) {{ return false; }}
+    return true)CUDA",
+    literal.size(),
+    pivot,
+    std::uint32_t(static_cast<std::uint8_t>(literal[pivot])),
+    std::uint32_t(static_cast<std::uint8_t>(literal.front())));
+  for (std::size_t offset = 0; offset < literal.size();) {
     auto remaining      = literal.size() - offset;
-    auto width          = remaining >= 8U ? 8U : remaining >= 4U ? 4U : remaining >= 2U ? 2U : 1U;
+    std::uint32_t width = remaining >= 8 ? 8 : remaining >= 4 ? 4 : remaining >= 2 ? 2 : 1;
     std::uint64_t value = 0;
-    for (std::size_t byte = 0; byte < width; ++byte) {
-      value |= static_cast<std::uint64_t>(static_cast<std::uint8_t>(literal[offset + byte]))
-               << (byte * 8U);
-    }
-    auto bits = width * 8U;
-    std::format_to(std::back_inserter(comparisons),
-                   "  %literal_ptr_{0} = getelementptr i8, i8* %data, i64 %literal_offset_{0}\n",
-                   index);
-    if (width == 1U) {
-      std::format_to(std::back_inserter(comparisons),
-                     "  %literal_chunk_{0} = load i8, i8* %literal_ptr_{0}, align 1\n",
-                     index);
-    } else {
-      std::format_to(
-        std::back_inserter(comparisons),
-        "{}",
-        regex_ir::nvvm_template(
-          regex_ir_nvvm_templates::kernel_warp_literal, "literal_chunk_ptr_n", index, bits));
-    }
-    std::format_to(std::back_inserter(comparisons),
-                   "  %literal_equal_{0} = icmp eq i{1} %literal_chunk_{0}, {2}\n",
-                   index,
-                   bits,
-                   value);
-    if (matched.empty()) {
-      matched = std::format("%literal_equal_{}", index);
-    } else {
-      std::format_to(std::back_inserter(comparisons),
-                     "  %literal_through_{0} = and i1 {1}, %literal_equal_{0}\n",
-                     index,
-                     matched);
-      matched = std::format("%literal_through_{}", index);
-    }
+    for (std::uint32_t piece_index = 0; piece_index < width; ++piece_index)
+      value |= std::uint64_t(static_cast<std::uint8_t>(literal[offset + piece_index]))
+               << (8 * piece_index);
+    source += std::format(
+      " && load_unaligned<u{}>(input_value.data + pos + {}) == {}ULL", width * 8, offset, value);
     offset += width;
-    ++index;
   }
-
-  auto offsets = std::string{};
-  offset       = pivot == 0U ? std::size_t{1} : std::size_t{0};
-  for (std::size_t chunk = 0; chunk < index; ++chunk) {
-    std::format_to(std::back_inserter(offsets),
-                   "  %literal_offset_{0} = add i64 %position, {1}\n",
-                   chunk,
-                   offset);
-    auto remaining = literal.size() - offset;
-    offset += remaining >= 8U ? 8U : remaining >= 4U ? 4U : remaining >= 2U ? 2U : 1U;
-  }
-
-  auto verify =
-    literal.size() == 1U
-      ? std::string{"  br i1 %first_equal, label %local_yes, label %inner_continue\n"}
-      : regex_ir::render_nvvm_template_section(
-          regex_ir_nvvm_templates::kernel_warp_literal,
-          "warp_literal_verify",
-          {{"@OFFSETS@", offsets}, {"@COMPARISONS@", comparisons}, {"@MATCHED@", matched}});
-
-  auto anchor_check = std::string{};
-  if (literal.size() == 1U) {
-    anchor_check = regex_ir::nvvm_template(
-      regex_ir_nvvm_templates::kernel_warp_literal,
-      "pivot_ptr",
-      static_cast<std::uint32_t>(static_cast<std::uint8_t>(literal.front())));
-  } else {
-    anchor_check = regex_ir::nvvm_template(
-      regex_ir_nvvm_templates::kernel_warp_literal,
-      "pivot_position",
-      pivot,
-      static_cast<std::uint32_t>(static_cast<std::uint8_t>(literal[pivot])),
-      pivot - 1U,
-      static_cast<std::uint32_t>(static_cast<std::uint8_t>(literal[pivot - 1U])));
-  }
-
-  auto result = common_nvvm(offset64, false, matcher_abi::NONE);
-  result +=
-    regex_ir::render_nvvm_template_section(regex_ir_nvvm_templates::kernel_warp_literal,
-                                           "warp_literal_contains",
-                                           {{"@LITERAL_SIZE@", std::to_string(literal.size())},
-                                            {"@ANCHOR_CHECK@", anchor_check},
-                                            {"@VERIFY@", verify}});
-  return annotate_kernel(std::move(result), "i8*, i8*, i32*, i32, i32, i8*", kernel_name);
-}
-
-std::string make_fixed_kernel(bool offset64,
-                              regex_ir::operation_kind operation,
-                              std::optional<regex_ir::builtin_character_class> repeated_builtin,
-                              std::string_view kernel_name)
-{
-  auto abi    = operation == regex_ir::operation_kind::CONTAINS ||
-                 operation == regex_ir::operation_kind::MATCHES
-                  ? matcher_abi::BOOLEAN
-                : operation == regex_ir::operation_kind::COUNT
-                  ? repeated_builtin.has_value() ? matcher_abi::BUILTIN_COUNT : matcher_abi::COUNT
-                  : matcher_abi::FIND;
-  auto result = common_nvvm(offset64, false, abi);
-  if (repeated_builtin.has_value()) {
-    result += regex_ir::nvvm_template(regex_ir_nvvm_templates::kernel_functions,
-                                      "repeated_builtin_adapter",
-                                      static_cast<unsigned>(*repeated_builtin));
-  }
-  if (operation == regex_ir::operation_kind::CONTAINS ||
-      operation == regex_ir::operation_kind::MATCHES) {
-    result +=
-      regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_fixed, "fixed_boolean");
-  } else if (operation == regex_ir::operation_kind::COUNT) {
-    result += regex_ir::render_nvvm_template_section(
-      regex_ir_nvvm_templates::kernel_fixed,
-      "fixed_count",
-      {{"@FLAGS_PARAMETER@", repeated_builtin.has_value() ? ", i8* %character_flags" : ""},
-       {"@FLAGS_ARGUMENT@", repeated_builtin.has_value() ? ", i8* %character_flags" : ""}});
-  } else {
-    result += regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_fixed, "fixed_find");
-  }
-  auto signature = repeated_builtin.has_value() ? "i8*, i8*, i32*, i32, i32, i8*, i8*"
-                                                : "i8*, i8*, i32*, i32, i32, i8*";
-  return annotate_kernel(std::move(result), signature, kernel_name);
+  source += R"CUDA(; } };
+)CUDA";
+  return entry(source, name, ", char* output", "warp_literal<literal>(strings, output);");
 }
 
 std::string make_capture_kernel(bool offset64,
-                                std::int32_t capture_slots,
-                                std::int32_t first_group,
-                                std::int32_t output_groups,
-                                bool column_major,
-                                std::string_view kernel_name)
+                                std::int32_t slots,
+                                std::int32_t first,
+                                std::int32_t groups,
+                                bool major,
+                                std::string_view name)
 {
-  auto result = common_nvvm(offset64, true, matcher_abi::CAPTURES);
-  result += regex_ir::render_nvvm_template_section(
-    regex_ir_nvvm_templates::kernel_enumeration,
-    "capture",
-    {{"@CAPTURE_SLOTS@", std::to_string(capture_slots)},
-     {"@FIRST_GROUP@", std::to_string(first_group)},
-     {"@OUTPUT_GROUPS@", std::to_string(output_groups)},
-     {"@COLUMN_SETUP@", column_major ? "%rows64 = sext i32 %rows to i64" : ""},
-     {"@PAIR_INDEX@",
-      column_major
-        ? regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_enumeration, "group_base")
-        : "%pair_index = sext i32 %row to i64"}});
-  return annotate_kernel(std::move(result), "i8*, i8*, i32*, i32, i32, i8*", kernel_name);
+  return entry(preamble(offset64, matcher_abi::CAPTURES),
+               name,
+               ", string_pair* output",
+               std::format("capture<matcher, {}, {}, {}, {}>(worker_state, strings, output);",
+                           slots,
+                           first,
+                           groups,
+                           major));
 }
 
 std::string make_enumeration_size_kernel(bool offset64,
-                                         std::int32_t capture_slots,
+                                         std::int32_t slots,
                                          std::int32_t multiplier,
-                                         bool require_match,
+                                         bool require,
                                          bool cache,
-                                         std::string_view kernel_name)
+                                         std::string_view name)
 {
-  auto result = common_nvvm(offset64, false, matcher_abi::CAPTURES);
-  if (cache) {
-    result +=
-      regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions, "capture_cache");
-  }
-  auto cache_parameters = cache ? ", i8* %cache_buffer, i32 %capacity, i8* %overflow" : "";
-  auto cache_match =
-    cache ? regex_ir::nvvm_template(
-              regex_ir_nvvm_templates::kernel_enumeration, "typed_cache", capture_slots)
-          : "";
-  result += regex_ir::render_nvvm_template_section(
-    regex_ir_nvvm_templates::kernel_enumeration,
-    "enumeration_size",
-    {{"@CAPTURE_SLOTS@", std::to_string(capture_slots)},
-     {"@MULTIPLIER@", std::to_string(multiplier)},
-     {"@ROW_VALID@", require_match ? "and i1 %valid, %has_match" : "and i1 %valid, true"},
-     {"@CACHE_PARAMETERS@", cache_parameters},
-     {"@CACHE_MATCH@", cache_match}});
-  return annotate_kernel(std::move(result),
-                         cache ? "i8*, i8*, i32*, i32, i32, i8*, i8*, i8*, i32, i8*"
-                               : "i8*, i8*, i32*, i32, i32, i8*, i8*",
-                         kernel_name);
+  return entry(
+    preamble(offset64, matcher_abi::CAPTURES),
+    name,
+    cache ? ", i32* output, char* output_validity, i64* cache, i32 capacity, char* overflow"
+          : ", i32* output, char* output_validity",
+    std::format(
+      R"CUDA(enumeration_size<matcher, {}, {}, {}, {}>(worker_state, strings, output, output_validity{});)CUDA",
+      slots,
+      multiplier,
+      require,
+      cache,
+      cache ? ", cache, capacity, overflow" : ""));
 }
 
 std::string make_enumeration_emit_kernel(bool offset64,
-                                         std::int32_t capture_slots,
+                                         std::int32_t slots,
                                          std::int32_t groups,
                                          bool findall,
-                                         bool overflow_only,
-                                         std::string_view kernel_name)
+                                         bool overflow,
+                                         std::string_view name)
 {
-  auto result      = common_nvvm(offset64, true, matcher_abi::CAPTURES);
-  auto write_match = [&] {
-    if (findall && groups == 0) {
-      return std::string{regex_ir::nvvm_template_section(
-        regex_ir_nvvm_templates::kernel_enumeration, "write_findall_whole")};
-    }
-    if (findall) {
-      return regex_ir::render_nvvm_template_section(
-        regex_ir_nvvm_templates::kernel_enumeration,
-        "write_findall_capture",
-        {{"@CAPTURE_SLOTS@", std::to_string(capture_slots)}});
-    }
-    return regex_ir::render_nvvm_template_section(
-      regex_ir_nvvm_templates::kernel_enumeration,
-      "write_extract",
-      {{"@CAPTURE_SLOTS@", std::to_string(capture_slots)}, {"@GROUPS@", std::to_string(groups)}});
-  }();
-  auto overflow_parameter = overflow_only ? ", i8* %overflow" : "";
-  auto overflow_guard =
-    overflow_only
-      ? regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_enumeration, "overflow_ptr")
-      : "br i1 %valid, label %setup, label %done";
-  result +=
-    regex_ir::render_nvvm_template_section(regex_ir_nvvm_templates::kernel_enumeration,
-                                           "enumeration_emit",
-                                           {{"@CAPTURE_SLOTS@", std::to_string(capture_slots)},
-                                            {"@OVERFLOW_PARAMETER@", overflow_parameter},
-                                            {"@OVERFLOW_GUARD@", overflow_guard},
-                                            {"@WRITE_MATCH@", write_match}});
-  return annotate_kernel(std::move(result),
-                         overflow_only ? "i8*, i8*, i32*, i32, i32, i8*, i8*, i8*"
-                                       : "i8*, i8*, i32*, i32, i32, i8*, i8*",
-                         kernel_name);
+  return entry(
+    preamble(offset64, matcher_abi::CAPTURES),
+    name,
+    overflow ? ", string_pair* output, i32 const* output_offsets, char const* overflow"
+             : ", string_pair* output, i32 const* output_offsets",
+    std::format(
+      "enumeration_emit<matcher, {}, {}, {}, {}>(worker_state, strings, output, output_offsets{});",
+      slots,
+      groups,
+      findall,
+      overflow,
+      overflow ? ", overflow" : ""));
 }
-
-namespace {
-
-std::string llvm_bytes(std::string_view value)
-{
-  std::string result;
-  result.reserve(value.size() * 3);
-  for (auto character : value) {
-    result += std::format("\\{:02X}", static_cast<unsigned char>(character));
-  }
-  return result;
-}
-
-}  // namespace
 
 std::string make_limited_replace_kernel(bool offset64,
                                         bool emit,
-                                        bool output_offset64,
+                                        bool output64,
                                         bool cache,
-                                        std::span<replacement_piece const> replacement,
-                                        std::int32_t capture_slots,
-                                        std::int32_t max_replace_count,
-                                        std::string_view kernel_name)
+                                        std::span<replacement_piece const> pieces,
+                                        std::int32_t slots,
+                                        std::int32_t limit,
+                                        std::string_view name)
 {
-  auto result = common_nvvm(offset64, false, matcher_abi::CAPTURES);
-  if (cache) {
-    result +=
-      regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions, "capture_cache");
-  }
-  result +=
-    regex_ir::nvvm_template_section(regex_ir_nvvm_templates::regex_functions, "append_range");
-  for (std::size_t index = 0; index < replacement.size(); ++index) {
-    auto& literal = replacement[index].literal;
-    if (!literal.empty()) {
-      result += std::format("\n@regex_ir_replacement_{0} = private constant [{1} x i8] c\"{2}\"\n",
-                            index,
-                            literal.size(),
-                            llvm_bytes(literal));
-    }
-  }
-  std::string steps;
-  auto cursor = std::string{"%cursor_unmatched"};
-  for (std::size_t index = 0; index < replacement.size(); ++index) {
-    auto& piece      = replacement[index];
-    auto next_cursor = std::format("%cursor_piece_{}", index);
-    if (piece.capture.has_value()) {
-      auto slot = static_cast<std::int64_t>(*piece.capture) * 2;
-      steps += regex_ir::nvvm_template(regex_ir_nvvm_templates::kernel_replace,
-                                       "capture_begin_ptr_n",
-                                       index,
-                                       capture_slots,
-                                       slot,
-                                       slot + 1,
-                                       next_cursor,
-                                       cursor);
+  auto source = preamble(offset64, matcher_abi::CAPTURES);
+  for (std::size_t piece_index = 0; piece_index < pieces.size(); ++piece_index)
+    if (!pieces[piece_index].literal.empty())
+      source += std::format(R"CUDA(__device__ __constant__ u8 replacement_{}[] = {{{}}};
+)CUDA",
+                            piece_index,
+                            bytes(pieces[piece_index].literal));
+  source +=
+    R"CUDA(struct replacement {
+  __device__ static i64 apply(input input_value, i64 const* spans, char* output, i64 cursor)
+  {
+)CUDA";
+  for (std::size_t piece_index = 0; piece_index < pieces.size(); ++piece_index) {
+    auto& piece = pieces[piece_index];
+    if (piece.capture) {
+      auto slot = *piece.capture * 2;
+      source += std::format(
+        R"CUDA(if (spans[{}] >= 0 && spans[{}] >= spans[{}])
+  cursor = append(input_value.data, spans[{}], spans[{}], output, cursor);
+)CUDA",
+        slot,
+        slot + 1,
+        slot,
+        slot,
+        slot + 1);
     } else if (!piece.literal.empty()) {
-      steps += regex_ir::nvvm_template(regex_ir_nvvm_templates::kernel_replace,
-                                       "literal_n",
-                                       index,
-                                       piece.literal.size(),
-                                       next_cursor,
-                                       cursor);
-    } else {
-      continue;
+      source += std::format(
+        R"CUDA(cursor = append(reinterpret_cast<char const*>(replacement_{}), 0, {}, output, cursor);
+)CUDA",
+        piece_index,
+        piece.literal.size());
     }
-    cursor = std::move(next_cursor);
   }
-  steps += std::format("  %replacement_cursor = add i64 {}, 0\n", cursor);
-
-  result += std::string{regex_ir::nvvm_template_section(
-    regex_ir_nvvm_templates::kernel_replace,
-    cache ? "limited_replace_execute_cached" : "limited_replace_execute")};
-  if (cache) {
-    result += std::string{regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_replace,
-                                                          "limited_replace_cached")};
-  }
-  replace_all(result, "@REPLACEMENT_STEPS@", steps);
-  replace_all(result,
-              "@LIMIT_REACHED@",
-              std::format("icmp uge i64 %replacement_count, {}", max_replace_count));
-
-  if (cache) {
-    result += emit ? std::string{regex_ir::nvvm_template_section(
-                       regex_ir_nvvm_templates::kernel_replace, "limited_replace_cached_emit")}
-                   : std::string{regex_ir::nvvm_template_section(
-                       regex_ir_nvvm_templates::kernel_replace, "limited_replace_cached_size")};
-  } else {
-    result += emit ? std::string{regex_ir::nvvm_template_section(
-                       regex_ir_nvvm_templates::kernel_replace, "limited_replace_emit")}
-                   : std::string{regex_ir::nvvm_template_section(
-                       regex_ir_nvvm_templates::kernel_replace, "limited_replace_size")};
-  }
-  replace_all(result, "@CAPTURE_SLOTS@", std::to_string(capture_slots));
-  replace_all(result, "@OUTPUT_OFFSET64@", output_offset64 ? "true" : "false");
-  return annotate_kernel(
-    std::move(result),
-    cache ? (emit ? "i8*, i8*, i32*, i32, i32, i8*, i8*, i8*, i32, i8*, i8*"
-                  : "i8*, i8*, i32*, i32, i32, i8*, i8*, i32, i8*, i8*, i32*")
-          : (emit ? "i8*, i8*, i32*, i32, i32, i8*, i8*" : "i8*, i8*, i32*, i32, i32, i8*, i32*"),
-    kernel_name);
+  source += R"CUDA(return cursor; } };
+)CUDA";
+  std::string parameters =
+    emit ? std::format(", void* output, {} const* output_offsets", output_type(output64))
+         : ", void* output";
+  if (cache) parameters += ", i64* cache, i32 capacity, char* overflow, i32* counts";
+  if (!emit) parameters += ", i32* size_overflow";
+  return entry(source,
+               name,
+               parameters,
+               std::format(
+                 R"CUDA(limited_replace<matcher,
+                replacement,
+                {},
+                {},
+                {},
+                {},
+                {}>(worker_state,
+                                 strings,
+                                 output,
+                                 {},
+                                 {},
+                                 {},
+                                 {},
+                                 {},
+                                 {});)CUDA",
+                 slots,
+                 limit,
+                 emit,
+                 cache,
+                 output_type(output64),
+                 emit ? "output_offsets" : "nullptr",
+                 cache ? "cache" : "nullptr",
+                 cache ? "capacity" : "0",
+                 cache ? "overflow" : "nullptr",
+                 cache ? "counts" : "nullptr",
+                 emit ? "nullptr" : "size_overflow"));
 }
 
 std::string encode_replacement(std::span<replacement_piece const> replacement)
 {
   std::string result;
   for (auto& piece : replacement) {
-    if (piece.capture.has_value()) {
+    if (piece.capture) {
       result += std::format("${{{}}}", *piece.capture);
       continue;
     }
-    for (auto character : piece.literal) {
-      result.push_back(character);
-      if (character == '$') { result.push_back('$'); }
+    for (char character : piece.literal) {
+      result += character;
+      if (character == '$') result += '$';
     }
   }
   return result;
 }
 
-std::string make_replace_kernel(bool offset64,
-                                bool emit,
-                                bool output_offset64,
-                                std::string_view kernel_name)
+std::string make_replace_kernel(bool offset64, bool emit, bool output64, std::string_view name)
 {
-  auto result = common_nvvm(offset64, false, matcher_abi::REPLACE);
-  if (emit) {
-    result += regex_ir::render_nvvm_template_section(
-      regex_ir_nvvm_templates::kernel_replace,
-      "replace_emit",
-      {{"@OUTPUT_OFFSET64@", output_offset64 ? "true" : "false"}});
-  } else {
-    result +=
-      regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_replace, "replace_size");
-  }
-  return annotate_kernel(
-    std::move(result),
-    emit ? "i8*, i8*, i32*, i32, i32, i8*, i8*" : "i8*, i8*, i32*, i32, i32, i8*",
-    kernel_name);
+  return entry(preamble(offset64, matcher_abi::REPLACE),
+               name,
+               emit ? std::format(", void* output, {} const* output_offsets", output_type(output64))
+                    : ", void* output",
+               std::format("replace<matcher, {}, {}>(worker_state, strings, output{});",
+                           emit,
+                           output_type(output64),
+                           emit ? ", output_offsets" : ""));
 }
 
 std::string make_split_size_kernel(bool offset64,
-                                   std::int32_t maxsplit,
+                                   std::int32_t limit,
                                    bool cache,
-                                   std::string_view kernel_name)
+                                   std::string_view name)
 {
-  auto result = common_nvvm(offset64, false, matcher_abi::SPLIT);
-  if (cache) {
-    result +=
-      regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions, "split_cached");
-  }
-  auto cache_parameters = cache ? ", i8* %cache_buffer, i32 %capacity, i8* %overflow" : "";
-  auto split_call =
-    cache
-      ? R"NVVM(  %count64 = call i64 @regex_ir_split_cached(@workspace@i8* %data, i64 %size, i8* %cache_buffer, i32 %row, i32 %capacity, i8* %overflow, i64 @MAXSPLIT@))NVVM"
-      : R"NVVM(  %count64 = call i64 @regex_ir_split_execute_limited(@workspace@i8* %data, i64 %size, i64* null, i64 @MAXSPLIT@, i64 -1, i8* null))NVVM";
-  result += regex_ir::render_nvvm_template_section(regex_ir_nvvm_templates::kernel_split,
-                                                   "split_size",
-                                                   {{"@CACHE_PARAMETERS@", cache_parameters},
-                                                    {"@SPLIT_CALL@", split_call},
-                                                    {"@MAXSPLIT@", std::to_string(maxsplit)}});
-  return annotate_kernel(
-    std::move(result),
-    cache ? "i8*, i8*, i32*, i32, i32, i8*, i8*, i32, i8*" : "i8*, i8*, i32*, i32, i32, i8*",
-    kernel_name);
+  return entry(preamble(offset64, matcher_abi::LIMITED_SPLIT),
+               name,
+               cache ? ", i32* output, i64* cache, i32 capacity, char* overflow" : ", i32* output",
+               std::format("split_size<matcher, {}, {}>(worker_state, strings, output{});",
+                           limit,
+                           cache,
+                           cache ? ", cache, capacity, overflow" : ""));
 }
 
-std::string make_split_emit_kernel(bool offset64,
-                                   bool reverse,
-                                   std::int32_t maxsplit,
-                                   bool overflow_only,
-                                   std::string_view kernel_name)
+std::string make_split_emit_kernel(
+  bool offset64, bool reverse, std::int32_t limit, bool overflow, std::string_view name)
 {
-  auto result             = common_nvvm(offset64, true, matcher_abi::SPLIT);
-  auto overflow_parameter = overflow_only ? ", i8* %overflow" : "";
-  if (overflow_only) {
-    result +=
-      regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions, "split_overflow");
-  }
-  auto overflow_guard = overflow_only ? regex_ir::nvvm_template_section(
-                                          regex_ir_nvvm_templates::kernel_split, "selected")
-                                      : "  br i1 %valid, label %setup, label %done";
-  auto source_index   = std::string{};
-  auto select_span    = std::string{};
-  if (reverse) {
-    result +=
-      regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions, "split_reverse");
-    source_index =
-      R"NVVM(%source = call i32 @regex_ir_reverse_split_source(i32 %full_count, i32 %effective_count, i32 %token, i1 %truncated))NVVM";
-    select_span =
-      regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_split, "selected_begin");
-  } else {
-    result +=
-      regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions, "split_forward");
-    source_index = "%source = add i32 %token, 0";
-    select_span =
-      regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_split, "selected_begin_2");
-  }
-  result +=
-    regex_ir::render_nvvm_template_section(regex_ir_nvvm_templates::kernel_split,
-                                           "split_emit",
-                                           {{"@OVERFLOW_PARAMETER@", overflow_parameter},
-                                            {"@OVERFLOW_GUARD@", overflow_guard},
-                                            {"@MAXSPLIT@", std::to_string(reverse ? -1 : maxsplit)},
-                                            {"@SOURCE_INDEX@", source_index},
-                                            {"@SELECT_SPAN@", select_span}});
-  return annotate_kernel(std::move(result),
-                         overflow_only ? "i8*, i8*, i32*, i32, i32, i8*, i8*, i8*, i64*, i8*"
-                                       : "i8*, i8*, i32*, i32, i32, i8*, i8*, i8*, i64*",
-                         kernel_name);
+  return entry(
+    preamble(offset64, matcher_abi::LIMITED_SPLIT),
+    name,
+    std::format(", string_pair* output, i32 const* effective, i32 const* full, i64* spans{}",
+                overflow ? ", char const* overflow" : ""),
+    std::format(
+      "split_emit<matcher, {}, {}, {}>(worker_state, strings, output, effective, full, spans{});",
+      limit,
+      reverse,
+      overflow,
+      overflow ? ", overflow" : ""));
 }
 
-std::string make_span_cache_sample_kernel(bool offset64,
-                                          bool split,
-                                          std::int32_t capture_slots,
-                                          std::int32_t match_limit,
-                                          std::string_view kernel_name)
+std::string make_span_cache_sample_kernel(
+  bool offset64, bool split, std::int32_t slots, std::int32_t limit, std::string_view name)
 {
-  auto result = common_nvvm(offset64, false, split ? matcher_abi::SPLIT : matcher_abi::CAPTURES);
-  result +=
-    regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_functions, "span_cache_sample");
-  result += split
-              ? std::string{regex_ir::nvvm_template_section(regex_ir_nvvm_templates::kernel_split,
-                                                            "span_cache_sample_split")}
-              : std::string{regex_ir::nvvm_template_section(
-                  regex_ir_nvvm_templates::kernel_enumeration, "span_cache_sample_enumeration")};
-  replace_all(result, "@CAPTURE_SLOTS@", std::to_string(std::max(capture_slots, 2)));
-  replace_all(result, "@MATCH_LIMIT@", std::to_string(match_limit));
-  return annotate_kernel(std::move(result), "i8*, i8*, i32*, i32, i32, i32, i32, i8*", kernel_name);
+  return entry(
+    preamble(offset64, split ? matcher_abi::LIMITED_SPLIT : matcher_abi::CAPTURES),
+    name,
+    ", i32 samples, i32 capacity, u64* stats",
+    std::format("sample<matcher, {}, {}, {}>(worker_state, strings, samples, capacity, stats);",
+                split,
+                std::max(slots, 2),
+                limit));
 }
-
 }  // namespace cudf::experimental::detail::regex_jit
