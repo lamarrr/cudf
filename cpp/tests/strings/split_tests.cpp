@@ -636,45 +636,52 @@ TYPED_TEST(StringsRegexSplitTest, SplitRecordRegex)
   }
 }
 
-TEST_F(StringsSplitTest, SplitRegexLiteralFastPath)
+TYPED_TEST(StringsRegexSplitTest, SplitRegexLiteralFastPath)
 {
   auto input =
     cudf::test::strings_column_wrapper({"a::b::c", "", "::d::", "e", ""}, {1, 0, 1, 1, 1});
   auto const sv    = cudf::strings_column_view(input);
-  auto const prog  = cudf::strings::regex_program::create("::");
   auto const delim = cudf::string_scalar("::");
 
+  auto split_prog = TypeParam::create(cudf::experimental::regex_operation::SPLIT, "::");
   // split_re with literal pattern == split
-  CUDF_TEST_EXPECT_TABLES_EQUAL(cudf::strings::split_re(sv, *prog)->view(),
+  CUDF_TEST_EXPECT_TABLES_EQUAL(TypeParam::split_re(sv, *split_prog)->view(),
                                 cudf::strings::split(sv, delim)->view());
 
+  auto reverse_split_prog = TypeParam::create(cudf::experimental::regex_operation::RSPLIT, "::");
   // rsplit_re with literal pattern == rsplit
-  CUDF_TEST_EXPECT_TABLES_EQUAL(cudf::strings::rsplit_re(sv, *prog)->view(),
+  CUDF_TEST_EXPECT_TABLES_EQUAL(TypeParam::rsplit_re(sv, *reverse_split_prog)->view(),
                                 cudf::strings::rsplit(sv, delim)->view());
 
   // split_re with maxsplit
-  CUDF_TEST_EXPECT_TABLES_EQUAL(cudf::strings::split_re(sv, *prog, 1)->view(),
+  CUDF_TEST_EXPECT_TABLES_EQUAL(TypeParam::split_re(sv, *split_prog, 1)->view(),
                                 cudf::strings::split(sv, delim, 1)->view());
 
   // rsplit_re with maxsplit
-  CUDF_TEST_EXPECT_TABLES_EQUAL(cudf::strings::rsplit_re(sv, *prog, 1)->view(),
+  CUDF_TEST_EXPECT_TABLES_EQUAL(TypeParam::rsplit_re(sv, *reverse_split_prog, 1)->view(),
                                 cudf::strings::rsplit(sv, delim, 1)->view());
 
+  auto split_record_prog =
+    TypeParam::create(cudf::experimental::regex_operation::SPLIT_RECORD, "::");
   // split_record_re with literal pattern == split_record
-  CUDF_TEST_EXPECT_COLUMNS_EQUAL(cudf::strings::split_record_re(sv, *prog)->view(),
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(TypeParam::split_record_re(sv, *split_record_prog)->view(),
                                  cudf::strings::split_record(sv, delim)->view());
 
+  auto reverse_split_record_prog =
+    TypeParam::create(cudf::experimental::regex_operation::RSPLIT_RECORD, "::");
   // rsplit_record_re with literal pattern == rsplit_record
-  CUDF_TEST_EXPECT_COLUMNS_EQUAL(cudf::strings::rsplit_record_re(sv, *prog)->view(),
-                                 cudf::strings::rsplit_record(sv, delim)->view());
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(
+    TypeParam::rsplit_record_re(sv, *reverse_split_record_prog)->view(),
+    cudf::strings::rsplit_record(sv, delim)->view());
 
   // split_record_re with maxsplit
-  CUDF_TEST_EXPECT_COLUMNS_EQUAL(cudf::strings::split_record_re(sv, *prog, 1)->view(),
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(TypeParam::split_record_re(sv, *split_record_prog, 1)->view(),
                                  cudf::strings::split_record(sv, delim, 1)->view());
 
   // rsplit_record_re with maxsplit
-  CUDF_TEST_EXPECT_COLUMNS_EQUAL(cudf::strings::rsplit_record_re(sv, *prog, 1)->view(),
-                                 cudf::strings::rsplit_record(sv, delim, 1)->view());
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(
+    TypeParam::rsplit_record_re(sv, *reverse_split_record_prog, 1)->view(),
+    cudf::strings::rsplit_record(sv, delim, 1)->view());
 }
 
 TYPED_TEST(StringsRegexSplitTest, SplitRecordRegexLazyQuantifier)
