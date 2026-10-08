@@ -68,8 +68,8 @@ __device__ inline i64 advance(input input_value, i64 pos)
 
 __device__ inline i32 character_index(input input_value, i64 byte_offset)
 {
-  i32 count    = 0;
-  i64 position = 0;
+  i32 count          = 0;
+  i64 position       = 0;
   auto aligned_input = (reinterpret_cast<u64>(input_value.data) & 7U) == 0;
   while (byte_offset - position >= 8) {
     auto characters = aligned_input ? *reinterpret_cast<u64 const*>(input_value.data + position)
