@@ -1884,7 +1884,9 @@ std::vector<std::unique_ptr<cudf::column>> list_offsets(std::initializer_list<in
 
 cudf::transform_output list_output(cudf::data_type type = cudf::data_type{cudf::type_id::INT32})
 {
-  return {cudf::data_type{cudf::type_id::LIST}, cudf::output_nullability::PRESERVE, type};
+  return {cudf::data_type{cudf::type_id::LIST},
+          cudf::output_nullability::PRESERVE,
+          {{cudf::data_type{cudf::type_id::INT32}}, {type}}};
 }
 
 constexpr auto copy_udf = R"(
@@ -2143,6 +2145,27 @@ __device__ void transform(cudf::mutable_list_element* first, cudf::mutable_strin
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(result->get_column(1), text);
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(result->get_column(2), sizes);
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(result->get_column(3), negative->view());
+}
+
+TEST_F(ListOperationTest, RejectsMalformedOutputChildren)
+{
+  auto input = make_lists({{1}});
+  std::array<cudf::transform_input, 1> inputs{input->view()};
+  std::array output{list_output()};
+  output[0].children.clear();
+  EXPECT_THROW(transform_lists(inputs, output, list_offsets({0, 1})), std::invalid_argument);
+  output[0].children = {{cudf::data_type{cudf::type_id::INT32}}};
+  EXPECT_THROW(transform_lists(inputs, output, list_offsets({0, 1})), std::invalid_argument);
+  output[0]                  = list_output();
+  output[0].children[0].type = cudf::data_type{cudf::type_id::INT64};
+  EXPECT_THROW(transform_lists(inputs, output, list_offsets({0, 1})), std::invalid_argument);
+  output[0]                      = list_output();
+  output[0].children[1].children = {{cudf::data_type{cudf::type_id::INT32}}};
+  EXPECT_THROW(transform_lists(inputs, output, list_offsets({0, 1})), std::invalid_argument);
+  output[0] = {cudf::data_type{cudf::type_id::INT32},
+               cudf::output_nullability::PRESERVE,
+               {{cudf::data_type{cudf::type_id::INT32}}}};
+  EXPECT_THROW(transform_lists(inputs, output, {}), std::invalid_argument);
 }
 
 TEST_F(ListOperationTest, RejectsMissingAndMalformedOffsets)

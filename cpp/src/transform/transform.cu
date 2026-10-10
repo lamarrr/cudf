@@ -151,29 +151,21 @@ std::string get_element_type_name(transform_input_spec const& spec, bool use_phy
 std::string reflect_input_element(transform_input_spec const& spec, bool use_physical_type)
 {
   if (spec.type == type_id::LIST) {
-    CUDF_EXPECTS(spec.children.size() == 2 && spec.children[0].type == type_id::INT32 &&
-                   (is_fixed_width(data_type{spec.children[1].type}) ||
-                    spec.children[1].type == type_id::STRING),
-                 "List inputs require INT32 offsets and a fixed-width or string child",
-                 std::invalid_argument);
     return "cudf::list_element";
+  } else {
+    return get_element_type_name(spec, use_physical_type);
   }
-  return get_element_type_name(spec, use_physical_type);
 }
 
 std::string reflect_output_element(transform_output_spec const& spec, bool use_physical_type)
 {
   if (spec.type == type_id::LIST) {
-    CUDF_EXPECTS(spec.children.size() == 2 && spec.children[0].type == type_id::INT32 &&
-                   is_fixed_width(data_type{spec.children[1].type}) && spec.has_offsets,
-                 "List outputs require supplied INT32 offsets and a fixed-width child",
-                 std::invalid_argument);
     return "cudf::mutable_list_element";
-  }
-  if (spec.type == type_id::STRING) {
+  } else if (spec.type == type_id::STRING) {
     return spec.has_offsets ? "cudf::mutable_string_view" : "cudf::string_view";
+  } else {
+    return get_element_type_name(transform_input_spec{.type = spec.type}, use_physical_type);
   }
-  return get_element_type_name(transform_input_spec{.type = spec.type}, use_physical_type);
 }
 
 std::string reflect_input_value_type(transform_input_spec const& spec, bool use_physical_type)
@@ -225,12 +217,7 @@ auto reflect(std::variant<udf_source_type, lto_binary_type> source_type,
 
   std::vector<std::string> out_types;
   for (size_t i = 0; i < outputs.size(); i++) {
-    auto& out = outputs[i];
-    CUDF_EXPECTS(out.type != type_id::LIST ||
-                   !std::holds_alternative<udf_source_type>(source_type) ||
-                   std::get<udf_source_type>(source_type) != udf_source_type::PTX,
-                 "PTX transforms do not support list outputs",
-                 std::invalid_argument);
+    auto& out      = outputs[i];
     auto column    = reflect_output_column(out);
     auto element   = reflect_output_element(out, use_physical_types);
     bool as_scalar = false;  // never scalar
@@ -335,27 +322,17 @@ std::vector<transform_output_spec> make_output_specs(
   std::span<transform_output const> outputs,
   std::span<std::unique_ptr<column> const> output_offsets)
 {
-  CUDF_EXPECTS(output_offsets.empty() || output_offsets.size() == outputs.size(),
-               "Number of output offsets must be empty or match the number of outputs",
-               std::invalid_argument);
   std::vector<transform_output_spec> result;
   for (size_t i = 0; i < outputs.size(); ++i) {
     auto has_offsets = !output_offsets.empty() && output_offsets[i] != nullptr;
     transform_output_spec spec{.type        = outputs[i].type.id(),
                                .nullability = outputs[i].nullability,
                                .has_offsets = has_offsets};
-    if (outputs[i].type.id() == type_id::LIST) {
-      CUDF_EXPECTS(outputs[i].list_element_type && is_fixed_width(*outputs[i].list_element_type) &&
-                     has_offsets,
-                   "LIST transform outputs require a fixed-width element type and supplied offsets",
-                   std::invalid_argument);
-      spec.children = {{.type = type_id::INT32}, {.type = outputs[i].list_element_type->id()}};
-    } else {
-      CUDF_EXPECTS(!outputs[i].list_element_type.has_value(),
-                   "list_element_type is only valid for LIST transform outputs",
-                   std::invalid_argument);
-    }
-    if (spec.type == type_id::STRING && spec.has_offsets) {
+    if (spec.type == type_id::LIST) {
+      for (auto const& child : outputs[i].children) {
+        spec.children.push_back({.type = child.type.id()});
+      }
+    } else if (spec.type == type_id::STRING && spec.has_offsets) {
       spec.children.push_back({.type = output_offsets[i]->type().id()});
     }
     result.push_back(std::move(spec));
@@ -411,6 +388,7 @@ std::string reflect_udf_signature(bool is_null_aware,
 
   return std::format("int({})", joined);
 }
+
 std::string reflect_udf_signature(bool is_null_aware,
                                   bool has_user_data,
                                   std::span<input_column_view const> inputs,
@@ -567,6 +545,7 @@ rtcx::binary_type as_rtcx_binary_type(lto_binary_type type)
   switch (type) {
     case lto_binary_type::LTO_IR: return rtcx::binary_type::LTO_IR;
     case lto_binary_type::FATBIN: return rtcx::binary_type::FATBIN;
+    case lto_binary_type::PTX: return rtcx::binary_type::PTX;
     default:
       CUDF_FAIL(
         std::format("Unrecognized LTO binary type {} for LTO transform", static_cast<int>(type)),
@@ -655,13 +634,13 @@ size_type inplace_null_mask_and(bitmask_type* null_mask,
 
   if (!is_nullable) { return 0; }
 
-  auto set_constant_mask = [&](bool valid) {
+  auto init_mask = [&](bool valid) {
     CUDF_CUDA_TRY(cudaMemsetAsync(
       null_mask, valid ? 0xff : 0, bitmask_allocation_size_bytes(row_size), stream.get()));
   };
   if (inputs.empty()) {
     // no input, set all to valid
-    set_constant_mask(true);
+    init_mask(true);
     return 0;
   }
 
@@ -677,7 +656,7 @@ size_type inplace_null_mask_and(bitmask_type* null_mask,
 
     if (scalar_is_null) {
       // scalar is null, all rows will be null
-      set_constant_mask(false);
+      init_mask(false);
       return row_size;
     }
   }
@@ -687,7 +666,7 @@ size_type inplace_null_mask_and(bitmask_type* null_mask,
 
   if (!has_cols) {
     // no non-scalar columns, so all rows are valid
-    set_constant_mask(true);
+    init_mask(true);
     return 0;
   }
 
@@ -708,7 +687,7 @@ size_type inplace_null_mask_and(bitmask_type* null_mask,
 
   if (nullable_masks.empty()) {
     // we only have non-nullable columns, so all rows are valid
-    set_constant_mask(true);
+    init_mask(true);
     return 0;
   }
 
@@ -779,67 +758,40 @@ void perform_checks(std::variant<udf_source_type, lto_binary_type> source_type,
                     std::optional<size_type> in_row_size,
                     std::span<transform_input const> inputs,
                     std::span<transform_output const> outputs,
-                    std::span<std::unique_ptr<column> const> output_offsets,
-                    cuda::stream_ref stream)
+                    std::span<std::unique_ptr<column> const> output_offsets)
 {
-  if (auto* udf_source = std::get_if<udf_source_type>(&source_type);
-      udf_source != nullptr && *udf_source == udf_source_type::PTX) {
-    static constexpr auto is_input_value_supported = [](auto const& c) {
-      return is_integral(c.type()) || is_floating_point(c.type());
-    };
-    static constexpr auto is_supported_input_type = [](auto const& c) {
-      auto col = std::visit([](auto& c) { return as_column_view(c); }, c);
-      return is_input_value_supported(col) ||
-             (is_dictionary(col.type()) &&
-              is_input_value_supported(col.child(dictionary_keys_column_index)));
-    };
-    CUDF_EXPECTS(
-      std::none_of(
-        inputs.begin(), inputs.end(), [](auto const& in) { return !is_supported_input_type(in); }),
-      "Transforms with PTX UDFs only support integer, floating-point, and boolean",
-      std::invalid_argument);
-    CUDF_EXPECTS(std::none_of(outputs.begin(),
-                              outputs.end(),
-                              [](auto& out) {
-                                return !is_integral(out.type) && !is_floating_point(out.type);
-                              }),
-                 "Transforms with PTX UDFs only support integer, floating-point, and boolean types",
-                 std::invalid_argument);
-    CUDF_EXPECTS(is_null_aware == null_aware::NO,
-                 "PTX UDFs do not support null-aware transformations",
-                 std::invalid_argument);
-  }
-
   CUDF_EXPECTS(std::none_of(outputs.begin(),
                             outputs.end(),
                             [](auto& out) {
-                              return !is_fixed_width(out.type) &&
-                                     out.type.id() != type_id::STRING &&
-                                     out.type.id() != type_id::LIST;
+                              return !(is_fixed_width(out.type) ||
+                                       out.type.id() == type_id::STRING ||
+                                       out.type.id() == type_id::LIST);
                             }),
                "Transforms only support fixed-width, STRING, or fixed-width LIST outputs",
                std::invalid_argument);
 
   for (auto const& out : outputs) {
-    CUDF_EXPECTS(out.type.id() == type_id::LIST
-                   ? out.list_element_type && is_fixed_width(*out.list_element_type)
-                   : !out.list_element_type.has_value(),
-                 "list_element_type must be fixed-width for LIST outputs and unset otherwise",
-                 std::invalid_argument);
+    if (out.type.id() == type_id::LIST) {
+      CUDF_EXPECTS(is_fixed_width(out.children[list_values_column_index].type),
+                   "LIST outputs require INT32 offsets and a fixed-width values child",
+                   std::invalid_argument);
+    } else {
+      CUDF_EXPECTS(out.children.empty(),
+                   "Child specifications are only supported for LIST outputs",
+                   std::invalid_argument);
+    }
   }
 
   static constexpr auto is_input_value_supported = [](auto const& self,
                                                       column_view const& c) -> bool {
-    if (is_dictionary(c.type())) {
-      return c.num_children() == 2 &&
-             is_index_type(c.child(dictionary_indices_column_index).type()) &&
-             self(self, c.child(dictionary_keys_column_index));
+    if (is_fixed_width(c.type()) || c.type().id() == type_id::STRING || is_dictionary(c.type())) {
+      return true;
     }
-    return is_fixed_width(c.type()) || c.type().id() == type_id::STRING ||
-           (c.type().id() == type_id::LIST && c.num_children() == 2 &&
-            c.child(0).type().id() == type_id::INT32 &&
-            (is_fixed_width(c.child(1).type()) || c.child(1).type().id() == type_id::STRING) &&
-            !c.child(1).has_nulls());
+    if (c.type().id() == type_id::LIST) {
+      return is_fixed_width(c.child(list_values_column_index).type());
+    }
+
+    return false;
   };
   static constexpr auto is_supported_input_type = [&](auto const& c) {
     auto col = std::visit([](auto const& c) { return as_column_view(c); }, c);
@@ -849,8 +801,7 @@ void perform_checks(std::variant<udf_source_type, lto_binary_type> source_type,
     std::none_of(
       inputs.begin(), inputs.end(), [&](auto const& in) { return !is_supported_input_type(in); }),
     "Transforms only support fixed-width, string, dictionary, or lists of fixed-width or string "
-    "inputs without "
-    "null child elements",
+    "inputs",
     std::invalid_argument);
 
   if (!in_row_size.has_value()) {
@@ -891,27 +842,13 @@ void perform_checks(std::variant<udf_source_type, lto_binary_type> source_type,
                "Output offsets must only be provided for string or list outputs",
                std::invalid_argument);
 
-  for (size_t i = 0; i < outputs.size(); ++i) {
-    if (outputs[i].type.id() != type_id::LIST) { continue; }
-    CUDF_EXPECTS(!output_offsets.empty() && output_offsets[i],
-                 "List outputs require supplied offsets",
-                 std::invalid_argument);
-    auto const offsets = output_offsets[i]->view();
-    CUDF_EXPECTS(row_size >= 0 && row_size < std::numeric_limits<size_type>::max() &&
-                   offsets.type().id() == type_id::INT32 && !offsets.has_nulls() &&
-                   offsets.size() == static_cast<int64_t>(row_size) + 1,
-                 "List offsets must be non-null INT32 values with row_count + 1 entries",
-                 std::invalid_argument);
-    auto data  = offsets.data<int32_t>();
-    auto valid = thrust::all_of(rmm::exec_policy(stream),
-                                thrust::make_counting_iterator<int64_t>(0),
-                                thrust::make_counting_iterator<int64_t>(offsets.size()),
-                                [data] __device__(int64_t index) {
-                                  return index == 0 ? data[0] == 0 : data[index] >= data[index - 1];
-                                });
-    CUDF_EXPECTS(
-      valid, "List offsets must start at zero and be nondecreasing", std::invalid_argument);
-  }
+  CUDF_EXPECTS(std::none_of(outputs.begin(),
+                            outputs.end(),
+                            [&](auto& out) {
+                              return out.type.id() == type_id::LIST && output_offsets.empty();
+                            }),
+               "List outputs require supplied offsets",
+               std::invalid_argument);
 }
 
 std::optional<std::pair<bitmask_type*, size_type>> make_stencil(
@@ -941,12 +878,8 @@ std::optional<std::pair<bitmask_type*, size_type>> make_stencil(
     auto* mask = std::visit([&](auto& c) { return c.null_mask(); }, out);
 
     if (mask != nullptr && mask != *stencil) {
-      // The AND operation initializes mask words, not the trailing allocation padding.
-      CUDF_CUDA_TRY(detail::memcpy_async(
-        mask,
-        *stencil,
-        static_cast<size_t>(num_bitmask_words(row_size)) * sizeof(bitmask_type),
-        stream));
+      CUDF_CUDA_TRY(
+        detail::memcpy_async(mask, *stencil, bitmask_allocation_size_bytes(row_size), stream));
     }
 
     auto null_count = (mask == nullptr) ? 0 : stencil_null_count;
@@ -968,13 +901,8 @@ rmm::device_uvector<char> make_chars_buffer(column_view const& offsets_view,
   auto offsets = detail::offsetalator_factory::make_input_iterator(offsets_view);
   auto chars   = rmm::device_uvector<char>(chars_size, stream, mr);
 
-  if (chars_size == 0) { return chars; }
-
   auto srcs = detail::make_counting_transform_iterator(
-    size_type{0}, [begin, stencil] __device__(size_type idx) -> void const* {
-      if (stencil != nullptr && !bit_is_set(stencil, idx)) { return nullptr; }
-      return begin[idx].data();
-    });
+    size_type{0}, [begin] __device__(size_type idx) -> void const* { return begin[idx].data(); });
 
   auto src_sizes = detail::make_counting_transform_iterator(
     size_type{0}, [begin, stencil] __device__(size_type idx) -> size_type {
@@ -1051,19 +979,9 @@ auto make_outputs(null_aware is_null_aware,
       cols.emplace_back(std::move(col));
     } else if (output.type.id() == type_id::LIST) {
       auto count = strings::detail::get_offset_value(output_offsets[i]->view(), row_size, stream);
-      auto element_type = *output.list_element_type;
-      CUDF_EXPECTS(
-        static_cast<uint64_t>(count) <= std::numeric_limits<size_t>::max() / size_of(element_type),
-        "List child allocation exceeds addressable storage",
-        std::overflow_error);
+      auto element_type = output.children[list_values_column_index].type;
       auto child =
         make_fixed_width_column(element_type, count, mask_state::UNALLOCATED, stream, mr);
-      if (count != 0) {
-        CUDF_CUDA_TRY(cudaMemsetAsync(child->mutable_view().head(),
-                                      0,
-                                      static_cast<size_t>(count) * size_of(element_type),
-                                      stream.get()));
-      }
       auto col = make_lists_column(
         row_size, std::move(output_offsets[i]), std::move(child), 0, std::move(null_mask));
       cols.emplace_back(mutable_lists_column{std::move(col)});
@@ -1534,6 +1452,7 @@ transform_program::transform_program(
   cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
+  // TODO(lamarrr): drop PTX-specific code and use LTO
   CUDF_FUNC_RANGE();
   auto args = detail::row_ir::ast_converter::compute_table(
     detail::row_ir::target::CUDA, expressions, table, {}, "compute_operation", stream, mr);

@@ -46,7 +46,7 @@ cdef extern from "cudf/transform.hpp" namespace "cudf" nogil:
     cdef cppclass transform_output:
         data_type type
         output_nullability nullability
-        optional[data_type] list_element_type
+        vector[transform_output] children
 
     ctypedef const transform_output const_transform_output
 
