@@ -7,6 +7,7 @@
 #include <cudf/column/column_child_offsets.hpp>
 #include <cudf/detail/offsets_iterator.cuh>
 #include <cudf/fixed_point/fixed_point.hpp>
+#include <cudf/strings/mutable_string_view.cuh>
 #include <cudf/strings/string_view.cuh>
 #include <cudf/types.hpp>
 #include <cudf/utilities/bit.hpp>
@@ -93,89 +94,304 @@ template <typename IndexType, typename KeyType>
 inline constexpr bool is_dictionary_encoded<dictionary_element<IndexType, KeyType>> = true;
 
 /**
- * @brief A non-owning view of a list row's device storage.
+ * @brief A non-owning, type-erased, read-only view of a list row's child elements.
  *
- * The child element type must be layout-compatible with its device representation.
- * Use `list_element<T const>` for read-only input rows and `list_element<T>` for
- * output rows written into storage allocated from supplied offsets. Decimal children
- * use their integer storage type; their scale is maintained by the column.
+ * The caller must keep the underlying device storage alive.
+ * List row validity is separate from the child validity retained here.
+ * Use the column view's nullable_element<list_element>() to check the list row itself.
  *
- * The caller must keep the underlying device memory alive while using this view or
- * its iterators. Access to that memory must occur in device code. Child nulls are not
- * represented, and writes must stay within the existing row range.
- *
- * Constness of the view does not change element mutability: a const `list_element<T>`
- * still permits writes when `T` is mutable.
- *
- * @tparam T The device storage type of the child elements
+ * Element indices are relative to this list row and must be in `[0, size())`.
+ * The caller must choose a `T` matching the child column's type.
+ *This view does not check types at runtime. Representation-compatible types,
+ * fixed-point types, and `string_view` are supported.
  */
-template <typename T>
-  requires(is_rep_layout_compatible<T>())
 struct list_element {
-  using element_type = T;  ///< The type of the elements in the list
+  friend class column_device_view_core;
+  friend class mutable_column_device_view_core;
 
+ public:
   /**
-   * @brief Construct a row over existing device storage.
-   *
-   * @param data Pointer to the first child element in the row
-   * @param size Number of child elements in the row
-   */
-  CUDF_HOST_DEVICE list_element(T* data, size_type size) : data_{data}, size_{size} {}
-
-  /** @brief Construct an empty row with a null data pointer. */
-  CUDF_HOST_DEVICE list_element() {}
-
-  /**
-   * @brief Return an iterator to the first child element.
-   * @return Pointer to the first element
-   */
-  CUDF_HOST_DEVICE T* begin() const { return data_; }
-
-  /**
-   * @brief Return an iterator past the last child element.
-   * @return Pointer past the last element
-   */
-  CUDF_HOST_DEVICE T* end() const { return data_ + size_; }
-
-  /**
-   * @brief Return the underlying device storage.
-   * @return Pointer to the first child element
-   */
-  CUDF_HOST_DEVICE T* data() const { return data_; }
-
-  /**
-   * @brief Return the number of child elements in the row.
-   * @return Number of elements
+   * @brief Returns the number of child elements in this list row, including null elements.
+   * @return Number of child elements
    */
   CUDF_HOST_DEVICE size_type size() const { return size_; }
 
   /**
-   * @brief Return whether the row is empty.
-   * @return true if the row contains no elements
+   * @brief Returns whether this list row contains no child elements.
+   * @return `true` if size() is zero
    */
   CUDF_HOST_DEVICE bool empty() const { return size_ == 0; }
 
   /**
-   * @brief Return the child element at the specified row-relative position.
-   *
-   * The position must be in `[0, size())` and the element must be valid.
-   * @param idx Position of the child element within the row
-   * @return Reference to the child element, with constness determined by `T`
+   * @brief Returns whether the child storage has a validity mask.
+   * @return `true` if a child validity mask is present, even if all children are valid
    */
-  CUDF_HOST_DEVICE T& operator[](size_type idx) const { return data_[idx]; }
+  CUDF_HOST_DEVICE bool nullable() const { return null_mask_ != nullptr; }
 
- private:
-  T* data_        = nullptr;  ///< Pointer to the first child element in the row
-  size_type size_ = 0;        ///< Number of child elements in the row
+  /**
+   * @brief Returns whether the specified child element is valid.
+   * @param idx Child index within this row in `[0, size())`
+   * @return `true` if the child is valid or no child validity mask is present
+   */
+  CUDF_HOST_DEVICE bool is_valid(size_type idx) const
+  { return bit_value_or(null_mask_, idx + offset_, true); }
+
+  /**
+   * @brief Returns whether the specified child element is null.
+   * @param idx Child index within this row in `[0, size())`
+   * @return `true` if the child is null
+   */
+  CUDF_HOST_DEVICE bool is_null(size_type idx) const { return !is_valid(idx); }
+
+  /**
+   * @brief Reads a representation-compatible child value.
+   *
+   * The child must be valid. Use nullable_element<T>() to check child validity.
+   * @tparam T The child type, satisfying `is_rep_layout_compatible<T>()`
+   * @param idx Child index within this row in `[0, size())`
+   * @return The child value
+   */
+  template <typename T, CUDF_ENABLE_IF(is_rep_layout_compatible<T>())>
+  __device__ T element(size_type idx) const noexcept
+  { return static_cast<T const*>(data_)[idx + offset_]; }
+
+  /**
+   * @brief Reads a fixed-point child value using the child column's scale.
+   *
+   * The child must be valid. Use nullable_element<T>() to check child validity.
+   * @tparam T The child's fixed-point type
+   * @param idx Child index within this row in `[0, size())`
+   * @return A fixed-point value constructed from the stored representation and scale
+   */
+  template <typename T, CUDF_ENABLE_IF(is_fixed_point<T>())>
+  __device__ T element(size_type idx) const noexcept
+  {
+    using rep = typename T::rep;
+    return T{numeric::scaled_integer<rep>{static_cast<rep const*>(data_)[idx + offset_],
+                                          numeric::scale_type{scale_}}};
+  }
+
+  /**
+   * @brief Returns a read-only view of a string child.
+   *
+   * The child must be valid. Use nullable_element<T>() to check child validity.
+   * @tparam T `string_view`
+   * @param idx Child index within this row in `[0, size())`
+   * @return A view of the child's existing character storage
+   */
+  template <typename T, CUDF_ENABLE_IF(cuda::std::is_same_v<T, string_view>)>
+  __device__ T element(size_type idx) const noexcept
+  {
+    auto const offsets = detail::input_offsetalator(offsets_, data_type{offsets_type_});
+    auto const begin   = offsets[idx + offset_];
+    auto const end     = offsets[idx + offset_ + 1];
+    return T{static_cast<char const*>(data_) + begin, static_cast<size_type>(end - begin)};
+  }
+
+  /**
+   * @brief Reads a child value if it is valid, otherwise returns `nullopt`.
+   *
+   * This checks child validity, not the validity of the containing list row.
+   * @tparam T A child type supported by element<T>()
+   * @param idx Child index within this row in `[0, size())`
+   * @return An optional child value or string view, or `nullopt` for a null child
+   */
+  template <typename T>
+  __device__ cuda::std::optional<T> nullable_element(size_type idx) const noexcept
+  {
+    if (is_null(idx)) { return cuda::std::nullopt; }
+    return element<T>(idx);
+  }
+
+ protected:
+  /**
+   * @brief Constructs a read-only view from the child storage of a list row.
+   * @param data Base pointer to child data or string characters, before applying `offset`
+   * @param offsets Base pointer to string offsets, or `nullptr` for other child types
+   * @param null_mask Base pointer to the child validity mask, or `nullptr` if absent
+   * @param size Number of child elements in the row
+   * @param scale Fixed-point child scale, ignored for other child types
+   * @param offset Child index at which the row begins, including the child column's offset
+   * @param offsets_type `INT32` or `INT64` for string offsets, otherwise `EMPTY`
+   */
+  CUDF_HOST_DEVICE list_element(void const* data,
+                                void const* offsets,
+                                bitmask_type const* null_mask,
+                                size_type size,
+                                numeric::scale_type scale,
+                                size_type offset,
+                                type_id offsets_type)
+    : data_{data},
+      offsets_{offsets},
+      null_mask_{null_mask},
+      size_{size},
+      scale_{scale},
+      offset_{offset},
+      offsets_type_{offsets_type}
+  {
+  }
+
+  void const* data_              = nullptr;         ///< Child data or string character buffer
+  void const* offsets_           = nullptr;         ///< String offsets storage
+  bitmask_type const* null_mask_ = nullptr;         ///< Child validity mask
+  size_type size_                = 0;               ///< Number of child elements in the row
+  int32_t scale_                 = 0;               ///< Fixed-point scale
+  size_type offset_              = 0;               ///< Row start within the child storage
+  type_id offsets_type_          = type_id::EMPTY;  ///< Type of string offsets
 };
 
-/** @brief Whether a type represents a list row. */
-template <typename T>
-inline constexpr bool is_list_element = false;
+/**
+ * @brief A non-owning, type-erased view for reading and modifying a list row's child elements.
+ *
+ * Inherits read access and validity queries from `list_element`. Mutable column device views
+ * construct this view from writable child storage, which must remain alive while the view
+ * is used. Assignment and validity updates apply the stored child offset and affect only
+ * the children, not the containing list row's validity.
+ *
+ * Writes must stay within the existing child range. String characters may be modified
+ * through element<mutable_string_view>(), but string offsets and lengths cannot be changed.
+ * The caller must choose a type matching the child column. No runtime type check is performed.
+ */
+struct mutable_list_element : list_element {
+  friend class mutable_column_device_view_core;
 
-/** @brief Identifies a list row by its child storage type. */
+ public:
+  using list_element::element;
+
+  /**
+   * @brief Returns a writable view of a valid string child's existing character storage.
+   *
+   * Use nullable_element<T>() to check child validity before accessing a nullable child.
+   * Modifications must stay within the string's existing byte range.
+   * @tparam T `mutable_string_view`
+   * @param idx Child index within this row in `[0, size())`
+   * @return A mutable view of the child's characters without changing offsets or length
+   */
+  template <typename T, CUDF_ENABLE_IF(cuda::std::is_same_v<T, mutable_string_view>)>
+  __device__ T element(size_type idx) const noexcept
+  {
+    auto const value = element<string_view>(idx);
+    return T{const_cast<char*>(value.data()), value.size_bytes()};
+  }
+
+  /**
+   * @brief Reads a child value or view if it is valid, otherwise returns `nullopt`.
+   *
+   * This checks child validity, not the validity of the containing list row.
+   * @tparam T A child type supported by element<T>(), including `mutable_string_view`
+   * @param idx Child index within this row in `[0, size())`
+   * @return An optional child value or view, or `nullopt` for a null child
+   */
+  template <typename T>
+  __device__ cuda::std::optional<T> nullable_element(size_type idx) const noexcept
+  {
+    if (is_null(idx)) { return cuda::std::nullopt; }
+    return element<T>(idx);
+  }
+
+  /**
+   * @brief Assigns a representation-compatible child value without changing its validity.
+   * @tparam T The child type, satisfying `is_rep_layout_compatible<T>()`
+   * @param idx Child index within this row in `[0, size())`
+   * @param value The value to store
+   */
+  template <typename T, CUDF_ENABLE_IF(is_rep_layout_compatible<T>())>
+  __device__ void assign(size_type idx, T value) const noexcept
+  { const_cast<T*>(static_cast<T const*>(data_))[idx + offset_] = value; }
+
+  /**
+   * @brief Assigns a fixed-point child's representation without rescaling or changing validity.
+   *
+   * Only `value.value()` is stored. The child column's scale is unchanged; the caller is
+   * responsible for supplying a representation appropriate for that scale.
+   * @tparam T The child's fixed-point type
+   * @param idx Child index within this row in `[0, size())`
+   * @param value The fixed-point value whose representation is stored
+   */
+  template <typename T, CUDF_ENABLE_IF(is_fixed_point<T>())>
+  __device__ void assign(size_type idx, T value) const noexcept
+  {
+    using rep                                                       = typename T::rep;
+    const_cast<rep*>(static_cast<rep const*>(data_))[idx + offset_] = value.value();
+  }
+
+  /**
+   * @brief Assignment from a read-only string view is not supported.
+   * @tparam T `string_view`
+   * @param idx Child index within this row
+   * @param value The string view
+   */
+  template <typename T, CUDF_ENABLE_IF(cuda::std::is_same_v<T, string_view>)>
+  __device__ void assign(size_type idx, T value) const noexcept = delete;
+
+  /**
+   * @brief Performs no assignment for a mutable string view.
+   *
+   * String characters are modified in place through element<mutable_string_view>().
+   * This method does not copy characters, change offsets or length, or update validity.
+   * @tparam T `mutable_string_view`
+   */
+  template <typename T, CUDF_ENABLE_IF(cuda::std::is_same_v<T, mutable_string_view>)>
+  __device__ void assign(size_type, T) const noexcept
+  {
+  }
+
+#ifdef __CUDACC__
+  /**
+   * @brief Marks a child element null using an atomic update to the child validity mask.
+   *
+   * Requires nullable() to be true. The containing list row's validity is unchanged.
+   * @param idx Child index within this row in `[0, size())`
+   */
+  __device__ void set_null(size_type idx) const noexcept
+  { clear_bit(const_cast<bitmask_type*>(null_mask_), idx + offset_); }
+
+  /**
+   * @brief Marks a child element valid using an atomic update to the child validity mask.
+   *
+   * Requires nullable() to be true. The containing list row's validity is unchanged.
+   * @param idx Child index within this row in `[0, size())`
+   */
+  __device__ void set_valid(size_type idx) const noexcept
+  { set_bit(const_cast<bitmask_type*>(null_mask_), idx + offset_); }
+#endif
+
+ protected:
+  /**
+   * @brief Constructs a mutable view from the writable child storage of a list row.
+   * @param data Base pointer to writable child data or string characters
+   * @param offsets Base pointer to string offsets, or `nullptr` for other child types
+   * @param null_mask Base pointer to the writable child validity mask, or `nullptr` if absent
+   * @param size Number of child elements in the row
+   * @param scale Fixed-point child scale, ignored for other child types
+   * @param offset Child index at which the row begins, including the child column's offset
+   * @param offsets_type `INT32` or `INT64` for string offsets, otherwise `EMPTY`
+   */
+  CUDF_HOST_DEVICE mutable_list_element(void* data,
+                                        void* offsets,
+                                        bitmask_type* null_mask,
+                                        size_type size,
+                                        numeric::scale_type scale,
+                                        size_type offset,
+                                        type_id offsets_type)
+    : list_element{data, offsets, null_mask, size, scale, offset, offsets_type}
+  {
+  }
+};
+
+/**
+ * @brief Whether `T` is the read-only list row view `list_element`.
+ * @tparam T The type to check
+ */
 template <typename T>
-inline constexpr bool is_list_element<list_element<T>> = true;
+inline constexpr bool is_list_element = cuda::std::is_same_v<T, list_element>;
+
+/**
+ * @brief Whether `T` is the mutable list row view `mutable_list_element`.
+ * @tparam T The type to check
+ */
+template <typename T>
+inline constexpr bool is_mutable_list_element = cuda::std::is_same_v<T, mutable_list_element>;
 
 namespace detail {
 /**
@@ -223,9 +439,7 @@ class alignas(16) column_device_view_base {
   template <typename T = void,
             CUDF_ENABLE_IF(cuda::std::is_same_v<T, void> or is_rep_layout_compatible<T>())>
   [[nodiscard]] CUDF_HOST_DEVICE T const* head() const noexcept
-  {
-    return static_cast<T const*>(_data);
-  }
+  { return static_cast<T const*>(_data); }
 
   /**
    * @brief Returns the underlying data casted to the specified type, plus the
@@ -244,9 +458,7 @@ class alignas(16) column_device_view_base {
    */
   template <typename T, CUDF_ENABLE_IF(is_rep_layout_compatible<T>())>
   [[nodiscard]] CUDF_HOST_DEVICE T const* data() const noexcept
-  {
-    return head<T>() + _offset;
-  }
+  { return head<T>() + _offset; }
 
   /**
    * @brief Returns the number of elements in the column.
@@ -283,9 +495,7 @@ class alignas(16) column_device_view_base {
    * @return Raw pointer to the underlying bitmask allocation
    */
   [[nodiscard]] CUDF_HOST_DEVICE bitmask_type const* null_mask() const noexcept
-  {
-    return _null_mask;
-  }
+  { return _null_mask; }
 
   /**
    * @brief Returns the index of the first element relative to the base memory
@@ -310,9 +520,7 @@ class alignas(16) column_device_view_base {
    * @return false The element is null
    */
   [[nodiscard]] __device__ bool is_valid(size_type element_index) const noexcept
-  {
-    return not nullable() or is_valid_nocheck(element_index);
-  }
+  { return not nullable() or is_valid_nocheck(element_index); }
 
   /**
    * @brief Returns whether the specified element holds a valid value (i.e., not
@@ -327,9 +535,7 @@ class alignas(16) column_device_view_base {
    * @return false The element is null
    */
   [[nodiscard]] __device__ bool is_valid_nocheck(size_type element_index) const noexcept
-  {
-    return bit_is_set(_null_mask, offset() + element_index);
-  }
+  { return bit_is_set(_null_mask, offset() + element_index); }
 
   /**
    * @brief Returns whether the specified element is null.
@@ -345,9 +551,7 @@ class alignas(16) column_device_view_base {
    * @return false The element is valid
    */
   [[nodiscard]] __device__ bool is_null(size_type element_index) const noexcept
-  {
-    return not is_valid(element_index);
-  }
+  { return not is_valid(element_index); }
 
   /**
    * @brief Returns whether the specified element is null
@@ -361,9 +565,7 @@ class alignas(16) column_device_view_base {
    * @return false The element is valid
    */
   [[nodiscard]] __device__ bool is_null_nocheck(size_type element_index) const noexcept
-  {
-    return not is_valid_nocheck(element_index);
-  }
+  { return not is_valid_nocheck(element_index); }
 
   /**
    * @brief Returns the specified bitmask word from the `null_mask()`.
@@ -375,9 +577,7 @@ class alignas(16) column_device_view_base {
    * @return bitmask word for the given word_index
    */
   [[nodiscard]] __device__ bitmask_type get_mask_word(size_type word_index) const noexcept
-  {
-    return null_mask()[word_index];
-  }
+  { return null_mask()[word_index]; }
 
  protected:
   data_type _type{type_id::EMPTY};   ///< Element type
@@ -534,9 +734,7 @@ class alignas(16) column_device_view_core : public detail::column_device_view_ba
    */
   template <typename T, CUDF_ENABLE_IF(is_rep_layout_compatible<T>())>
   [[nodiscard]] __device__ T element(size_type element_index) const noexcept
-  {
-    return data<T>()[element_index];
-  }
+  { return data<T>()[element_index]; }
 
   /**
    * @brief Returns `string_view` to the string element at the specified index.
@@ -607,17 +805,45 @@ class alignas(16) column_device_view_core : public detail::column_device_view_ba
     return keys.template element<typename T::key_type>(index);
   }
 
-  template <
-    typename L,
-    CUDF_ENABLE_IF(is_list_element<L>&& is_rep_layout_compatible<typename L::element_type>() &&
-                   cuda::std::is_const_v<typename L::element_type>)>
+  /**
+   * @brief Returns a read-only view of the child elements of the list at the specified index.
+   *
+   * This function accounts for the column offset.
+   *
+   * The column must have type `LIST` and a supported child type.
+   *
+   * Fixed-point children include their scale, and string children retain their offsets and
+   * character buffer.
+   *
+   * @tparam L `list_element`
+   * @param element_index Position of the desired list row in `[0, size())`
+   * @return A view of the row's child elements in device storage
+   */
+  template <typename L, CUDF_ENABLE_IF(is_list_element<L>)>
   [[nodiscard]] __device__ L element(size_type element_index) const noexcept
   {
     auto const& offsets = child(list_offsets_column_index);
     auto const begin    = offsets.template element<size_type>(element_index + offset());
     auto const end      = offsets.template element<size_type>(element_index + offset() + 1);
     auto const& values  = child(list_values_column_index);
-    return L{values.data<typename L::element_type>() + begin, end - begin};
+    if (values.type().id() == type_id::STRING) {
+      auto const string_offsets = values.child(offsets_column_index);
+      return L{values.head(),
+               string_offsets.head(),
+               values.null_mask(),
+               end - begin,
+               numeric::scale_type{0},
+               values.offset() + begin,
+               string_offsets.type().id()};
+    } else {
+      return L{values.head(),
+               nullptr,
+               values.null_mask(),
+               end - begin,
+               numeric::scale_type{values.type().scale()},
+               values.offset() + begin,
+               type_id::EMPTY};
+    }
   }
 
   /**
@@ -643,9 +869,7 @@ class alignas(16) column_device_view_core : public detail::column_device_view_ba
    * @return column_view The requested child `column_view`
    */
   [[nodiscard]] __device__ column_device_view_core child(size_type child_index) const noexcept
-  {
-    return static_cast<column_device_view_core*>(_children)[child_index];
-  }
+  { return static_cast<column_device_view_core*>(_children)[child_index]; }
 
   /**
    * @brief Returns the number of child columns
@@ -653,9 +877,7 @@ class alignas(16) column_device_view_core : public detail::column_device_view_ba
    * @return The number of child columns
    */
   [[nodiscard]] CUDF_HOST_DEVICE size_type num_child_columns() const noexcept
-  {
-    return _num_children;
-  }
+  { return _num_children; }
 
   /**
    * @brief Returns the number of nulls in this column
@@ -742,9 +964,7 @@ class alignas(16) mutable_column_device_view_core : public detail::column_device
   template <typename T = void,
             CUDF_ENABLE_IF(cuda::std::is_same_v<T, void> or is_rep_layout_compatible<T>())>
   [[nodiscard]] CUDF_HOST_DEVICE T* head() const noexcept
-  {
-    return const_cast<T*>(detail::column_device_view_base::head<T>());
-  }
+  { return const_cast<T*>(detail::column_device_view_base::head<T>()); }
 
   /**
    * @brief Returns the underlying data casted to the specified type, plus the
@@ -760,9 +980,7 @@ class alignas(16) mutable_column_device_view_core : public detail::column_device
    */
   template <typename T, CUDF_ENABLE_IF(is_rep_layout_compatible<T>())>
   [[nodiscard]] CUDF_HOST_DEVICE T* data() const noexcept
-  {
-    return const_cast<T*>(detail::column_device_view_base::data<T>());
-  }
+  { return const_cast<T*>(detail::column_device_view_base::data<T>()); }
 
   /**
    * @brief Returns reference to element at the specified index.
@@ -780,9 +998,7 @@ class alignas(16) mutable_column_device_view_core : public detail::column_device
    */
   template <typename T, CUDF_ENABLE_IF(is_rep_layout_compatible<T>())>
   [[nodiscard]] __device__ T& element(size_type element_index) const noexcept
-  {
-    return data<T>()[element_index];
-  }
+  { return data<T>()[element_index]; }
 
   /**
    * @brief Returns `string_view` to the string element at the specified index.
@@ -826,6 +1042,64 @@ class alignas(16) mutable_column_device_view_core : public detail::column_device
   }
 
   /**
+   * @brief Returns a mutable view into the existing string character buffer.
+   *
+   * The column offset is applied. The element must be valid, and mutations must stay
+   * within the existing string's byte range.
+   * @tparam T `mutable_string_view`
+   * @param element_index Position of the desired string element
+   * @return A mutable view of the string's preallocated character storage
+   */
+  template <typename T, CUDF_ENABLE_IF(cuda::std::is_same_v<T, mutable_string_view>)>
+  [[nodiscard]] __device__ T element(size_type element_index) const noexcept
+  {
+    auto const index   = element_index + offset();
+    auto const offsets = child(offsets_column_index);
+    auto const itr     = detail::input_offsetalator(offsets.head(), offsets.type());
+    auto const begin   = itr[index];
+    auto const end     = itr[index + 1];
+    return T{head<char>() + begin, static_cast<size_type>(end - begin)};
+  }
+
+  /**
+   * @brief Returns a view of a list row's child elements in their existing storage.
+   *
+   * The column offset and child validity mask are retained. The list row must be valid;
+   * use nullable_element<L>() to check row validity. Child validity is checked separately
+   * through the returned list view. Request `list_element` for read-only access or
+   * `mutable_list_element` for in-place writes within the existing child range.
+   * @tparam L `list_element` or `mutable_list_element`
+   * @param element_index Position of the desired list row
+   * @return A non-owning view of the list row's child storage
+   */
+  template <typename L, CUDF_ENABLE_IF(is_list_element<L> || is_mutable_list_element<L>)>
+  [[nodiscard]] __device__ L element(size_type element_index) const noexcept
+  {
+    auto const offsets = child(list_offsets_column_index);
+    auto const begin   = offsets.template element<size_type>(element_index + offset());
+    auto const end     = offsets.template element<size_type>(element_index + offset() + 1);
+    auto const values  = child(list_values_column_index);
+    if (values.type().id() == type_id::STRING) {
+      auto const string_offsets = values.child(offsets_column_index);
+      return L{values.head(),
+               string_offsets.head(),
+               values.null_mask(),
+               end - begin,
+               numeric::scale_type{0},
+               values.offset() + begin,
+               string_offsets.type().id()};
+    } else {
+      return L{values.head(),
+               nullptr,
+               values.null_mask(),
+               end - begin,
+               numeric::scale_type{values.type().scale()},
+               values.offset() + begin,
+               type_id::EMPTY};
+    }
+  }
+
+  /**
    * @brief Returns a nullable element at the specified index. If the element is null, returns
    * `nullopt`.
    *
@@ -850,9 +1124,7 @@ class alignas(16) mutable_column_device_view_core : public detail::column_device
    */
   template <typename T, CUDF_ENABLE_IF(is_rep_layout_compatible<T>())>
   __device__ void assign(size_type element_index, T value) const noexcept
-  {
-    data<T>()[element_index] = value;
-  }
+  { data<T>()[element_index] = value; }
 
   /**
    * @brief Assigns `value` to the element at `element_index`.
@@ -880,9 +1152,7 @@ class alignas(16) mutable_column_device_view_core : public detail::column_device
    * @return Raw pointer to the underlying bitmask allocation
    */
   [[nodiscard]] CUDF_HOST_DEVICE bitmask_type* null_mask() const noexcept
-  {
-    return const_cast<bitmask_type*>(detail::column_device_view_base::null_mask());
-  }
+  { return const_cast<bitmask_type*>(detail::column_device_view_base::null_mask()); }
 
   /**
    * @brief Returns the specified child
@@ -892,9 +1162,7 @@ class alignas(16) mutable_column_device_view_core : public detail::column_device
    */
   [[nodiscard]] __device__ mutable_column_device_view_core
   child(size_type child_index) const noexcept
-  {
-    return static_cast<mutable_column_device_view_core*>(_children)[child_index];
-  }
+  { return static_cast<mutable_column_device_view_core*>(_children)[child_index]; }
 
 #ifdef __CUDACC__  // because set_bit in bit.hpp is wrapped with __CUDACC__
   /**
@@ -912,9 +1180,7 @@ class alignas(16) mutable_column_device_view_core : public detail::column_device
    * @param element_index The index of the element to update
    */
   __device__ void set_valid(size_type element_index) const noexcept
-  {
-    return set_bit(null_mask(), element_index);
-  }
+  { return set_bit(null_mask(), element_index); }
 
   /**
    * @brief Updates the null mask to indicate that the specified element is null
@@ -930,9 +1196,7 @@ class alignas(16) mutable_column_device_view_core : public detail::column_device
    * @param element_index The index of the element to update
    */
   __device__ void set_null(size_type element_index) const noexcept
-  {
-    return clear_bit(null_mask(), element_index);
-  }
+  { return clear_bit(null_mask(), element_index); }
 
 #endif
 
@@ -947,9 +1211,7 @@ class alignas(16) mutable_column_device_view_core : public detail::column_device
    * @param new_word The new bitmask word
    */
   __device__ void set_mask_word(size_type word_index, bitmask_type new_word) const noexcept
-  {
-    null_mask()[word_index] = new_word;
-  }
+  { null_mask()[word_index] = new_word; }
 
  protected:
   /**

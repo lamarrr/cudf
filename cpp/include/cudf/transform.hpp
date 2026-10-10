@@ -34,8 +34,12 @@ namespace CUDF_EXPORT cudf {
 
 /**
  * @brief Typedef for inputs to the transform function. Each input can be either a column or a
- * scalar column. Fixed-width list rows use `cudf::list_element<T const>` in CUDA and LTO UDFs,
- * where T is the child storage type. Null-aware UDFs receive optional list elements.
+ * scalar column. List rows with fixed-width or string children use
+ * `cudf::list_element` in CUDA and LTO UDFs. This read-only view retains the child storage
+ * and validity metadata without encoding the child type in the UDF signature. Read
+ * children with `element<T>(idx)` or `nullable_element<T>(idx)`, choosing `T` to match
+ * the child column's type. Null-aware UDFs receive `cuda::std::optional<cudf::list_element>`;
+ * this optional represents list row validity, while the view retains child validity.
  */
 using transform_input = std::variant<column_view, scalar_column_view>;
 
@@ -51,10 +55,20 @@ struct transform_output {
     output_nullability::PRESERVE;  ///< Signifies if a null mask should be created for the output
                                    ///< column
 
-  // LIST UDF outputs receive cudf::list_element<T>* (optional when null-aware), initialized
-  // from supplied offsets. Write the elements in place without changing the row range.
-  std::optional<data_type> list_element_type =
-    std::nullopt;  ///< The element type for LIST outputs, if applicable
+  /**
+   * @brief Child type for LIST outputs; unset for other output types.
+   *
+   * LIST outputs require a fixed-width child type and supplied INT32 offsets. CUDA and
+   * LTO UDFs receive `cudf::mutable_list_element*`, initialized from those offsets.
+   * Null-aware UDFs receive `cuda::std::optional<cudf::mutable_list_element>*`, where the
+   * optional controls list row validity.
+   *
+   * Write children in place with `assign<T>(idx, value)` within the existing row range.
+   * Assignment does not update child validity. Fixed-point assignment stores the
+   * representation without rescaling; the supplied representation must match this
+   * child type's scale. The UDF cannot change the row's offsets or size.
+   */
+  std::optional<data_type> list_element_type = std::nullopt;
 };
 
 /**
@@ -269,7 +283,8 @@ struct transform_program {
  *
  * @throws std::invalid_argument if any of the input columns have different sizes (except scalars)
  * @throws std::invalid_argument if an output is not fixed-width, STRING, or fixed-width LIST, or an
- * input is not a supported fixed-width, string, dictionary, or fixed-width list type
+ * input is not a supported fixed-width, string, dictionary, or list type with fixed-width or
+ * string children
  * @throws std::invalid_argument if the inputs only have a scalar with no column inputs and
  * `row_size` is not provided. This is because the row size cannot be inferred from the inputs in
  * this case.
@@ -365,7 +380,8 @@ enum class lto_binary_type : uint8_t {
  *
  * @throws std::invalid_argument if any of the input columns have different sizes (except scalars)
  * @throws std::invalid_argument if an output is not fixed-width, STRING, or fixed-width LIST, or an
- * input is not a supported fixed-width, string, dictionary, or fixed-width list type
+ * input is not a supported fixed-width, string, dictionary, or list type with fixed-width or
+ * string children
  * @throws std::invalid_argument if the inputs only have a scalar with no column inputs and
  * `row_size` is not provided. This is because the row size cannot be inferred from the inputs in
  * this case

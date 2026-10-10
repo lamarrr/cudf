@@ -210,6 +210,52 @@ class alignas(16) column_device_view : public column_device_view_core {
   }
 
   /**
+   * @brief Returns a read-only view of a list row's child elements.
+   *
+   * This function accounts for the column offset. The row must be valid; use the returned
+   * list view's is_valid() or is_null() to check individual child validity.
+   * @tparam L `list_element`
+   * @param element_index Position of the desired list row
+   * @return A non-owning view of the row's child elements
+   */
+  template <typename L, CUDF_ENABLE_IF(is_list_element<L>)>
+  [[nodiscard]] __device__ L element(size_type element_index) const noexcept
+  {
+    return base::element<L>(element_index);
+  }
+
+  /**
+   * @brief Returns a decoded dictionary key for a dictionary element tag.
+   *
+   * The column offset is applied, and the element must be valid.
+   * @tparam T A dictionary_element tag specifying the index and key types
+   * @param element_index Position of the desired dictionary element
+   * @return The decoded key returned by the dictionary's keys column
+   */
+  template <typename T, CUDF_ENABLE_IF(is_dictionary_encoded<T>)>
+  [[nodiscard]] __device__ decltype(auto) element(size_type element_index) const noexcept
+  {
+    return base::element<T>(element_index);
+  }
+
+  /**
+   * @brief Returns a nullable decoded value or list row view.
+   *
+   * A null column element returns nullopt. For a list row, the optional indicates row
+   * validity; child validity is retained in the returned list_element view.
+   * @tparam T A type supported by element<T>()
+   * @param element_index Position of the desired element in this view
+   * @return An optional containing the value or row view, or nullopt
+   */
+  template <typename T>
+  [[nodiscard]] __device__ auto nullable_element(size_type element_index) const noexcept
+  {
+    using value_type = cuda::std::remove_cvref_t<decltype(element<T>(element_index))>;
+    if (is_null(element_index)) { return cuda::std::optional<value_type>{}; }
+    return cuda::std::optional<value_type>{element<T>(element_index)};
+  }
+
+  /**
    * @brief For a given `T`, indicates if `column_device_view::element<T>()` has a valid overload.
    *
    * @tparam T The element type
@@ -680,6 +726,44 @@ class alignas(16) mutable_column_device_view : public mutable_column_device_view
   [[nodiscard]] __device__ T& element(size_type element_index) const noexcept
   {
     return base::element<T>(element_index);
+  }
+
+  /**
+   * @brief Returns a decoded fixed-point value, string view, or list row view.
+   *
+   * The column offset is applied. The element must be valid; for list rows, child validity
+   * is retained in the returned view. Mutable string and list views write into existing
+   * storage without changing offsets or allocating memory.
+   * Request `list_element` for read-only list access or `mutable_list_element` for
+   * child assignment, child validity updates, and mutable string access.
+   * @tparam T A fixed-point type, string_view, mutable_string_view, list_element, or
+   * mutable_list_element
+   * @param element_index Position of the desired element in this view
+   * @return The decoded value or non-owning view of the existing storage
+   */
+  template <typename T,
+            CUDF_ENABLE_IF(is_fixed_point<T>() || cuda::std::is_same_v<T, string_view> ||
+                           cuda::std::is_same_v<T, mutable_string_view> || is_list_element<T> ||
+                           is_mutable_list_element<T>)>
+  [[nodiscard]] __device__ T element(size_type element_index) const noexcept
+  {
+    return base::element<T>(element_index);
+  }
+
+  /**
+   * @brief Returns a nullable value or mutable element view.
+   *
+   * A null column element returns nullopt. For a list row, child validity is checked
+   * separately through the returned list_element or mutable_list_element view.
+   * @tparam T A type supported by element<T>()
+   * @param element_index Position of the desired element in this view
+   * @return An optional containing the value or view, or nullopt
+   */
+  template <typename T>
+  [[nodiscard]] __device__ cuda::std::optional<T> nullable_element(
+    size_type element_index) const noexcept
+  {
+    return base::nullable_element<T>(element_index);
   }
 
   /**

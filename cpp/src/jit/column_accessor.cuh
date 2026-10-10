@@ -28,7 +28,7 @@ struct column_accessor {
 
   static constexpr bool is_inplace_output =
     cuda::std::is_same_v<element_type, cudf::mutable_string_view> ||
-    cudf::is_list_element<element_type>;
+    cudf::is_mutable_list_element<element_type>;
 
   static __device__ constexpr size_type map_index(size_type row)
   {
@@ -81,7 +81,7 @@ struct column_accessor {
   static __device__ void assign(auto const* __restrict__ cols, size_type row, element_type value)
     requires(!as_scalar)
   {
-    column(cols).template assign<element_type>(row, value);
+    if constexpr (!is_inplace_output) { column(cols).template assign<element_type>(row, value); }
   }
 
   static __device__ element_type output_arg(auto const* __restrict__ cols, size_type row)
