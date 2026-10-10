@@ -81,7 +81,7 @@ struct column_accessor {
   static __device__ void assign(auto const* __restrict__ cols, size_type row, element_type value)
     requires(!as_scalar)
   {
-    if constexpr (!is_inplace_output) { column(cols).template assign<element_type>(row, value); }
+    column(cols).template assign<element_type>(row, value);
   }
 
   static __device__ element_type output_arg(auto const* __restrict__ cols, size_type row)

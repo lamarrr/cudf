@@ -1184,6 +1184,22 @@ class alignas(16) mutable_column_device_view_core : public detail::column_device
   }
 
   /**
+   * @brief Assigns `value` to the element at `element_index`.
+   * This is a no-op for mutable string and list elements.
+   *
+   * @tparam T The element type
+   * @param element_index Position of the desired element
+   * @param value The value to assign
+   */
+  template <typename T,
+            CUDF_ENABLE_IF(cuda::std::is_same_v<T, mutable_string_view> ||
+                           is_mutable_list_element<T>)>
+  __device__ void assign(size_type element_index, T value) const noexcept
+  {
+    // no-op for mutable string and list elements
+  }
+
+  /**
    * @brief Returns raw pointer to the underlying bitmask allocation.
    *
    * @note This function does *not* account for the `offset()`.
