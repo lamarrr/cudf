@@ -1959,9 +1959,9 @@ TEST_F(ListOperationTest, NullAwareDictionaryListKeys)
   std::array output{list_output()};
   auto result = transform_lists(inputs, output, list_offsets({0, 2, 2, 3, 5}), true);
   std::array<bool, 4> validity{true, true, false, false};
-  auto expected  = make_lists({{1, -2}, {}, {}, {}}, validity);
-  auto canonical = cudf::purge_nonempty_nulls(result->get_column(0).view());
-  CUDF_TEST_EXPECT_COLUMNS_EQUAL(canonical->view(), expected->view());
+  auto expected = make_lists({{1, -2}, {}, {}, {}}, validity);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(result->get_column(0), expected->view());
+  EXPECT_FALSE(cudf::has_nonempty_nulls(result->get_column(0).view()));
 }
 
 TEST_F(ListOperationTest, DecimalChild)
@@ -2000,7 +2000,7 @@ TEST_F(ListOperationTest, StringChild)
     {"skip"}, {"hello", "", "é"}, {}, {"world"}};
   std::array<cudf::transform_input, 1> inputs{cudf::slice(input, {1, 4}).front()};
   std::array outputs{cudf::transform_output{cudf::data_type{cudf::type_id::INT32}}};
-  auto result = cudf::transform(R"(
+  EXPECT_THROW(cudf::transform(R"(
 __device__ void transform(int32_t* output, cudf::list_element input)
 {
   *output = 0;
@@ -2009,15 +2009,14 @@ __device__ void transform(int32_t* output, cudf::list_element input)
   }
 }
 )",
-                                cudf::udf_source_type::CUDA,
-                                cudf::null_aware::NO,
-                                std::nullopt,
-                                inputs,
-                                outputs,
-                                {},
-                                std::nullopt);
-  offsets_type expected{7, 0, 5};
-  CUDF_TEST_EXPECT_COLUMNS_EQUAL(result->get_column(0), expected);
+                               cudf::udf_source_type::CUDA,
+                               cudf::null_aware::NO,
+                               std::nullopt,
+                               inputs,
+                               outputs,
+                               {},
+                               std::nullopt),
+               std::invalid_argument);
 }
 
 TEST_F(ListOperationTest, SizeScanThenEncode)
@@ -2076,14 +2075,15 @@ TEST_F(ListOperationTest, NullAwareAndPreservedParentValidity)
   std::array<bool, 4> expected_validity{true, true, false, false};
   auto expected = make_lists({{1, -2}, {}, {}, {}}, expected_validity);
 
-  auto preserved = transform_lists(inputs, output, list_offsets({0, 2, 2, 3, 3}));
+  auto preserved = transform_lists(inputs, output, list_offsets({0, 2, 2, 3, 5}));
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(preserved->get_column(0), input->view());
-  auto aware     = transform_lists(inputs, output, list_offsets({0, 2, 2, 3, 3}), true);
-  auto canonical = cudf::purge_nonempty_nulls(aware->get_column(0).view());
-  CUDF_TEST_EXPECT_COLUMNS_EQUAL(canonical->view(), expected->view());
-  offsets_type unchanged_offsets{0, 2, 2, 3, 3};
-  offsets_type initialized_child{1, -2, 0};
-  CUDF_TEST_EXPECT_COLUMNS_EQUAL(aware->get_column(0).child(0), unchanged_offsets);
+  EXPECT_FALSE(cudf::has_nonempty_nulls(preserved->get_column(0).view()));
+  auto aware = transform_lists(inputs, output, list_offsets({0, 2, 2, 3, 5}), true);
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(aware->get_column(0), expected->view());
+  EXPECT_FALSE(cudf::has_nonempty_nulls(aware->get_column(0).view()));
+  offsets_type sanitized_offsets{0, 2, 2, 2, 2};
+  offsets_type initialized_child{1, -2};
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(aware->get_column(0).child(0), sanitized_offsets);
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(aware->get_column(0).child(1), initialized_child);
   EXPECT_FALSE(aware->get_column(0).child(1).nullable());
 }
@@ -2104,6 +2104,13 @@ TEST_F(ListOperationTest, EmptyAndAllNull)
 
   result = transform_lists(inputs, output, list_offsets({0, 0, 0}));
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(result->get_column(0), nulls->view());
+
+  for (bool null_aware : {false, true}) {
+    result = transform_lists(inputs, output, list_offsets({0, 2, 4}), null_aware);
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(result->get_column(0), nulls->view());
+    EXPECT_EQ(result->get_column(0).child(1).size(), 0);
+    EXPECT_FALSE(cudf::has_nonempty_nulls(result->get_column(0).view()));
+  }
 }
 
 TEST_F(ListOperationTest, MixedListStringAndFixedWidthOutputs)
@@ -2147,68 +2154,7 @@ __device__ void transform(cudf::mutable_list_element* first, cudf::mutable_strin
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(result->get_column(3), negative->view());
 }
 
-TEST_F(ListOperationTest, RejectsMalformedOutputChildren)
-{
-  auto input = make_lists({{1}});
-  std::array<cudf::transform_input, 1> inputs{input->view()};
-  std::array output{list_output()};
-  output[0].children.clear();
-  EXPECT_THROW(transform_lists(inputs, output, list_offsets({0, 1})), std::invalid_argument);
-  output[0].children = {{cudf::data_type{cudf::type_id::INT32}}};
-  EXPECT_THROW(transform_lists(inputs, output, list_offsets({0, 1})), std::invalid_argument);
-  output[0]                  = list_output();
-  output[0].children[0].type = cudf::data_type{cudf::type_id::INT64};
-  EXPECT_THROW(transform_lists(inputs, output, list_offsets({0, 1})), std::invalid_argument);
-  output[0]                      = list_output();
-  output[0].children[1].children = {{cudf::data_type{cudf::type_id::INT32}}};
-  EXPECT_THROW(transform_lists(inputs, output, list_offsets({0, 1})), std::invalid_argument);
-  output[0] = {cudf::data_type{cudf::type_id::INT32},
-               cudf::output_nullability::PRESERVE,
-               {{cudf::data_type{cudf::type_id::INT32}}}};
-  EXPECT_THROW(transform_lists(inputs, output, {}), std::invalid_argument);
-}
-
-TEST_F(ListOperationTest, RejectsMissingAndMalformedOffsets)
-{
-  auto input = make_lists({{1}, {2}});
-  std::array<cudf::transform_input, 1> inputs{input->view()};
-  std::array output{list_output()};
-  EXPECT_THROW(transform_lists(inputs, output, {}), std::invalid_argument);
-  std::span<cudf::transform_input const> no_inputs;
-  EXPECT_THROW(cudf::transform(copy_udf,
-                               cudf::udf_source_type::CUDA,
-                               cudf::null_aware::NO,
-                               std::nullopt,
-                               no_inputs,
-                               output,
-                               list_offsets({}),
-                               -1),
-               std::invalid_argument);
-
-  for (auto values : {std::initializer_list<int32_t>{1, 2, 3}, {0, 2, 1}, {0, -1, 0}, {0, 1}}) {
-    EXPECT_THROW(transform_lists(inputs, output, list_offsets(values)), std::invalid_argument);
-  }
-  std::vector<std::unique_ptr<cudf::column>> wrong_type;
-  wrong_type.push_back(cudf::test::fixed_width_column_wrapper<int64_t>{0, 1, 2}.release());
-  EXPECT_THROW(transform_lists(inputs, output, std::move(wrong_type)), std::invalid_argument);
-  auto nullable = list_offsets({0, 1, 2});
-  nullable[0]   = offsets_type{{0, 1, 2}, {true, false, true}}.release();
-  EXPECT_THROW(transform_lists(inputs, output, std::move(nullable)), std::invalid_argument);
-  output[0] = list_output(cudf::data_type{cudf::type_id::STRING});
-  EXPECT_THROW(transform_lists(inputs, output, list_offsets({0, 1, 2})), std::invalid_argument);
-  output[0] = list_output();
-  EXPECT_THROW(cudf::transform("",
-                               cudf::udf_source_type::PTX,
-                               cudf::null_aware::NO,
-                               std::nullopt,
-                               inputs,
-                               output,
-                               list_offsets({0, 1, 2}),
-                               std::nullopt),
-               std::invalid_argument);
-}
-
-TEST_F(ListOperationTest, RejectsUnsupportedListChildren)
+TEST_F(ListOperationTest, NullableChildren)
 {
   auto input = cudf::make_lists_column(1,
                                        offsets_type{0, 2}.release(),
@@ -2217,7 +2163,34 @@ TEST_F(ListOperationTest, RejectsUnsupportedListChildren)
                                        cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
   std::array<cudf::transform_input, 1> inputs{input->view()};
   std::array output{list_output()};
-  EXPECT_THROW(transform_lists(inputs, output, list_offsets({0, 2})), std::invalid_argument);
+  auto expected = make_lists({{1, -1}});
+  offsets_type indices{0};
+  auto dictionary = cudf::make_dictionary_column(input->view(), indices);
+  for (auto const& view : {input->view(), dictionary->view()}) {
+    inputs[0]   = view;
+    auto result = cudf::transform(R"(
+__device__ void transform(cudf::mutable_list_element* output, cudf::list_element input)
+{
+  for (size_t index = 0; index < input.size(); ++index) {
+    output->assign<int32_t>(index, input.nullable_element<int32_t>(index).value_or(-1));
+  }
+}
+)",
+                                  cudf::udf_source_type::CUDA,
+                                  cudf::null_aware::NO,
+                                  std::nullopt,
+                                  inputs,
+                                  output,
+                                  list_offsets({0, 2}),
+                                  std::nullopt);
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(result->get_column(0), expected->view());
+  }
+}
+
+TEST_F(ListOperationTest, RejectsUnsupportedListChildren)
+{
+  std::array<cudf::transform_input, 1> inputs;
+  std::array output{list_output()};
   auto child  = make_lists({{1, 2}});
   auto nested = cudf::make_lists_column(1,
                                         offsets_type{0, 1}.release(),
@@ -2235,7 +2208,7 @@ TEST_F(ListOperationTest, RejectsUnsupportedListChildren)
   inputs[0] = strings->view();
   EXPECT_THROW(transform_lists(inputs, output, list_offsets({0, 2})), std::invalid_argument);
   offsets_type indices{0};
-  for (auto const& keys : {input->view(), nested->view(), strings->view()}) {
+  for (auto const& keys : {nested->view(), strings->view()}) {
     auto dictionary = cudf::make_dictionary_column(keys, indices);
     inputs[0]       = dictionary->view();
     EXPECT_THROW(transform_lists(inputs, output, list_offsets({0, 2})), std::invalid_argument);

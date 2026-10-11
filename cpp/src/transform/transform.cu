@@ -6,6 +6,7 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_device_view.cuh>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/detail/copy.hpp>
 #include <cudf/detail/device_scalar.hpp>
 #include <cudf/detail/null_mask.cuh>
 #include <cudf/detail/null_mask.hpp>
@@ -511,7 +512,9 @@ void perform_checks(std::variant<udf_source_type, lto_binary_type> source_type,
 
   for (auto const& out : outputs) {
     if (out.type.id() == type_id::LIST) {
-      CUDF_EXPECTS(is_fixed_width(out.children[list_values_column_index].type),
+      auto const& offsets = out.children[list_offsets_column_index];
+      auto const& values  = out.children[list_values_column_index];
+      CUDF_EXPECTS(is_fixed_width(values.type),
                    "LIST outputs require INT32 offsets and a fixed-width values child",
                    std::invalid_argument);
     } else {
@@ -523,9 +526,8 @@ void perform_checks(std::variant<udf_source_type, lto_binary_type> source_type,
 
   static constexpr auto is_input_value_supported = [](auto const& self,
                                                       column_view const& c) -> bool {
-    if (is_fixed_width(c.type()) || c.type().id() == type_id::STRING || is_dictionary(c.type())) {
-      return true;
-    }
+    if (is_fixed_width(c.type()) || c.type().id() == type_id::STRING) { return true; }
+    if (is_dictionary(c.type())) { return self(self, c.child(dictionary_keys_column_index)); }
     if (c.type().id() == type_id::LIST) {
       return is_fixed_width(c.child(list_values_column_index).type());
     }
@@ -798,8 +800,13 @@ auto finalize_output(string_views_column&& c,
     mr);
 }
 
-auto finalize_output(mutable_lists_column&& c, cuda::stream_ref, rmm::device_async_resource_ref)
+auto finalize_output(mutable_lists_column&& c,
+                     cuda::stream_ref stream,
+                     rmm::device_async_resource_ref mr)
 {
+  if (auto const view = c._col->view(); detail::has_nonempty_nulls(view, stream)) {
+    return detail::purge_nonempty_nulls(view, stream, mr);
+  }
   return std::move(c._col);
 }
 
