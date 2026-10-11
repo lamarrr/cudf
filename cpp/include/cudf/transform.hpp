@@ -34,8 +34,7 @@ namespace CUDF_EXPORT cudf {
 
 /**
  * @brief Typedef for inputs to the transform function. Each input can be either a column or a
- * scalar column. List rows with fixed-width or string children use
- * `cudf::list_element` in CUDA and LTO UDFs.
+ * scalar column.
  */
 using transform_input = std::variant<column_view, scalar_column_view>;
 
@@ -115,6 +114,7 @@ struct transform_output_spec {
     output_nullability::PRESERVE;  ///< Null-mask policy for the output
 
   bool has_offsets = false;  ///< Whether a string or list output uses supplied offsets
+
   std::vector<transform_output_spec> children =
     {};  ///< Specifications of string offsets or nested child columns
 };
@@ -265,21 +265,19 @@ struct transform_program {
  * `(outputs[i]...) =  UDF(inputs[i]...)`.
  *
  * @throws std::invalid_argument if any of the input columns have different sizes (except scalars)
- * @throws std::invalid_argument if an output is not fixed-width, STRING, or fixed-width LIST, or an
- * input is not a supported fixed-width, string, dictionary, or list type with fixed-width or
- * string children
+ * @throws std::invalid_argument if an output is not fixed-width, STRING, or fixed-width LIST, or
+ * dictionary type.
  * @throws std::invalid_argument if the inputs only have a scalar with no column inputs and
  * `row_size` is not provided. This is because the row size cannot be inferred from the inputs in
  * this case.
  * @throws std::invalid_argument if any of the output or input types are not supported.
  * CUDA-supported input types include fixed-width, string, dictionary, and lists with fixed-width
- * children without null elements, including such lists used as dictionary keys. PTX-supported input
- * types are integrals, floats, and their dictionary types. CUDA-supported output types are
- * fixed-width, STRING, and fixed-width LIST. PTX-supported output types are integrals and floats.
+ * children. PTX-supported input types are integrals, floats, and their dictionary types.
+ * CUDA-supported output types are fixed-width, STRING, and fixed-width LIST. PTX-supported output
+ * types are integrals and floats.
  * @throws std::invalid_argument if output offsets are provided for outputs other than strings or
  * lists, or if the number of output offsets does not match the number of output columns.
  * @throws cudf::evaluation_error if the UDF produces an error during execution.
- * @throws std::overflow_error if a list child allocation exceeds addressable storage.
  *
  * The size of the resulting column is the `row_size` if provided, otherwise it is inferred from
  * the input and pre-allocated output columns.
@@ -292,9 +290,6 @@ struct transform_program {
  * @param outputs       Specification of the output columns to be created
  * @param output_offsets For string and list output columns, offsets can be preallocated and passed
  * in. String offsets avoid compaction; list offsets are required and allocate the child storage.
- * String UDF outputs with supplied offsets receive `cudf::mutable_string_view*` (optional when
- * null-aware), initialized to the allocated byte range. Write the bytes in place without changing
- * the view's pointer or size.
  * @param row_size The row size of the transform operation. If not provided, it is inferred from the
  * input columns.
  * @param stream        CUDA stream used for device memory operations and kernel launches
@@ -363,16 +358,14 @@ enum class lto_binary_type : uint8_t {
  *
  *
  * @throws std::invalid_argument if any of the input columns have different sizes (except scalars)
- * @throws std::invalid_argument if an output is not fixed-width, STRING, or fixed-width LIST, or an
- * input is not a supported fixed-width, string, dictionary, or list type with fixed-width or
- * string children
+ * @throws std::invalid_argument if an output is not fixed-width, STRING, or fixed-width LIST, or
+ * dictionary type.
  * @throws std::invalid_argument if the inputs only have a scalar with no column inputs and
  * `row_size` is not provided. This is because the row size cannot be inferred from the inputs in
  * this case
  * @throws std::invalid_argument if output offsets are provided for outputs other than strings or
  * lists, or if the number of output offsets does not match the number of output columns
  * @throws cudf::evaluation_error if the UDF produces an error during execution
- * @throws std::overflow_error if a list child allocation exceeds addressable storage
  *
  * The size of the resulting column is the `row_size` if provided, otherwise it is inferred from
  * the input and pre-allocated output columns.
