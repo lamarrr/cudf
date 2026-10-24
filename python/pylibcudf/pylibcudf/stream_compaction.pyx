@@ -74,7 +74,7 @@ cpdef Table drop_nulls(
     cdef vector[size_type] c_keys = keys
 
     cdef Stream _stream = _get_stream(stream)
-    cdef cudaStream_t _cs = _stream.view().value()
+    cdef cudaStream_t _cs = _stream.view().get()
     mr = _get_memory_resource(mr)
 
     cdef table_view c_source_table = source_table.view()
@@ -114,7 +114,7 @@ cpdef Table drop_nans(
     cdef vector[size_type] c_keys = keys
 
     cdef Stream _stream = _get_stream(stream)
-    cdef cudaStream_t _cs = _stream.view().value()
+    cdef cudaStream_t _cs = _stream.view().get()
     mr = _get_memory_resource(mr)
 
     cdef table_view c_source_table = source_table.view()
@@ -150,7 +150,7 @@ cpdef Table apply_retention_mask(
     cdef unique_ptr[table] c_result
 
     cdef Stream _stream = _get_stream(stream)
-    cdef cudaStream_t _cs = _stream.view().value()
+    cdef cudaStream_t _cs = _stream.view().get()
     mr = _get_memory_resource(mr)
 
     cdef table_view c_source_table = source_table.view()
@@ -202,7 +202,7 @@ cpdef Table apply_deletion_mask(
     cdef unique_ptr[table] c_result
 
     cdef Stream _stream = _get_stream(stream)
-    cdef cudaStream_t _cs = _stream.view().value()
+    cdef cudaStream_t _cs = _stream.view().get()
     mr = _get_memory_resource(mr)
 
     cdef table_view c_source_table = source_table.view()
@@ -252,7 +252,7 @@ cpdef Table unique(
     cdef vector[size_type] c_keys = keys
 
     cdef Stream _stream = _get_stream(stream)
-    cdef cudaStream_t _cs = _stream.view().value()
+    cdef cudaStream_t _cs = _stream.view().get()
     mr = _get_memory_resource(mr)
 
     cdef table_view c_input = input.view()
@@ -299,7 +299,7 @@ cpdef Table distinct(
     cdef vector[size_type] c_keys = keys
 
     cdef Stream _stream = _get_stream(stream)
-    cdef cudaStream_t _cs = _stream.view().value()
+    cdef cudaStream_t _cs = _stream.view().get()
     mr = _get_memory_resource(mr)
 
     cdef table_view c_input = input.view()
@@ -342,7 +342,7 @@ cpdef Column distinct_indices(
     cdef unique_ptr[column] c_result
 
     cdef Stream _stream = _get_stream(stream)
-    cdef cudaStream_t _cs = _stream.view().value()
+    cdef cudaStream_t _cs = _stream.view().get()
     mr = _get_memory_resource(mr)
 
     cdef table_view c_input = input.view()
@@ -389,7 +389,7 @@ cpdef Table stable_distinct(
     cdef vector[size_type] c_keys = keys
 
     cdef Stream _stream = _get_stream(stream)
-    cdef cudaStream_t _cs = _stream.view().value()
+    cdef cudaStream_t _cs = _stream.view().get()
     mr = _get_memory_resource(mr)
 
     cdef table_view c_input = input.view()
