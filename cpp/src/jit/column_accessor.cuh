@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <cudf/column/column_device_view_base.cuh>
 #include <cudf/types.hpp>
 
 #include <cuda/std/optional>
