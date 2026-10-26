@@ -1057,15 +1057,11 @@ table_with_metadata reader_impl::finalize_output(read_mode mode,
     out_metadata.num_rows_per_source.clear();
 
     bool use_jit = cudf::get_context().use_jit() || _options.use_jit_filter;
-    std::unique_ptr<column> predicate;
-
-    if (!use_jit) {
-      predicate =
-        cudf::detail::compute_column(*read_table, final_filter_expr.value().get(), _stream, _mr);
-    } else {
-      predicate =
-        cudf::compute_column_jit(read_table->view(), final_filter_expr.value().get(), _stream, _mr);
-    }
+    auto predicate =
+      !use_jit
+        ? cudf::detail::compute_column(*read_table, final_filter_expr.value().get(), _stream, _mr)
+        : cudf::compute_column_jit(
+            read_table->view(), final_filter_expr.value().get(), _stream, _mr);
 
     CUDF_EXPECTS(predicate->view().type().id() == type_id::BOOL8,
                  "Predicate filter should return a boolean");
