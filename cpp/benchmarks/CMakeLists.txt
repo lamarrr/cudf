@@ -422,7 +422,7 @@ rtcx_embed(
 # * binaryop benchmark ----------------------------------------------------------------------------
 ConfigureNVBench(
   BINARYOP_NVBENCH binaryop/binaryop.cpp binaryop/compiled_binaryop.cpp binaryop/polynomials.cpp
-  binaryop/ptx.cpp ${cudf_benchmark_fragments_SOURCE_DIR}/cudf_benchmark_fragments.s
+  ${cudf_benchmark_fragments_SOURCE_DIR}/cudf_benchmark_fragments.s
 )
 target_include_directories(BINARYOP_NVBENCH PRIVATE ${cudf_benchmark_fragments_SOURCE_DIR})
 add_dependencies(BINARYOP_NVBENCH cudf_benchmark_fragments)
