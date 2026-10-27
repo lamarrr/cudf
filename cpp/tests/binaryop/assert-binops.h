@@ -1,7 +1,7 @@
 /*
  * SPDX-FileCopyrightText: Copyright 2018-2019 BlazingDB, Inc.
  * SPDX-FileCopyrightText: Copyright 2018 Christian Noboa Mardini <christian@blazingdb.com>
- * SPDX-FileCopyrightText: Copyright (c) 2019-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION & AFFILIATES.
  * SPDX-License-Identifier: Apache-2.0
  */
 /*
@@ -27,6 +27,7 @@
 #include <cudf_test/cudf_gtest.hpp>
 
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <limits>
@@ -203,43 +204,17 @@ void ASSERT_BINOP(cudf::column_view const& out,
 
   ASSERT_EQ(out_data.size(), lhs_data.size());
   ASSERT_EQ(out_data.size(), rhs_data.size());
+  EXPECT_EQ(out.nullable(), lhs.nullable() || rhs.nullable());
   for (size_t i = 0; i < out_data.size(); ++i) {
-    auto lhs = out_data[i];
-    auto rhs = (TypeOut)(op(lhs_data[i], rhs_data[i]));
-    // TODO: This is incorrectly comparing row values that may be null
-    EXPECT_TRUE(value_comparator(lhs, rhs)) << stringify_out_values{}(i, lhs, rhs);
-  }
+    auto const lhs_valid = !lhs.nullable() || cudf::bit_is_set(lhs_h.second.data(), i);
+    auto const rhs_valid = !rhs.nullable() || cudf::bit_is_set(rhs_h.second.data(), i);
+    auto const out_valid = !out.nullable() || cudf::bit_is_set(out_h.second.data(), i);
+    EXPECT_EQ(out_valid, lhs_valid && rhs_valid) << "Row " << i;
+    // Transform does not evaluate null rows, whose data is unspecified.
+    if (!lhs_valid || !rhs_valid) { continue; }
 
-  if (lhs.nullable() and rhs.nullable()) {
-    EXPECT_TRUE(out.nullable());
-    auto lhs_valid = lhs_h.second;
-    auto rhs_valid = rhs_h.second;
-    auto out_valid = out_h.second;
-
-    ASSERT_EQ(out_valid.size(), lhs_valid.size());
-    ASSERT_EQ(out_valid.size(), rhs_valid.size());
-    for (cudf::size_type i = 0; i < cudf::num_bitmask_words(out_data.size()); ++i) {
-      EXPECT_EQ(out_valid[i], (lhs_valid[i] & rhs_valid[i]));
-    }
-  } else if (not lhs.nullable() and rhs.nullable()) {
-    EXPECT_TRUE(out.nullable());
-    auto rhs_valid = rhs_h.second;
-    auto out_valid = out_h.second;
-
-    ASSERT_EQ(out_valid.size(), rhs_valid.size());
-    for (cudf::size_type i = 0; i < cudf::num_bitmask_words(out_data.size()); ++i) {
-      EXPECT_EQ(out_valid[i], rhs_valid[i]);
-    }
-  } else if (lhs.nullable() and not rhs.nullable()) {
-    EXPECT_TRUE(out.nullable());
-    auto lhs_valid = lhs_h.second;
-    auto out_valid = out_h.second;
-
-    ASSERT_EQ(out_valid.size(), lhs_valid.size());
-    for (cudf::size_type i = 0; i < cudf::num_bitmask_words(out_data.size()); ++i) {
-      EXPECT_EQ(out_valid[i], lhs_valid[i]);
-    }
-  } else {
-    EXPECT_FALSE(out.nullable());
+    auto const actual   = out_data[i];
+    auto const expected = static_cast<TypeOut>(op(lhs_data[i], rhs_data[i]));
+    EXPECT_TRUE(value_comparator(actual, expected)) << stringify_out_values{}(i, actual, expected);
   }
 }

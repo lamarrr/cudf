@@ -1,7 +1,7 @@
 /*
  * SPDX-FileCopyrightText: Copyright 2018-2019 BlazingDB, Inc.
  * SPDX-FileCopyrightText: Copyright 2018 Christian Noboa Mardini <christian@blazingdb.com>
- * SPDX-FileCopyrightText: Copyright (c) 2019-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION & AFFILIATES.
  * SPDX-License-Identifier: Apache-2.0
  */
 /*
@@ -25,6 +25,11 @@
 #include <tests/binaryop/binop-fixture.hpp>
 
 #include <cudf/binaryop.hpp>
+#include <cudf/copying.hpp>
+
+// Exercise the deprecated PTX API until its removal.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
 struct BinaryOperationGenericPTXTest : public BinaryOperationTest {};
 
@@ -85,6 +90,14 @@ TEST_F(BinaryOperationGenericPTXTest, CAdd_Vector_Vector_FP32_FP32_FP32)
 
   // pow has a max ULP error of 2 per CUDA programming guide
   ASSERT_BINOP<TypeOut, TypeLhs, TypeRhs>(*out, lhs, rhs, CADD, NearEqualComparator<TypeOut>{2});
+
+  // Both data and validity must respect independent input offsets.
+  auto const sliced_lhs = cudf::slice(lhs, {1, 499}).front();
+  auto const sliced_rhs = cudf::slice(rhs, {2, 500}).front();
+  auto sliced_out       = cudf::binary_operation(
+    sliced_lhs, sliced_rhs, ptx, cudf::data_type{cudf::type_to_id<TypeOut>()});
+  ASSERT_BINOP<TypeOut, TypeLhs, TypeRhs>(
+    *sliced_out, sliced_lhs, sliced_rhs, CADD, NearEqualComparator<TypeOut>{2});
 }
 
 TEST_F(BinaryOperationGenericPTXTest, CAdd_Vector_Vector_INT64_INT32_INT32)
@@ -206,3 +219,16 @@ TEST_F(BinaryOperationGenericPTXTest, CAdd_Vector_Vector_INT64_INT32_INT64)
 
   ASSERT_BINOP<TypeOut, TypeLhs, TypeRhs>(*out, lhs, rhs, CADD);
 }
+
+TEST_F(BinaryOperationGenericPTXTest, EmptyInputs)
+{
+  cudf::test::fixed_width_column_wrapper<int32_t> const input{};
+  auto const output_type = cudf::data_type{cudf::type_id::INT64};
+  // Empty inputs do not require a UDF to be parsed or compiled.
+  auto const result = cudf::binary_operation(input, input, "", output_type);
+  EXPECT_EQ(result->size(), 0);
+  EXPECT_EQ(result->type(), output_type);
+  EXPECT_EQ(result->null_count(), 0);
+}
+
+#pragma GCC diagnostic pop

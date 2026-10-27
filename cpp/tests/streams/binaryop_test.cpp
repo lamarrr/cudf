@@ -51,6 +51,10 @@ TEST_F(BinaryopTest, ScalarColumn)
 
 class BinaryopPTXTest : public BinaryopTest {};
 
+// Exercise the deprecated PTX API until its removal.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+
 TEST_F(BinaryopPTXTest, ColumnColumnPTX)
 {
   cudf::test::fixed_width_column_wrapper<int32_t> lhs{10, 20, 30, 40, 50};
@@ -102,9 +106,9 @@ TEST_F(BinaryopPTXTest, ColumnColumnPTX)
 )***";
 
   cudf::binary_operation(
-    lhs, rhs, ptx, cudf::data_type(cudf::type_to_id<int32_t>()), cudf::test::get_default_stream());
-  cudf::binary_operation(
     lhs, rhs, ptx, cudf::data_type(cudf::type_to_id<int64_t>()), cudf::test::get_default_stream());
 }
+
+#pragma GCC diagnostic pop
 
 CUDF_TEST_PROGRAM_MAIN()
