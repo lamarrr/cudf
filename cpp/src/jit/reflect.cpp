@@ -73,7 +73,7 @@ struct reflect_output_element_fn {
   std::string operator()(transform_output_spec const& spec, bool use_physical_type) const
     requires(std::same_as<T, string_view>)
   {
-    return spec.has_string_offsets ? "cuda::std::span<char>"
+    return spec.has_string_offsets ? "cudf::mutable_string_view"
                                    : "cudf::repr_element<cudf::string_view>";
   }
 
@@ -138,7 +138,7 @@ struct reflect_output_value_fn {
   std::string operator()(transform_output_spec const& spec, bool use_physical_type) const
     requires(std::same_as<T, string_view>)
   {
-    return spec.has_string_offsets ? "cuda::std::span<char>" : "cudf::string_view";
+    return spec.has_string_offsets ? "cudf::mutable_string_view" : "cudf::string_view";
   }
 
   template <typename T>
