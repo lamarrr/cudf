@@ -340,9 +340,13 @@ size_type inplace_null_mask_and(bitmask_type* null_mask,
 
   if (!is_nullable) { return 0; }
 
+  auto init_mask = [&](bool valid) {
+    CUDF_CUDA_TRY(cudaMemsetAsync(
+      null_mask, valid ? 0xff : 0, bitmask_allocation_size_bytes(row_size), stream.get()));
+  };
   if (inputs.empty()) {
     // no input, set all to valid
-    set_null_mask(null_mask, 0, row_size, true, stream);
+    init_mask(true);
     return 0;
   }
 
@@ -358,7 +362,7 @@ size_type inplace_null_mask_and(bitmask_type* null_mask,
 
     if (scalar_is_null) {
       // scalar is null, all rows will be null
-      set_null_mask(null_mask, 0, row_size, false, stream);
+      init_mask(false);
       return row_size;
     }
   }
@@ -368,7 +372,7 @@ size_type inplace_null_mask_and(bitmask_type* null_mask,
 
   if (!has_cols) {
     // no non-scalar columns, so all rows are valid
-    set_null_mask(null_mask, 0, row_size, true, stream);
+    init_mask(true);
     return 0;
   }
 
@@ -389,7 +393,7 @@ size_type inplace_null_mask_and(bitmask_type* null_mask,
 
   if (nullable_masks.empty()) {
     // we only have non-nullable columns, so all rows are valid
-    set_null_mask(null_mask, 0, row_size, true, stream);
+    init_mask(true);
     return 0;
   }
 
