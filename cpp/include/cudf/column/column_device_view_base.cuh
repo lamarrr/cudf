@@ -94,7 +94,7 @@ template <typename IndexType, typename KeyType>
 inline constexpr bool is_dictionary_encoded<dictionary_element<IndexType, KeyType>> = true;
 
 /**
- * @brief An element interpreted directly as its stored representation.
+ * @brief An element interpreted directly as its byte representation.
  * @tparam T The underlying type used to store the value (e.g., `bool` or `uint8_t`, `char`,
  * `string_view`, etc.)
  *
