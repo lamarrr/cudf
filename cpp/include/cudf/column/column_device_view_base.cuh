@@ -453,53 +453,34 @@ class alignas(16) column_device_view_core : public detail::column_device_view_ba
   }
 
   /**
-   * @brief Returns a copy of the boolean element at the specified index
-   *
-   * The boolean value is normalized: zero is false and any nonzero byte is true.
-   *
-   * If the element at the specified index is NULL, i.e.,
-   * `is_null(element_index) == true`, then any attempt to use the result will
-   * lead to undefined behavior.
-   *
-   * This function accounts for the offset.
-   *
-   * This function does not participate in overload resolution if
-   * `is_same_v<remove_cv_t<T>, bool>` is false.
-   *
-   * @tparam T The element type
-   * @param element_index Position of the desired element
-   * @return The element at the specified index
-   */
-  template <typename T, CUDF_ENABLE_IF(cuda::std::is_same_v<cuda::std::remove_cv_t<T>, bool>)>
-  [[nodiscard]] __device__ T element(size_type element_index) const noexcept
-  {
-    // BOOL8 permits any nonzero byte for true. Read the storage as a byte before converting
-    // to bool, since loading a noncanonical representation as bool is undefined behavior.
-    return element<uint8_t>(element_index) != 0;
-  }
-
-  /**
    * @brief Returns a copy of the element at the specified index
    *
+   * Boolean values are normalized: zero is false and any nonzero byte is true.
+   *
    * If the element at the specified index is NULL, i.e.,
    * `is_null(element_index) == true`, then any attempt to use the result will
    * lead to undefined behavior.
    *
    * This function accounts for the offset.
    *
-   * This function does not participate in overload resolution if `is_rep_layout_compatible<T> &&
-   * !is_same_v<remove_cv_t<T>, bool>` is false.
+   * This function does not participate in overload resolution if `is_rep_layout_compatible<T>` is
+   * false. Specializations of this function may exist for types `T` where
+   *`is_rep_layout_compatible<T>` is false.
    *
    * @tparam T The element type
    * @param element_index Position of the desired element
    * @return The element at the specified index
    */
-  template <typename T,
-            CUDF_ENABLE_IF(is_rep_layout_compatible<T>() &&
-                           !cuda::std::is_same_v<cuda::std::remove_cv_t<T>, bool>)>
-  [[nodiscard]] __device__ T const& element(size_type element_index) const noexcept
+  template <typename T, CUDF_ENABLE_IF(is_rep_layout_compatible<T>())>
+  [[nodiscard]] __device__ T element(size_type element_index) const noexcept
   {
-    return data<T>()[element_index];
+    if constexpr (cuda::std::is_same_v<cuda::std::remove_cv_t<T>, bool>) {
+      // BOOL8 permits any nonzero byte for true. Read the storage as a byte before converting
+      // to bool, since loading a noncanonical representation as bool is undefined behavior.
+      return data<uint8_t>()[element_index] != 0;
+    } else {
+      return data<T>()[element_index];
+    }
   }
 
   /**
