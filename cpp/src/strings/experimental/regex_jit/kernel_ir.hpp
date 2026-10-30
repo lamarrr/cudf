@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include <regex_ir.hpp>
+#include <libregex_ir/regex_ir.hpp>
 
 #include <cstdint>
 #include <optional>

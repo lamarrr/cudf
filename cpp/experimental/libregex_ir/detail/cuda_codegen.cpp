@@ -3,11 +3,18 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "cuda_codegen.hpp"
+/**
+ * @file cuda_codegen.cpp
+ * @brief CUDA source emission for regex execution plans.
+ *
+ * Renders pattern policies, transition and Unicode tables, matcher entry points,
+ * and replacement handling using the shared device runtime.
+ */
 
-#include "cuda_abi.hpp"
-#include "execution_plan.hpp"
-#include "regex_ir_unicode.hpp"
+#include <libregex_ir/detail/cuda_abi.hpp>
+#include <libregex_ir/detail/cuda_codegen.hpp>
+#include <libregex_ir/detail/execution_plan.hpp>
+#include <libregex_ir/detail/unicode.hpp>
 
 #include <algorithm>
 #include <array>
@@ -96,19 +103,36 @@ std::string assertion_name(assertion_kind kind)
   switch (kind) {
     case assertion_kind::BEGIN_INPUT: return "regex_ir::device::assertion_kind::BEGIN_INPUT";
     case assertion_kind::END_INPUT: return "regex_ir::device::assertion_kind::END_INPUT";
+    case assertion_kind::SCOPED_WORD_BOUNDARY:
     case assertion_kind::WORD_BOUNDARY: return "regex_ir::device::assertion_kind::WORD_BOUNDARY";
+    case assertion_kind::SCOPED_NOT_WORD_BOUNDARY:
     case assertion_kind::NOT_WORD_BOUNDARY:
       return "regex_ir::device::assertion_kind::NOT_WORD_BOUNDARY";
+    case assertion_kind::SCOPED_BEGIN_LINE:
     case assertion_kind::BEGIN_LINE: return "regex_ir::device::assertion_kind::BEGIN_LINE";
+    case assertion_kind::SCOPED_END_LINE:
     case assertion_kind::END_LINE: return "regex_ir::device::assertion_kind::END_LINE";
+    case assertion_kind::LOOKAROUND: break;
   }
   throw std::invalid_argument("invalid assertion kind");
 }
 
+std::string_view assertion_policy(assertion_kind kind)
+{
+  if (kind == assertion_kind::SCOPED_BEGIN_LINE || kind == assertion_kind::SCOPED_END_LINE)
+    return "assertion_context<pattern, true, false>";
+  if (kind == assertion_kind::SCOPED_WORD_BOUNDARY ||
+      kind == assertion_kind::SCOPED_NOT_WORD_BOUNDARY)
+    return "assertion_context<pattern, false, true>";
+  return "pattern";
+}
+
 class cuda_source_emitter {
  public:
-  cuda_source_emitter(execution_plan const& plan, cuda_codegen_options options)
-    : plan_(plan), options_(std::move(options))
+  cuda_source_emitter(execution_plan const& plan,
+                      cuda_codegen_options options,
+                      std::string word_namespace = {})
+    : plan_(plan), options_(std::move(options)), word_namespace_(std::move(word_namespace))
   {
   }
 
@@ -116,6 +140,32 @@ class cuda_source_emitter {
   {
     require_identifier(options_.symbol_prefix, "symbol_prefix");
     require_identifier(options_.execute_function, "execute_function");
+    if (word_namespace_.empty() && !plan_.lookarounds_.empty()) {
+      auto needs_words = [&](auto&& self, execution_plan const& plan) -> bool {
+        if (plan.uses_unicode_word_boundaries()) return true;
+        return std::any_of(plan.lookarounds_.begin(), plan.lookarounds_.end(), [&](auto& nested) {
+          return self(self, nested);
+        });
+      };
+      if (needs_words(needs_words, plan_)) {
+        word_namespace_ = options_.symbol_prefix + "_lookaround_words";
+        output_.emit("namespace {} {{ using namespace regex_ir::device;", word_namespace_);
+        emit_word_tables();
+        output_.emit("struct words {{");
+        emit_word_definition();
+        output_.emit("}}; }}");
+      }
+    }
+    for (std::size_t index = 0; index < plan_.lookarounds_.size(); ++index) {
+      auto nested_options = options_;
+      auto suffix         = std::format("_lookaround_{}", index);
+      nested_options.symbol_prefix += suffix;
+      nested_options.execute_function += suffix;
+      output_.emit("{}",
+                   cuda_source_emitter(plan_.lookarounds_[index], nested_options, word_namespace_)
+                     .render()
+                     .cuda_source);
+    }
     output_.emit(R"CUDA(namespace {} {{
 using namespace regex_ir::device;)CUDA",
                  options_.symbol_prefix);
@@ -123,6 +173,11 @@ using namespace regex_ir::device;)CUDA",
     output_.emit(R"CUDA(
 struct pattern : policy {{)CUDA");
     constant("executor", executor_name(plan_.executor_));
+    if (plan_.ir_.reverse) constant("reverse", true);
+    if (plan_.capture_slots_.empty() &&
+        (plan_.ir_.assertion_program ||
+         (!plan_.lookarounds_.empty() && plan_.ir_.control.result == result_shape::BOOLEAN)))
+      constant("accept_first", true);
     constant("bytes", plan_.ir_.options.characters == character_mode::BYTES);
     constant("ascii_word_classes", plan_.ir_.options.ascii_classes);
     constant("multiline", plan_.ir_.options.multiline);
@@ -163,11 +218,11 @@ struct pattern : policy {{)CUDA");
     if (plan_.glushkov_) emit_glushkov(*plan_.glushkov_);
     if (plan_.deterministic_) emit_dfa(*plan_.deterministic_);
     if (plan_.thompson_) emit_thompson(*plan_.thompson_);
-    emit_replacement();
+    if (!plan_.ir_.assertion_program) emit_replacement();
     output_.emit(R"CUDA(}};
 }} // namespace {})CUDA",
                  options_.symbol_prefix);
-    emit_entry();
+    if (!plan_.ir_.assertion_program) emit_entry();
     auto states = plan_.thompson_        ? static_cast<std::uint32_t>(plan_.thompson_->nodes.size())
                   : plan_.deterministic_ ? plan_.deterministic_->state_count
                   : plan_.glushkov_      ? plan_.glushkov_->position_count
@@ -273,17 +328,10 @@ __device__ {} {} const {}[] = {{)CUDA",
       array("reach_masks", "u64", plan_.glushkov_->reach_masks);
     auto unicode_word = plan_.uses_unicode_word_boundaries() ||
                         (plan_.word_run_minimum_ && !plan_.ir_.options.ascii_classes);
-    if (unicode_word) {
-      std::vector<std::uint32_t> firsts;
-      std::vector<std::uint32_t> ends;
-      for (auto& range : unicode_word_ranges) {
-        firsts.push_back(range.first);
-        ends.push_back(range.last);
-      }
-      array("word_firsts", "u32", firsts);
-      array("word_ends", "u32", ends);
-    }
-    for (std::size_t index = 0; index < plan_.ir_.replacement.size(); ++index) {
+    if (unicode_word && word_namespace_.empty()) emit_word_tables();
+    for (std::size_t index = 0;
+         !plan_.ir_.assertion_program && index < plan_.ir_.replacement.size();
+         ++index) {
       auto& token = plan_.ir_.replacement[index];
       if (token.type == replacement_token::kind::LITERAL && !token.literal.empty()) {
         std::vector<std::uint8_t> bytes(token.literal.begin(), token.literal.end());
@@ -292,13 +340,39 @@ __device__ {} {} const {}[] = {{)CUDA",
     }
   }
 
+  void emit_word_tables()
+  {
+    std::vector<std::uint32_t> firsts;
+    std::vector<std::uint32_t> ends;
+    for (auto& range : unicode_word_ranges) {
+      firsts.push_back(range.first);
+      ends.push_back(range.last);
+    }
+    array("word_firsts", "u32", firsts);
+    array("word_ends", "u32", ends);
+  }
+
   void emit_word()
   {
     if (!(plan_.uses_unicode_word_boundaries() ||
           (plan_.word_run_minimum_ && !plan_.ir_.options.ascii_classes)))
       return;
+    auto const name = plan_.ir_.options.ascii_classes ? "unicode_word" : "is_word";
+    if (!word_namespace_.empty()) {
+      output_.emit(
+        "__device__ __forceinline__ static bool {}(u32 code_point) {{ return "
+        "{}::words::is_word(code_point); }}",
+        name,
+        word_namespace_);
+      return;
+    }
+    emit_word_definition(name);
+  }
+
+  void emit_word_definition(std::string_view name = "is_word")
+  {
     output_.emit(R"CUDA(
-__device__ __forceinline__ static bool is_word(u32 code_point) {{
+__device__ __forceinline__ static bool {}(u32 code_point) {{
 if (code_point < 128) return ascii_word(code_point);
 u32 low = 0; u32 high = {};
 while (low < high) {{
@@ -307,6 +381,7 @@ while (low < high) {{
 }}
 return low < {} && code_point >= word_firsts[low];
 }})CUDA",
+                 name,
                  std::size(unicode_word_ranges),
                  std::size(unicode_word_ranges));
   }
@@ -831,6 +906,7 @@ auto* scratch = {};)CUDA",
   execution_plan const& plan_;
   cuda_codegen_options options_;
   source_buffer output_;
+  std::string word_namespace_;
   std::optional<std::string> literal_;
 };
 
@@ -840,6 +916,7 @@ void cuda_source_emitter::emit_thompson(deterministic_nfa_graph const& graph)
   constant("frontier_words", plan_.frontier_words_);
   constant("closure_records", plan_.closure_records_);
   constant("storage_words", plan_.storage_words_);
+  if (!plan_.lookarounds_.empty()) constant("lookaround_storage_offset", plan_.own_storage_words_);
   constant("bitset_words", (graph.nodes.size() + 63) / 64);
   // A slot is live before a state if some accepting continuation reads it before
   // the state writes it. BEGIN also clears its matching END slot.
@@ -872,6 +949,11 @@ void cuda_source_emitter::emit_thompson(deterministic_nfa_graph const& graph)
         capture_masks[state] = live;
       }
     } while (changed);
+  }
+  if (plan_.ir_.assertion_program || !plan_.lookarounds_.empty()) {
+    auto count = plan_.capture_slots_.size();
+    auto mask  = count >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << count) - 1;
+    std::fill(capture_masks.begin(), capture_masks.end(), mask);
   }
   output_.emit(R"CUDA(
 __device__ static constexpr u64 capture_mask(u32 state) {{ switch (state) {{)CUDA");
@@ -914,11 +996,36 @@ __device__ __forceinline__ static i32 dispatch(
           output_.emit("work.active[{}] = {};", found - plan_.capture_slots_.begin() + 1, value);
       };
       write(slot, "pos");
-      if (node.capture->action == capture_action::BEGIN) write(slot + 1, "-1");
+      if (node.capture->action == (plan_.ir_.reverse ? capture_action::END : capture_action::BEGIN))
+        write(plan_.ir_.reverse ? slot - 1 : slot + 1, "-1");
+    }
+    if (!graph.lookarounds.empty() && graph.lookarounds[id]) {
+      // Lookaround does not move the cursor. Reject a failed following anchor
+      // before evaluating the assertion body, including across capture writes.
+      auto next = id;
+      for (std::size_t remaining = graph.nodes.size(); remaining != 0; --remaining) {
+        auto const& continuation = graph.nodes[next];
+        if (continuation.consumes || continuation.accepts || continuation.targets.size() != 1)
+          break;
+        next = continuation.targets.front();
+        if (graph.nodes[next].assertion)
+          output_.emit(
+            R"CUDA(if (!assertion<{}>(input_value, pos, {})) return static_cast<i32>(dispatch_status::EXHAUSTED);)CUDA",
+            assertion_policy(*graph.nodes[next].assertion),
+            assertion_name(*graph.nodes[next].assertion));
+      }
+      auto lookaround = *graph.lookarounds[id];
+      output_.emit(
+        "if (!lookaround<pattern, {}_lookaround_{}::pattern, {}>(input_value, pos, work)) return "
+        "static_cast<i32>(dispatch_status::EXHAUSTED);",
+        options_.symbol_prefix,
+        lookaround.program_index,
+        lookaround.negative);
     }
     if (node.assertion)
       output_.emit(
-        R"CUDA(if (!assertion<pattern>(input_value, pos, {})) return static_cast<i32>(dispatch_status::EXHAUSTED);)CUDA",
+        R"CUDA(if (!assertion<{}>(input_value, pos, {})) return static_cast<i32>(dispatch_status::EXHAUSTED);)CUDA",
+        assertion_policy(*node.assertion),
         assertion_name(*node.assertion));
     if (node.accepts) {
       output_.emit(
@@ -928,9 +1035,9 @@ __device__ __forceinline__ static i32 dispatch(
       continue;
     }
     if (node.consumes)
-      output_.emit(
-        "if (pos >= input_value.size || !{}) return static_cast<i32>(dispatch_status::EXHAUSTED);",
-        predicate(node.predicate));
+      output_.emit("if ({} || !{}) return static_cast<i32>(dispatch_status::EXHAUSTED);",
+                   plan_.ir_.reverse ? "pos <= 0" : "pos >= input_value.size",
+                   predicate(node.predicate));
     for (std::size_t index = 0; index < node.targets.size(); ++index) {
       auto target = node.targets[node.consumes ? index : node.targets.size() - index - 1];
       if (!node.consumes && index + 1 == node.targets.size())
@@ -952,15 +1059,22 @@ __device__ __forceinline__ static i32 dispatch(
   };
 
   std::vector<run_loop> loops;
-  for (std::size_t start = 0; start < graph.nodes.size(); ++start) {
+  auto has_lookaround = [&](std::size_t state) {
+    return !graph.lookarounds.empty() && graph.lookarounds[state].has_value();
+  };
+  for (std::size_t start = 0;
+       !plan_.ir_.assertion_program &&
+       (plan_.lookarounds_.empty() || plan_.ir_.control.result != result_shape::BOOLEAN) &&
+       start < graph.nodes.size();
+       ++start) {
     auto& branch = graph.nodes[start];
-    if (branch.consumes || branch.capture || branch.assertion || branch.accepts ||
-        branch.targets.size() != 2)
+    if (branch.consumes || branch.capture || branch.assertion || has_lookaround(start) ||
+        branch.accepts || branch.targets.size() != 2)
       continue;
     auto consume = branch.targets[0];
     auto& loop   = graph.nodes[consume];
-    if (!loop.consumes || loop.capture || loop.assertion || loop.accepts ||
-        loop.targets.size() != 1 || loop.targets[0] != start)
+    if (!loop.consumes || loop.capture || loop.assertion || has_lookaround(consume) ||
+        loop.accepts || loop.targets.size() != 1 || loop.targets[0] != start)
       continue;
     auto disjoint = [&](character_predicate const& other) {
       std::vector<char32_t> points{0, 10, 11, 13, 14, 133, 134, 8232, 8233, 8234};
@@ -980,7 +1094,7 @@ __device__ __forceinline__ static i32 dispatch(
       if (++proof_steps > 256 || visited[state] == 1) return false;
       if (visited[state] == 2) return true;
       auto& node = graph.nodes[state];
-      if (node.assertion) return false;
+      if (node.assertion || has_lookaround(state)) return false;
       if (node.consumes) return disjoint(node.predicate);
       if (node.accepts) return true;
       visited[state] = 1;
@@ -1007,7 +1121,8 @@ __device__ __forceinline__ static i32 dispatch(
   auto simple_path    = std::vector<std::size_t>{};
   auto visited_path   = std::vector<bool>(graph.nodes.size());
   auto simple_state   = static_cast<std::size_t>(graph.entry);
-  bool simple_capture = plan_.ir_.control.result == result_shape::CAPTURES;
+  bool simple_capture = !plan_.ir_.assertion_program && plan_.lookarounds_.empty() &&
+                        plan_.ir_.control.result == result_shape::CAPTURES;
   while (simple_capture) {
     if (visited_path[simple_state]) {
       simple_capture = false;
@@ -1046,7 +1161,8 @@ __device__ __forceinline__ static bool simple_capture_find(
           output_.emit("if (captures != nullptr) captures[{}] = pos;", slot);
       }
       if (node.assertion)
-        output_.emit("if (!assertion<pattern>(input_value, pos, {})) return false;",
+        output_.emit("if (!assertion<{}>(input_value, pos, {})) return false;",
+                     assertion_policy(*node.assertion),
                      assertion_name(*node.assertion));
       auto loop = std::find_if(
         loops.begin(), loops.end(), [&](auto& candidate) { return candidate.state == state; });
@@ -1187,7 +1303,8 @@ __device__ __forceinline__ static bool mandatory_present(input) {{ return true; 
 
 compile_result render_cuda(instruction_ir const& ir, cuda_codegen_options const& options)
 {
-  if (ir.control.result == result_shape::BOOLEAN && ir.blocks.size() >= 80 &&
+  if (ir.lookarounds.empty() && !ir.assertion_program &&
+      ir.control.result == result_shape::BOOLEAN && ir.blocks.size() >= 80 &&
       ir.entry < ir.blocks.size() && ir.blocks[ir.entry].instructions.empty() &&
       ir.blocks[ir.entry].successors.size() >= 2) {
     std::string source;

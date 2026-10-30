@@ -3,7 +3,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "execution_plan.hpp"
+/**
+ * @file execution_plan.cpp
+ * @brief Executor selection and analysis of regex instruction graphs.
+ *
+ * Builds execution machines, determines observable captures, proves input-skipping
+ * opportunities, and computes bounded scratch storage for nested assertions.
+ */
+
+#include <libregex_ir/detail/execution_plan.hpp>
 
 #include <algorithm>
 #include <array>
@@ -18,6 +26,8 @@
 
 namespace regex_ir::detail {
 namespace {
+
+constexpr std::size_t inline_workspace_limit_bytes = 0x8000;
 
 bool equivalent_predicates(character_predicate const& left, character_predicate const& right)
 {
@@ -326,6 +336,7 @@ std::optional<deterministic_nfa_graph> make_deterministic_graph(instruction_ir c
 
   deterministic_nfa_graph graph;
   graph.nodes.resize(node_count);
+  if (!ir.lookarounds.empty()) graph.lookarounds.resize(node_count);
   graph.entry = block_starts[ir.entry];
   for (auto& block : ir.blocks) {
     auto start                      = block_starts[block.id];
@@ -337,7 +348,12 @@ std::optional<deterministic_nfa_graph> make_deterministic_graph(instruction_ir c
       if (auto* candidate = std::get_if<match_character>(&item)) match = candidate;
       if (auto* candidate = std::get_if<match_literal>(&item)) literal = candidate;
       if (auto* candidate = std::get_if<write_capture>(&item)) capture = candidate;
-      if (auto* candidate = std::get_if<test_assertion>(&item)) assertion = candidate;
+      if (auto* candidate = std::get_if<test_assertion>(&item)) {
+        if (candidate->kind == assertion_kind::LOOKAROUND)
+          graph.lookarounds[start] = *candidate;
+        else
+          assertion = candidate;
+      }
       if (std::holds_alternative<emit_accept>(item)) graph.nodes[start].accepts = true;
     }
     if (capture != nullptr) graph.nodes[start].capture = *capture;
@@ -699,6 +715,7 @@ std::optional<deterministic_machine> make_assertion_deterministic_machine(
   machine.assertion_aware = true;
   for (auto& node : graph.nodes) {
     if (node.capture.has_value()) return std::nullopt;
+    if (node.assertion && *node.assertion > assertion_kind::LOOKAROUND) return std::nullopt;
     if (node.assertion.has_value()) machine.assertion_mask |= assertion_bit(*node.assertion);
   }
   if (machine.assertion_mask == 0) return std::nullopt;
@@ -1202,6 +1219,35 @@ std::optional<deterministic_machine> make_deterministic_machine(instruction_ir c
 
 execution_plan::execution_plan(instruction_ir ir) : ir_(std::move(ir))
 {
+  if (ir_.assertion_program || !ir_.lookarounds.empty()) {
+    capture_slots_ = live_capture_slots();
+    for (auto& nested : ir_.lookarounds)
+      lookarounds_.emplace_back(nested);
+    prepare_thompson();
+    // The start proof already includes every assertion as a potentially
+    // successful epsilon edge. Reuse the wide byte seeker for a unique ASCII
+    // candidate instead of testing every byte before a lookbehind.
+    if (candidate_seeker_ && candidate_bitmap_[2] == 0 && candidate_bitmap_[3] == 0 &&
+        std::popcount(candidate_bitmap_[0]) + std::popcount(candidate_bitmap_[1]) == 1) {
+      constexpr auto word_bits = std::numeric_limits<std::uint64_t>::digits;
+      auto byte                = candidate_bitmap_[0] != 0 ? std::countr_zero(candidate_bitmap_[0])
+                                                           : word_bits + std::countr_zero(candidate_bitmap_[1]);
+      prefix_seek_byte_        = static_cast<std::uint8_t>(byte);
+    }
+    own_storage_words_       = storage_words_;
+    std::size_t nested_words = 0;
+    for (auto& nested : lookarounds_)
+      nested_words = std::max(nested_words, nested.storage_words_);
+    if (!capture_slots_.empty() &&
+        std::any_of(lookarounds_.begin(), lookarounds_.end(), [](auto const& nested) {
+          return !nested.capture_slots_.empty();
+        }))
+      nested_words += static_cast<std::size_t>(ir_.capture_count + 1) * 2;
+    storage_words_ += nested_words;
+    auto bytes       = storage_words_ * sizeof(std::int64_t);
+    workspace_bytes_ = bytes > inline_workspace_limit_bytes ? bytes : 0;
+    return;
+  }
   exact_ascii_literal_metadata_ = exact_ascii_literal();
   auto result                   = ir_.control.result;
   auto adapt_count              = result == result_shape::MATCH_COUNT;
@@ -1685,12 +1731,31 @@ std::vector<std::size_t> execution_plan::live_capture_slots() const
   } else if (ir_.control.result == result_shape::REPLACEMENT) {
     for (auto& token : ir_.replacement) {
       if (token.type == replacement_token::kind::CAPTURE && token.capture_index != 0 &&
-          !is_whole_match_capture(token.capture_index)) {
+          (ir_.assertion_program || !is_whole_match_capture(token.capture_index))) {
         auto slot       = static_cast<std::size_t>(token.capture_index) * 2U;
         live[slot]      = true;
         live[slot + 1U] = true;
       }
     }
+  }
+  if (ir_.assertion_program || !ir_.lookarounds.empty()) {
+    // An assertion can only change captures written by its own subtree. Groups
+    // confined to a negative assertion remain null in the enclosing program.
+    std::vector<bool> written(live.size(), false);
+    auto mark_written = [&](auto&& self, instruction_ir const& program) -> void {
+      if (program.control.result == result_shape::BOOLEAN) return;
+      for (auto const& block : program.blocks)
+        for (auto const& item : block.instructions)
+          if (auto capture = std::get_if<write_capture>(&item)) {
+            auto slot     = static_cast<std::size_t>(capture->capture_index) * 2;
+            written[slot] = written[slot + 1] = true;
+          }
+      for (auto const& nested : program.lookarounds)
+        self(self, nested);
+    };
+    mark_written(mark_written, ir_);
+    for (std::size_t slot = 0; slot < live.size(); ++slot)
+      live[slot] = live[slot] && written[slot];
   }
   std::vector<std::size_t> result;
   for (std::size_t slot = 0; slot < live.size(); ++slot) {
@@ -1774,12 +1839,16 @@ bool execution_plan::is_whole_match_capture(std::uint32_t capture_index) const
 
 bool execution_plan::uses_unicode_word_boundaries() const
 {
-  if (ir_.options.ascii_classes || ir_.options.characters == character_mode::BYTES) return false;
+  if (ir_.options.characters == character_mode::BYTES) return false;
   for (instruction_block const& block : ir_.blocks) {
     for (instruction const& item : block.instructions) {
       auto* assertion = std::get_if<test_assertion>(&item);
-      if (assertion != nullptr && (assertion->kind == assertion_kind::WORD_BOUNDARY ||
-                                   assertion->kind == assertion_kind::NOT_WORD_BOUNDARY)) {
+      if (assertion != nullptr &&
+          ((!ir_.options.ascii_classes && (assertion->kind == assertion_kind::WORD_BOUNDARY ||
+                                           assertion->kind == assertion_kind::NOT_WORD_BOUNDARY)) ||
+           (ir_.options.ascii_classes &&
+            (assertion->kind == assertion_kind::SCOPED_WORD_BOUNDARY ||
+             assertion->kind == assertion_kind::SCOPED_NOT_WORD_BOUNDARY)))) {
         return true;
       }
     }
@@ -1853,13 +1922,15 @@ void execution_plan::prepare_thompson()
   thompson_ = make_deterministic_graph(ir_);
   if (!thompson_) { throw std::invalid_argument("unsupported Thompson instruction graph"); }
   auto& graph = *thompson_;
-  prepare_start_seeker(graph);
+  if (!ir_.assertion_program) prepare_start_seeker(graph);
   ir_.blocks.clear();
   ir_.entry = static_cast<block_id>(graph.entry);
   for (std::size_t id = 0; id < graph.nodes.size(); ++id) {
     auto& node = graph.nodes[id];
     instruction_block block;
     block.id = static_cast<block_id>(id);
+    if (!graph.lookarounds.empty() && graph.lookarounds[id])
+      block.instructions.emplace_back(*graph.lookarounds[id]);
     if (node.capture) block.instructions.emplace_back(*node.capture);
     if (node.assertion) block.instructions.emplace_back(test_assertion{*node.assertion});
     if (node.consumes) {
@@ -1896,7 +1967,7 @@ void execution_plan::prepare_thompson()
   storage_words_ =
     2 * frontier_words_ + closure_records_ * record + record + 2 * ((states + 63) / 64);
   auto bytes       = storage_words_ * sizeof(std::int64_t);
-  workspace_bytes_ = bytes > 32768 ? bytes : 0;
+  workspace_bytes_ = bytes > inline_workspace_limit_bytes ? bytes : 0;
 }
 
 void execution_plan::select()

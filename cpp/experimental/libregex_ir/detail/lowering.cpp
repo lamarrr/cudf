@@ -3,8 +3,17 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "regex_ir_detail.hpp"
+/**
+ * @file lowering.cpp
+ * @brief Lowering from Thompson automata to operation-specific instruction graphs.
+ *
+ * Parses replacement references and validates instruction graphs, including
+ * independently anchored lookaround programs and their capture observation.
+ */
 
+#include <libregex_ir/detail/detail.hpp>
+
+#include <algorithm>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -74,6 +83,8 @@ void verify(instruction_ir const& ir)
 {
   auto invalid = [](std::string_view message) { throw std::logic_error(std::string{message}); };
 
+  for (auto& nested : ir.lookarounds)
+    verify(nested);
   if (ir.entry >= ir.blocks.size()) invalid("entry block is invalid");
   if (ir.accept >= ir.blocks.size()) invalid("accept block is invalid");
 
@@ -89,6 +100,10 @@ void verify(instruction_ir const& ir)
     std::size_t character_tests{};
     std::size_t advances{};
     for (auto& item : block.instructions) {
+      if (auto* look = std::get_if<test_assertion>(&item);
+          look && look->kind == assertion_kind::LOOKAROUND &&
+          look->program_index >= ir.lookarounds.size())
+        invalid("lookaround program index is invalid");
       if (std::holds_alternative<emit_accept>(item)) accepting = true;
       if (std::holds_alternative<match_character>(item) ||
           std::holds_alternative<match_literal>(item)) {
@@ -125,6 +140,22 @@ instruction_ir lower(automata_ir const& automata, operation const& selected)
     case operation_kind::REPLACE: result.control = {true, false, result_shape::REPLACEMENT}; break;
     case operation_kind::SPLIT: result.control = {true, false, result_shape::SPLIT_FIELDS}; break;
   }
+  result.reverse = automata.reverse;
+  for (std::size_t index = 0; index < automata.lookarounds.size(); ++index) {
+    // Captures inside a negative assertion cannot escape it. Its complete
+    // subtree therefore needs only a Boolean result, even for EXTRACT/REPLACE.
+    auto negative = std::any_of(automata.states.begin(), automata.states.end(), [&](auto& state) {
+      return state.kind == automata_state_kind::ASSERTION &&
+             state.assertion == assertion_kind::LOOKAROUND && state.operand_index == index &&
+             state.negative;
+    });
+    auto program  = negative ? lower(automata.lookarounds[index], {operation_kind::MATCHES, {}})
+                             : lower(automata.lookarounds[index], selected);
+    program.assertion_program   = true;
+    program.control.scan_input  = false;
+    program.control.require_end = false;
+    result.lookarounds.push_back(std::move(program));
+  }
   result.entry               = automata.entry;
   result.accept              = automata.accept;
   result.capture_count       = automata.capture_count;
@@ -150,10 +181,11 @@ instruction_ir lower(automata_ir const& automata, operation const& selected)
         block.instructions.emplace_back(advance_cursor{1});
         break;
       case automata_state_kind::ASSERTION:
-        block.instructions.emplace_back(test_assertion{state.assertion});
+        block.instructions.emplace_back(
+          test_assertion{state.assertion, state.operand_index, state.negative});
         break;
       case automata_state_kind::CAPTURE:
-        block.instructions.emplace_back(write_capture{state.capture, state.capture_index});
+        block.instructions.emplace_back(write_capture{state.capture, state.operand_index});
         break;
       case automata_state_kind::ACCEPT: block.instructions.emplace_back(emit_accept{}); break;
     }

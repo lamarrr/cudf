@@ -3,6 +3,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+/**
+ * @file regex_ir.hpp
+ * @brief Public interface to the standalone regex compiler and generated-code metadata.
+ *
+ * Defines compilation options, resource limits, operations, and results without
+ * exposing the private IR or cuDF column integration.
+ */
+
 #pragma once
 
 #include <cstddef>
@@ -105,7 +113,8 @@ enum class builtin_character_class : std::uint8_t {
  * operation-specific signature unchanged.
  */
 struct compile_result {
-  std::string cuda_source;         ///< Operation-specialized CUDA C++ source; requires executor.cuh
+  /// Operation-specialized CUDA C++ source; requires libregex_ir/executor.cuh.
+  std::string cuda_source;
   std::uint32_t capture_count;     ///< Number of explicit capture groups
   executor_kind executor;          ///< Executor selected for the pattern and operation
   std::uint32_t executor_states;   ///< Number of states in the selected executor
@@ -122,6 +131,9 @@ struct compile_result {
  *
  * `replacement` is required for `REPLACE` and rejected for every other
  * operation. Compilation failures are reported as `std::invalid_argument`.
+ * Prefix and scoped inline flags `i/m/s/a/u/x` override the matching settings;
+ * scoped settings are restored when their group ends. Only `i/m/s/x` can be
+ * disabled, and Unicode mode (`u`) requires UTF-8 input.
  *
  * @param pattern Regular expression encoded as UTF-8 source bytes
  * @param operation Operation implemented by the generated entry point

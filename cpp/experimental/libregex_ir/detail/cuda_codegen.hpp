@@ -3,9 +3,17 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+/**
+ * @file cuda_codegen.hpp
+ * @brief Private interface for emitting CUDA source from regex instruction graphs.
+ *
+ * Connects the compiler pipeline to CUDA generation and its compiled-program
+ * metadata without exposing emitter implementation details.
+ */
+
 #pragma once
 
-#include "regex_ir_detail.hpp"
+#include <libregex_ir/detail/detail.hpp>
 
 namespace regex_ir {
 

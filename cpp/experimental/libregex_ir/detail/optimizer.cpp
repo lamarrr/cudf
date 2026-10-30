@@ -3,7 +3,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "regex_ir_detail.hpp"
+/**
+ * @file optimizer.cpp
+ * @brief Optimization passes over regex instruction graphs.
+ *
+ * Removes unobserved capture writes, folds empty jumps, fuses literal sequences,
+ * and removes unreachable blocks, including within lookaround subprograms.
+ */
+
+#include <libregex_ir/detail/detail.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -153,6 +161,8 @@ instruction_ir optimize(instruction_ir ir, optimization_options const& options)
 {
   verify(ir);
 
+  for (auto& nested : ir.lookarounds)
+    nested = optimize(std::move(nested), options);
   if (options.strip_unobserved_captures) strip_captures(ir);
   if (options.fold_epsilon_jumps) fold_empty_jumps(ir);
   if (options.fuse_literals) fuse_literals(ir, options.literal_fusion_limit);

@@ -3,9 +3,17 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "regex_ir_case_mapping.hpp"
-#include "regex_ir_detail.hpp"
-#include "regex_ir_unicode.hpp"
+/**
+ * @file parser.cpp
+ * @brief Regex parsing, character predicates, and Thompson automata construction.
+ *
+ * Builds the private AST, assigns capture groups, and constructs ordered automata
+ * and lookaround subprograms while enforcing compilation limits.
+ */
+
+#include <libregex_ir/detail/case_mapping.hpp>
+#include <libregex_ir/detail/detail.hpp>
+#include <libregex_ir/detail/unicode.hpp>
 
 #include <algorithm>
 #include <array>
@@ -32,6 +40,17 @@ enum class node_kind : std::uint8_t {
   REPEAT      = 4,
   GROUP       = 5,
   ASSERTION   = 6,
+  LOOKAROUND  = 7,
+};
+
+struct flag_context {
+  bool case_insensitive = false;
+  bool multiline        = false;
+  bool dot_all          = false;
+  bool ascii_classes    = true;
+  bool verbose          = false;
+  bool inline_case      = false;
+  bool ascii_case       = false;
 };
 
 struct node {
@@ -45,6 +64,8 @@ struct node {
   bool greedy                                 = true;
   std::uint32_t capture_index                 = 0;
   bool capturing                              = false;
+  bool reverse                                = false;
+  bool negative                               = false;
 };
 
 bool can_consume_character(node const& value)
@@ -52,7 +73,8 @@ bool can_consume_character(node const& value)
   switch (value.kind) {
     case node_kind::PREDICATE: return true;
     case node_kind::EMPTY:
-    case node_kind::ASSERTION: return false;
+    case node_kind::ASSERTION:
+    case node_kind::LOOKAROUND: return false;
     case node_kind::GROUP: return can_consume_character(*value.children.front());
     case node_kind::CONCATENATE:
     case node_kind::ALTERNATE:
@@ -76,7 +98,8 @@ bool is_unconditional_empty(node const& value)
       });
     case node_kind::PREDICATE:
     case node_kind::REPEAT:
-    case node_kind::ASSERTION: return false;
+    case node_kind::ASSERTION:
+    case node_kind::LOOKAROUND: return false;
   }
   return false;
 }
@@ -85,7 +108,8 @@ bool can_match_empty(node const& value)
 {
   switch (value.kind) {
     case node_kind::EMPTY:
-    case node_kind::ASSERTION: return true;
+    case node_kind::ASSERTION:
+    case node_kind::LOOKAROUND: return true;
     case node_kind::PREDICATE: return false;
     case node_kind::GROUP: return can_match_empty(*value.children.front());
     case node_kind::CONCATENATE:
@@ -99,6 +123,14 @@ bool can_match_empty(node const& value)
     case node_kind::REPEAT: return value.minimum == 0 || can_match_empty(*value.children.front());
   }
   return false;
+}
+
+bool contains_lookaround(node const& value)
+{
+  if (value.kind == node_kind::LOOKAROUND) return true;
+  return std::any_of(value.children.begin(), value.children.end(), [](auto& child) {
+    return contains_lookaround(*child);
+  });
 }
 
 bool contains_capture(node const& value)
@@ -221,10 +253,58 @@ void add_case_pair(character_predicate& predicate, char32_t first, char32_t last
   }
 }
 
+void add_inline_case_pair(character_predicate& predicate, char32_t first, char32_t last, bool ascii)
+{
+  character_predicate folded;
+  folded.ranges.push_back({first, last});
+  if (ascii) {
+    for (auto range : {codepoint_range{U'A', U'Z'}, codepoint_range{U'a', U'z'}}) {
+      auto begin = std::max(first, range.first);
+      auto end   = std::min(last, range.last);
+      if (begin <= end) {
+        auto const delta = range.first == U'A' ? 32 : -32;
+        folded.ranges.push_back(
+          {static_cast<char32_t>(begin + delta), static_cast<char32_t>(end + delta)});
+      }
+    }
+  } else {
+    // Include inverse mappings as well: S/s/long-s and sigma/final-sigma share a class.
+    for (;;) {
+      auto const previous = folded.ranges;
+      for (auto range : previous)
+        add_case_pair(folded, range.first, range.last);
+      for (auto mapping : unicode_case_ranges) {
+        if (mapping.delta == 0) continue;  // Adjacent pairs are already symmetric.
+        auto target_first = static_cast<char32_t>(mapping.first + mapping.delta);
+        auto target_last  = static_cast<char32_t>(mapping.last + mapping.delta);
+        for (auto range : previous) {
+          auto begin = std::max(range.first, target_first);
+          auto end   = std::min(range.last, target_last);
+          if (begin <= end)
+            folded.ranges.push_back({static_cast<char32_t>(begin - mapping.delta),
+                                     static_cast<char32_t>(end - mapping.delta)});
+        }
+      }
+      normalize_ranges(folded);
+      if (std::equal(previous.begin(),
+                     previous.end(),
+                     folded.ranges.begin(),
+                     folded.ranges.end(),
+                     [](auto left, auto right) {
+                       return left.first == right.first && left.last == right.last;
+                     }))
+        break;
+    }
+  }
+  predicate.ranges.insert(predicate.ranges.end(), folded.ranges.begin(), folded.ranges.end());
+}
+
 class parser {
  public:
   parser(std::string_view pattern, compile_options const& options)
-    : pattern_(pattern), options_(options)
+    : pattern_(pattern),
+      options_(options),
+      flags_{options.case_insensitive, options.multiline, options.dot_all, options.ascii_classes}
   {
   }
 
@@ -234,6 +314,18 @@ class parser {
       fail({0, pattern_.size()}, "pattern exceeds max_pattern_bytes");
     }
 
+    while (starts_flags()) {
+      auto const start       = position_;
+      auto const saved_flags = flags_;
+      position_ += 2;
+      if (parse_flags(start)) {
+        position_ = start;
+        flags_    = saved_flags;
+        break;
+      }
+      skip_ignored();
+    }
+    root_flags_     = flags_;
     auto expression = parse_alternation();
     if (position_ != pattern_.size()) { fail({position_, 1}, "unexpected token"); }
 
@@ -241,8 +333,96 @@ class parser {
   }
 
   std::uint32_t capture_count = 0;
+  bool has_lookaround         = false;
+  void apply_root_flags(compile_options& options) const
+  {
+    options.case_insensitive = root_flags_.case_insensitive;
+    options.multiline        = root_flags_.multiline;
+    options.dot_all          = root_flags_.dot_all;
+    options.ascii_classes    = root_flags_.ascii_classes;
+  }
 
  private:
+  static bool is_flag(char value)
+  {
+    return value == 'i' || value == 'm' || value == 's' || value == 'a' || value == 'u' ||
+           value == 'x';
+  }
+
+  bool starts_flags() const
+  {
+    return pattern_.substr(position_).starts_with("(?") && position_ + 2 < pattern_.size() &&
+           (is_flag(pattern_[position_ + 2]) || pattern_[position_ + 2] == '-');
+  }
+
+  void skip_ignored()
+  {
+    if (!flags_.verbose) return;
+    while (!at_end()) {
+      char const value = peek();
+      if (value == '#') {
+        while (!at_end() && take() != '\n') {}
+      } else if (value == ' ' || value == '\t' || value == '\n' || value == '\r' || value == '\f' ||
+                 value == '\v') {
+        ++position_;
+      } else {
+        break;
+      }
+    }
+  }
+
+  // Return true for a scoped group and false for a prefix directive.
+  bool parse_flags(std::size_t start)
+  {
+    constexpr std::string_view flags = "imsaux";
+    auto bit                         = [&](char value) { return 1U << flags.find(value); };
+    unsigned enabled                 = 0;
+    unsigned disabled                = 0;
+    bool removing                    = false;
+    while (!at_end() && peek() != ':' && peek() != ')') {
+      auto const value = take();
+      if (value == '-' && !removing) {
+        removing = true;
+        continue;
+      }
+      if (!is_flag(value)) fail({start, position_ - start}, "unsupported inline flag");
+      if (removing && (value == 'a' || value == 'u'))
+        fail({start, position_ - start}, "ASCII and Unicode flags cannot be disabled");
+      (removing ? disabled : enabled) |= bit(value);
+    }
+    if ((enabled | disabled) == 0 || (enabled & disabled) != 0 ||
+        ((enabled & bit('a')) && (enabled & bit('u'))) || (removing && disabled == 0))
+      fail({start, position_ - start}, "invalid inline flag combination");
+    auto const scoped = consume(':');
+    if (!scoped && (!consume(')') || removing))
+      fail({start, position_ - start}, "invalid inline flag directive");
+    if ((enabled & bit('u')) && options_.characters == character_mode::BYTES)
+      fail({start, position_ - start}, "Unicode inline mode requires UTF-8 input");
+    auto set = [&](char flag, bool& value) {
+      if (enabled & bit(flag)) value = true;
+      if (disabled & bit(flag)) value = false;
+    };
+    set('i', flags_.case_insensitive);
+    set('m', flags_.multiline);
+    set('s', flags_.dot_all);
+    set('x', flags_.verbose);
+    if ((enabled | disabled) & (bit('i') | bit('a') | bit('u'))) flags_.inline_case = true;
+    if (enabled & bit('a')) flags_.ascii_case = true;
+    if (enabled & bit('u')) flags_.ascii_case = false;
+    if (enabled & bit('a')) flags_.ascii_classes = true;
+    if (enabled & bit('u')) flags_.ascii_classes = false;
+    return scoped;
+  }
+
+  void add_case(character_predicate& predicate, char32_t first, char32_t last)
+  {
+    if (flags_.inline_case)
+      add_inline_case_pair(
+        predicate, first, last, flags_.ascii_case || options_.characters == character_mode::BYTES);
+    else
+      add_case_pair(predicate, first, last);
+  }
+
   [[noreturn]] void fail(source_span span, std::string message)
   {
     throw compile_failure{span, std::move(message)};
@@ -295,8 +475,10 @@ class parser {
   {
     auto start = position_;
     std::vector<std::unique_ptr<node>> children;
+    skip_ignored();
     while (!at_end() && peek() != ')' && peek() != '|') {
       children.push_back(parse_quantified());
+      skip_ignored();
     }
     if (children.empty()) { return make(node_kind::EMPTY, start); }
     if (children.size() == 1) { return std::move(children.front()); }
@@ -323,6 +505,7 @@ class parser {
   std::unique_ptr<node> parse_quantified()
   {
     auto atom = parse_atom();
+    skip_ignored();
     if (at_end()) { return atom; }
 
     auto start = atom->source.offset;
@@ -362,7 +545,7 @@ class parser {
       atom->source.length = position_ - start;
       return atom;
     }
-    if (!can_consume_character(*atom)) {
+    if (!can_consume_character(*atom) && !contains_lookaround(*atom)) {
       fail({start, position_ - start}, "zero-width assertions cannot be repeated");
     }
     auto result = make(node_kind::REPEAT, start);
@@ -453,7 +636,7 @@ class parser {
       if (kind == 's') append_unicode_ranges(result, unicode_space_ranges);
     };
     auto base = static_cast<char>(std::tolower(static_cast<std::uint8_t>(value)));
-    if (options_.ascii_classes) {
+    if (flags_.ascii_classes) {
       append_ascii(base);
     } else {
       append_unicode(base);
@@ -462,7 +645,7 @@ class parser {
     bool negative = value == 'D' || value == 'W' || value == 'S';
     if (negative) {
       result.ranges = complement_ranges(std::move(result.ranges));
-      if (!options_.ascii_classes && (value == 'D' || value == 'W')) {
+      if (!flags_.ascii_classes && (value == 'D' || value == 'W')) {
         remove_codepoint(result.ranges, U'\n');
       }
     }
@@ -481,6 +664,10 @@ class parser {
         break;
       default: break;
     }
+    // Adapter predicates use the program-wide class mode. A scoped override
+    // must retain its explicit ranges instead of selecting that fast path.
+    if (flags_.ascii_classes != root_flags_.ascii_classes)
+      result.recognized = predicate_class::NONE;
     return result;
   }
 
@@ -500,6 +687,21 @@ class parser {
     }
   }
 
+  assertion_kind contextual_assertion(assertion_kind kind) const
+  {
+    if (flags_.multiline != root_flags_.multiline) {
+      if (kind == assertion_kind::BEGIN_LINE)
+        kind = flags_.multiline ? assertion_kind::SCOPED_BEGIN_LINE : assertion_kind::BEGIN_INPUT;
+      if (kind == assertion_kind::END_LINE) kind = assertion_kind::SCOPED_END_LINE;
+    }
+    if (flags_.ascii_classes != root_flags_.ascii_classes) {
+      if (kind == assertion_kind::WORD_BOUNDARY) kind = assertion_kind::SCOPED_WORD_BOUNDARY;
+      if (kind == assertion_kind::NOT_WORD_BOUNDARY)
+        kind = assertion_kind::SCOPED_NOT_WORD_BOUNDARY;
+    }
+    return kind;
+  }
+
   std::unique_ptr<node> parse_escape(bool in_class)
   {
     auto start = position_ - 1;
@@ -512,6 +714,7 @@ class parser {
       if (value == 'B') result->assertion = assertion_kind::NOT_WORD_BOUNDARY;
       if (value == 'A') result->assertion = assertion_kind::BEGIN_INPUT;
       if (value == 'Z' || value == 'z') result->assertion = assertion_kind::END_INPUT;
+      result->assertion = contextual_assertion(result->assertion);
       return result;
     }
     auto result = make(node_kind::PREDICATE, start);
@@ -544,8 +747,8 @@ class parser {
         fail({start, 2}, "backreferences are not supported");
       }
       auto literal = three_digit_octal ? parse_octal(value) : escaped_literal(value, start);
-      if (options_.case_insensitive && !in_class) {
-        add_case_pair(result->predicate, literal, literal);
+      if (flags_.case_insensitive && !in_class) {
+        add_case(result->predicate, literal, literal);
       } else {
         result->predicate.ranges.push_back({literal, literal});
       }
@@ -620,8 +823,8 @@ class parser {
         }
         if (upper < lower) { fail({start, position_ - start}, "descending character range"); }
       }
-      if (options_.case_insensitive) {
-        add_case_pair(result->predicate, lower, upper);
+      if (flags_.case_insensitive) {
+        add_case(result->predicate, lower, upper);
       } else {
         result->predicate.ranges.push_back({lower, upper});
       }
@@ -637,73 +840,102 @@ class parser {
 
   std::unique_ptr<node> parse_atom()
   {
-    auto start       = position_;
-    char const value = take();
-    if (value == '(') {
-      bool capturing = true;
-      if (consume('?')) {
-        if (consume(':')) {
+    for (;;) {
+      auto start       = position_;
+      char const value = take();
+      if (value == '(') {
+        auto const saved_flags = flags_;
+        bool capturing         = true;
+        bool lookaround        = false;
+        bool reverse           = false;
+        bool negative          = false;
+        if (consume('?')) {
           capturing = false;
-        } else {
-          fail({start, position_ - start + 1},
-               "lookaround and inline group extensions are not supported");
+          if (is_flag(peek()) || peek() == '-') {
+            if (!parse_flags(start)) {
+              skip_ignored();
+              if (peek() == '*' || peek() == '+' || peek() == '?' ||
+                  (peek() == '{' && position_ + 1 < pattern_.size() &&
+                   std::isdigit(static_cast<std::uint8_t>(pattern_[position_ + 1])) != 0))
+                fail({position_, 1}, "inline flag directives cannot be repeated");
+              if (at_end() || peek() == ')' || peek() == '|') return make(node_kind::EMPTY, start);
+              continue;
+            }
+          } else if (!consume(':')) {
+            reverse = consume('<');
+            if (consume('=')) {
+              lookaround = true;
+            } else if (consume('!')) {
+              lookaround = true;
+              negative   = true;
+            } else {
+              fail({start, position_ - start + 1}, "unsupported inline group extension");
+            }
+          }
         }
-      }
-      if (++depth_ > options_.limits.max_nesting) {
-        fail({start, 1}, "group nesting exceeds max_nesting");
-      }
-      std::uint32_t capture{};
-      if (capturing) {
-        if (capture_count >= options_.limits.max_captures) {
-          fail({start, 1}, "capture count exceeds max_captures");
+        if (++depth_ > options_.limits.max_nesting) {
+          fail({start, 1}, "group nesting exceeds max_nesting");
         }
-        capture = ++capture_count;
+        std::uint32_t capture{};
+        if (capturing) {
+          if (capture_count >= options_.limits.max_captures) {
+            fail({start, 1}, "capture count exceeds max_captures");
+          }
+          capture = ++capture_count;
+        }
+        auto child = parse_alternation();
+        if (!consume(')')) { fail({start, position_ - start}, "unterminated group"); }
+        flags_ = saved_flags;
+        --depth_;
+        has_lookaround  = has_lookaround || lookaround;
+        auto group      = make(lookaround ? node_kind::LOOKAROUND : node_kind::GROUP, start);
+        group->reverse  = reverse;
+        group->negative = negative;
+        group->children.push_back(std::move(child));
+        group->capturing     = capturing;
+        group->capture_index = capture;
+        return group;
       }
-      auto child = parse_alternation();
-      if (!consume(')')) { fail({start, position_ - start}, "unterminated group"); }
-      --depth_;
-      auto group = make(node_kind::GROUP, start);
-      group->children.push_back(std::move(child));
-      group->capturing     = capturing;
-      group->capture_index = capture;
-      return group;
-    }
-    if (value == '[') { return parse_class(); }
-    if (value == '\\') { return parse_escape(false); }
-    if (value == '.') {
-      auto result                        = make(node_kind::PREDICATE, start);
-      result->predicate.recognized       = predicate_class::ANY;
-      result->predicate.matches_newline  = options_.dot_all;
-      result->predicate.extended_newline = options_.extended_newline;
-      return result;
-    }
-    if (value == '^' || value == '$') {
-      auto result       = make(node_kind::ASSERTION, start);
-      result->assertion = value == '^' ? assertion_kind::BEGIN_LINE : assertion_kind::END_LINE;
-      return result;
-    }
-    if (value == ')' || value == '|' || value == '*' || value == '+' || value == '?' ||
-        (value == '{' && std::isdigit(static_cast<std::uint8_t>(peek())) != 0)) {
-      fail({start, 1}, "unexpected metacharacter");
-    }
+      if (value == '[') { return parse_class(); }
+      if (value == '\\') { return parse_escape(false); }
+      if (value == '.') {
+        auto result                        = make(node_kind::PREDICATE, start);
+        result->predicate.recognized       = predicate_class::ANY;
+        result->predicate.matches_newline  = flags_.dot_all;
+        result->predicate.extended_newline = options_.extended_newline;
+        return result;
+      }
+      if (value == '^' || value == '$') {
+        auto result       = make(node_kind::ASSERTION, start);
+        result->assertion = contextual_assertion(value == '^' ? assertion_kind::BEGIN_LINE
+                                                              : assertion_kind::END_LINE);
+        return result;
+      }
+      if (value == ')' || value == '|' || value == '*' || value == '+' || value == '?' ||
+          (value == '{' && std::isdigit(static_cast<std::uint8_t>(peek())) != 0)) {
+        fail({start, 1}, "unexpected metacharacter");
+      }
 
-    --position_;
-    std::size_t length{};
-    auto literal = decode_literal(length);
-    position_ += length;
-    auto result = make(node_kind::PREDICATE, start);
-    if (options_.case_insensitive) {
-      add_case_pair(result->predicate, literal, literal);
-    } else {
-      result->predicate.ranges.push_back({literal, literal});
+      --position_;
+      std::size_t length{};
+      auto literal = decode_literal(length);
+      position_ += length;
+      auto result = make(node_kind::PREDICATE, start);
+      if (flags_.case_insensitive) {
+        add_case(result->predicate, literal, literal);
+      } else {
+        result->predicate.ranges.push_back({literal, literal});
+      }
+      normalize_ranges(result->predicate);
+      result->source.length = length;
+      return result;
     }
-    normalize_ranges(result->predicate);
-    result->source.length = length;
-    return result;
   }
 
   std::string_view pattern_;
   compile_options const& options_;
+  flag_context flags_;
+  flag_context root_flags_;
   std::size_t position_ = 0;
   std::size_t depth_    = 0;
 };
@@ -717,9 +949,18 @@ struct fragment {
   std::vector<patch_reference> outs = std::vector<patch_reference>{};
 };
 
+struct construction_budget {
+  std::size_t states      = 0;
+  std::size_t transitions = 0;
+  bool lookaround         = false;
+};
+
 class thompson_builder {
  public:
-  thompson_builder(std::string_view pattern, compile_options const& options)
+  thompson_builder(std::string_view pattern,
+                   compile_options const& options,
+                   construction_budget& budget)
+    : budget_(budget)
   {
     ir.pattern = std::string(pattern);
     ir.options = options;
@@ -732,6 +973,7 @@ class thompson_builder {
       case node_kind::EMPTY: return make_empty(expression.source);
       case node_kind::PREDICATE: return make_predicate(expression);
       case node_kind::ASSERTION: return make_assertion(expression);
+      case node_kind::LOOKAROUND: return make_lookaround(expression);
       case node_kind::GROUP: return make_group(expression);
       case node_kind::CONCATENATE: return make_concatenate(expression);
       case node_kind::ALTERNATE: ir.has_alternation = true; return make_alternate(expression);
@@ -748,15 +990,21 @@ class thompson_builder {
     patch(expression.outs, accept);
     auto entry = add_state(automata_state_kind::JUMP, {0, 0});
     add_edge(entry, expression.start, 0);
-    ir.entry         = entry;
-    ir.accept        = accept;
-    ir.capture_count = captures;
+    ir.entry          = entry;
+    ir.accept         = accept;
+    ir.capture_count  = captures;
+    auto set_captures = [&](auto&& self, automata_ir& program) -> void {
+      program.capture_count = captures;
+      for (auto& nested : program.lookarounds)
+        self(self, nested);
+    };
+    set_captures(set_captures, ir);
   }
 
  private:
   state_id add_state(automata_state_kind kind, source_span source)
   {
-    if (ir.states.size() >= ir.options.limits.max_states) {
+    if (budget_.states >= ir.options.limits.max_states) {
       throw compile_failure{source, "state count exceeds max_states"};
     }
     auto id = static_cast<state_id>(ir.states.size());
@@ -765,15 +1013,16 @@ class thompson_builder {
     state.kind   = kind;
     state.source = source;
     ir.states.push_back(std::move(state));
+    ++budget_.states;
     return id;
   }
 
   std::size_t add_edge(state_id from, state_id to, std::uint32_t priority)
   {
-    if (transition_count_ >= ir.options.limits.max_transitions) {
+    if (budget_.transitions >= ir.options.limits.max_transitions) {
       throw compile_failure{ir.states[from].source, "transition count exceeds limit"};
     }
-    ++transition_count_;
+    ++budget_.transitions;
     ir.states[from].edges.push_back({to, priority});
     return ir.states[from].edges.size() - 1;
   }
@@ -811,20 +1060,44 @@ class thompson_builder {
     return {state, {add_open_edge(state, 0)}};
   }
 
+  fragment make_lookaround(node const& expression)
+  {
+    if (!lookaround_programs_) lookaround_programs_.emplace();
+    auto& programs = *lookaround_programs_;
+    auto found     = programs.find(&expression);
+    std::uint32_t index;
+    if (found != programs.end()) {
+      index = found->second;
+    } else {
+      thompson_builder nested(ir.pattern, ir.options, budget_);
+      nested.ir.reverse = expression.reverse;
+      auto inner        = nested.build(*expression.children.front());
+      nested.finish(std::move(inner), 0);
+      index = static_cast<std::uint32_t>(ir.lookarounds.size());
+      ir.lookarounds.push_back(std::move(nested.ir));
+      programs.emplace(&expression, index);
+    }
+    auto state                     = add_state(automata_state_kind::ASSERTION, expression.source);
+    ir.states[state].assertion     = assertion_kind::LOOKAROUND;
+    ir.states[state].operand_index = index;
+    ir.states[state].negative      = expression.negative;
+    return {state, {add_open_edge(state, 0)}};
+  }
+
   fragment make_group(node const& expression)
   {
     if (!expression.capturing) return build(*expression.children.front());
 
     auto begin                     = add_state(automata_state_kind::CAPTURE, expression.source);
-    ir.states[begin].capture       = capture_action::BEGIN;
-    ir.states[begin].capture_index = expression.capture_index;
+    ir.states[begin].capture       = ir.reverse ? capture_action::END : capture_action::BEGIN;
+    ir.states[begin].operand_index = expression.capture_index;
 
     auto inner = build(*expression.children.front());
     add_edge(begin, inner.start, 0);
 
     auto end                     = add_state(automata_state_kind::CAPTURE, expression.source);
-    ir.states[end].capture       = capture_action::END;
-    ir.states[end].capture_index = expression.capture_index;
+    ir.states[end].capture       = ir.reverse ? capture_action::BEGIN : capture_action::END;
+    ir.states[end].operand_index = expression.capture_index;
     patch(inner.outs, end);
     return {begin, {add_open_edge(end, 0)}};
   }
@@ -838,9 +1111,12 @@ class thompson_builder {
   fragment make_concatenate(node const& expression)
   {
     if (expression.children.empty()) return make_empty(expression.source);
-    auto result = build(*expression.children.front());
+    auto child = [&](std::size_t index) -> node const& {
+      return *expression.children[ir.reverse ? expression.children.size() - index - 1 : index];
+    };
+    auto result = build(child(0));
     for (std::size_t index = 1; index < expression.children.size(); ++index) {
-      result = concatenate(std::move(result), build(*expression.children[index]));
+      result = concatenate(std::move(result), build(child(index)));
     }
     return result;
   }
@@ -880,19 +1156,55 @@ class thompson_builder {
 
   fragment star(node const& expression, source_span span, bool greedy)
   {
+    auto first           = ir.states.size();
     auto inner           = build(expression);
+    auto last            = ir.states.size();
     auto branch          = add_state(automata_state_kind::BRANCH, span);
     auto repeat_priority = greedy ? 0U : 1U;
     auto exit_priority   = greedy ? 1U : 0U;
     add_edge(branch, inner.start, repeat_priority);
-    patch(inner.outs, branch);
-    return {branch, {add_open_edge(branch, exit_priority)}};
+    std::vector<patch_reference> exits{add_open_edge(branch, exit_priority)};
+    if (budget_.lookaround && can_match_empty(expression)) {
+      // Track whether this iteration consumed a character. Empty iterations exit
+      // immediately, after exporting their captures. Consuming iterations repeat.
+      // Distinct states keep epsilon-closure deduplication valid for both paths.
+      std::vector<state_id> consumed(last - first);
+      for (auto id = first; id < last; ++id) {
+        auto original = ir.states[id];
+        auto copy     = add_state(original.kind, original.source);
+        original.id   = copy;
+        original.edges.clear();
+        ir.states[copy]      = std::move(original);
+        consumed[id - first] = copy;
+      }
+      for (auto id = first; id < last; ++id) {
+        auto edges = ir.states[id].edges;
+        for (auto edge : edges)
+          add_edge(consumed[id - first],
+                   edge.target == invalid_state ? invalid_state : consumed[edge.target - first],
+                   edge.priority);
+        if (ir.states[id].kind == automata_state_kind::CONSUME)
+          for (auto& edge : ir.states[id].edges)
+            if (edge.target != invalid_state) edge.target = consumed[edge.target - first];
+      }
+      for (auto out : inner.outs) {
+        ir.states[consumed[out.state - first]].edges[out.edge].target = branch;
+        if (ir.states[out.state].kind == automata_state_kind::CONSUME)
+          ir.states[out.state].edges[out.edge].target = branch;
+        else
+          exits.push_back(out);
+      }
+    } else {
+      patch(inner.outs, branch);
+    }
+    return {branch, std::move(exits)};
   }
 
   fragment make_repeat(node const& expression)
   {
     auto& repeated = *expression.children.front();
-    if (expression.maximum == unbounded_repeat && can_match_empty(repeated)) {
+    if (expression.maximum == unbounded_repeat && can_match_empty(repeated) &&
+        !budget_.lookaround) {
       throw compile_failure{expression.source,
                             "unbounded repetition of a nullable expression is not supported"};
     }
@@ -920,7 +1232,8 @@ class thompson_builder {
     return result ? std::move(*result) : make_empty(expression.source);
   }
 
-  std::size_t transition_count_ = 0;
+  construction_budget& budget_;
+  std::optional<std::map<node const*, std::uint32_t>> lookaround_programs_;
 };
 
 }  // namespace
@@ -958,6 +1271,8 @@ void verify(automata_ir const& ir)
 {
   auto invalid = [](std::string_view message) { throw std::logic_error(std::string{message}); };
 
+  for (auto& nested : ir.lookarounds)
+    verify(nested);
   if (ir.entry >= ir.states.size()) invalid("entry state is invalid");
   if (ir.accept >= ir.states.size()) invalid("accept state is invalid");
 
@@ -983,8 +1298,12 @@ void verify(automata_ir const& ir)
     if (state.kind == automata_state_kind::BRANCH && state.edges.size() < 2) {
       invalid("branch state must have at least two edges");
     }
+    if (state.kind == automata_state_kind::ASSERTION &&
+        state.assertion == assertion_kind::LOOKAROUND &&
+        (state.operand_index >= ir.lookarounds.size() || state.edges.size() != 1))
+      invalid("lookaround state is invalid");
     if (state.kind == automata_state_kind::CAPTURE &&
-        (state.capture_index == 0 || state.capture_index > ir.capture_count)) {
+        (state.operand_index == 0 || state.operand_index > ir.capture_count)) {
       invalid("capture index is out of range");
     }
   }
@@ -995,7 +1314,10 @@ automata_ir compile_automata(std::string_view pattern, compile_options const& op
   parser parse_pattern(pattern, options);
   auto expression = parse_pattern.parse();
 
-  thompson_builder builder(pattern, options);
+  construction_budget budget;
+  budget.lookaround = parse_pattern.has_lookaround;
+  thompson_builder builder(pattern, options, budget);
+  parse_pattern.apply_root_flags(builder.ir.options);
   auto fragment = builder.build(*expression);
   builder.finish(std::move(fragment), parse_pattern.capture_count);
   verify(builder.ir);

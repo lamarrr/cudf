@@ -3,9 +3,17 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+/**
+ * @file detail.hpp
+ * @brief Private intermediate representations and interfaces between compiler passes.
+ *
+ * Defines source diagnostics, character predicates, automata, instruction graphs,
+ * and replacement tokens shared by parsing, lowering, optimization, and planning.
+ */
+
 #pragma once
 
-#include <regex_ir.hpp>
+#include <libregex_ir/regex_ir.hpp>
 
 #include <exception>
 #include <limits>
@@ -172,12 +180,17 @@ struct character_predicate {
  * @brief Zero-width assertion evaluated at the current input position
  */
 enum class assertion_kind : std::uint8_t {
-  BEGIN_INPUT       = 0,  ///< Absolute beginning of input
-  END_INPUT         = 1,  ///< Absolute end of input
-  WORD_BOUNDARY     = 2,  ///< Transition between configured word and non-word characters
-  NOT_WORD_BOUNDARY = 3,  ///< Position that is not a configured word boundary
-  BEGIN_LINE        = 4,  ///< Beginning of input or a configured multiline boundary
-  END_LINE          = 5,  ///< End of input or a configured line boundary
+  BEGIN_INPUT              = 0,   ///< Absolute beginning of input
+  END_INPUT                = 1,   ///< Absolute end of input
+  WORD_BOUNDARY            = 2,   ///< Transition between configured word and non-word characters
+  NOT_WORD_BOUNDARY        = 3,   ///< Position that is not a configured word boundary
+  BEGIN_LINE               = 4,   ///< Beginning of input or a configured multiline boundary
+  END_LINE                 = 5,   ///< End of input or a configured line boundary
+  LOOKAROUND               = 6,   ///< Evaluate an independently anchored assertion program
+  SCOPED_BEGIN_LINE        = 7,   ///< Line start with the opposite multiline setting
+  SCOPED_END_LINE          = 8,   ///< Line end with the opposite multiline setting
+  SCOPED_WORD_BOUNDARY     = 9,   ///< Word boundary with the opposite ASCII setting
+  SCOPED_NOT_WORD_BOUNDARY = 10,  ///< Negated boundary with the opposite ASCII setting
 };
 
 /**
@@ -214,12 +227,13 @@ struct automata_edge {
 struct automata_state {
   state_id id                      = invalid_state;                 ///< Dense state identifier
   automata_state_kind kind         = automata_state_kind::JUMP;     ///< State operation
+  bool negative                    = false;                         ///< Invert a lookaround result
   source_span source               = source_span{};                 ///< Related pattern range
   std::vector<automata_edge> edges = std::vector<automata_edge>{};  ///< Ordered outgoing edges
   character_predicate predicate    = character_predicate{};         ///< Predicate for `CONSUME`
   assertion_kind assertion         = assertion_kind::BEGIN_INPUT;   ///< Assertion for `ASSERTION`
   capture_action capture           = capture_action::BEGIN;         ///< Action for `CAPTURE`
-  std::uint32_t capture_index      = 0;                             ///< Capture index for `CAPTURE`
+  std::uint32_t operand_index      = 0;  ///< Capture group or lookaround program index
 };
 
 /**
@@ -231,9 +245,11 @@ struct automata_ir {
   std::vector<automata_state> states = std::vector<automata_state>{};  ///< Dense states
   state_id entry                     = invalid_state;                  ///< Entry state
   state_id accept                    = invalid_state;                  ///< Unique accepting state
-  std::uint32_t capture_count        = 0;      ///< Number of explicit capture groups
-  bool has_alternation     : 1       = false;  ///< Whether the expression contains alternation
-  bool has_lazy_quantifier : 1       = false;  ///< Whether any repetition prefers its exit edge
+  std::uint32_t capture_count        = 0;  ///< Number of explicit capture groups
+  std::vector<automata_ir> lookarounds;    ///< Independently anchored assertion programs
+  bool reverse                 = false;    ///< Consume backwards for a lookbehind
+  bool has_alternation     : 1 = false;    ///< Whether the expression contains alternation
+  bool has_lazy_quantifier : 1 = false;    ///< Whether any repetition prefers its exit edge
 };
 
 }  // namespace regex_ir
@@ -289,7 +305,9 @@ struct advance_cursor {
  * @brief Evaluate a zero-width assertion at the cursor
  */
 struct test_assertion {
-  assertion_kind kind = assertion_kind::BEGIN_INPUT;  ///< Assertion to evaluate
+  assertion_kind kind         = assertion_kind::BEGIN_INPUT;  ///< Assertion to evaluate
+  std::uint32_t program_index = 0;                            ///< Nested program for `LOOKAROUND`
+  bool negative               = false;  ///< Invert the nested program's result
 };
 
 /**
@@ -377,16 +395,19 @@ struct operation_control {
  * @brief Typed operation-specialized control-flow IR
  */
 struct instruction_ir {
-  std::string pattern                        = "";                   ///< Original UTF-8 pattern
-  compile_options options                    = compile_options{};    ///< Compilation options
-  operation selected_operation               = operation{};          ///< Encoded operation
-  operation_control control                  = operation_control{};  ///< Execution policy
-  std::vector<instruction_block> blocks      = std::vector<instruction_block>{};  ///< Dense blocks
-  block_id entry                             = invalid_block;                     ///< Entry block
-  block_id accept                            = invalid_block;  ///< Block containing acceptance
-  std::uint32_t capture_count                = 0;              ///< Explicit capture count
-  bool has_alternation     : 1               = false;  ///< Whether the expression has alternation
-  bool has_lazy_quantifier : 1               = false;  ///< Whether repetition priority is lazy
+  std::string pattern                   = "";                   ///< Original UTF-8 pattern
+  compile_options options               = compile_options{};    ///< Compilation options
+  operation selected_operation          = operation{};          ///< Encoded operation
+  operation_control control             = operation_control{};  ///< Execution policy
+  std::vector<instruction_block> blocks = std::vector<instruction_block>{};  ///< Dense blocks
+  block_id entry                        = invalid_block;                     ///< Entry block
+  block_id accept                       = invalid_block;  ///< Block containing acceptance
+  std::uint32_t capture_count           = 0;              ///< Explicit capture count
+  std::vector<instruction_ir> lookarounds;  ///< Assertion programs with global capture indices
+  bool reverse                 = false;     ///< Consume backwards from the assertion position
+  bool assertion_program       = false;     ///< Always execute with the ordered Thompson executor
+  bool has_alternation     : 1 = false;     ///< Whether the expression has alternation
+  bool has_lazy_quantifier : 1 = false;     ///< Whether repetition priority is lazy
   std::vector<replacement_token> replacement = std::vector<replacement_token>{};  ///< Template
 };
 

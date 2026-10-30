@@ -3,6 +3,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+/**
+ * @file unicode.hpp
+ * @brief Unicode category ranges used by regex predicates and word boundaries.
+ *
+ * Provides embedded word, digit, whitespace, and mathematical-symbol tables
+ * shared by character-class parsing and CUDA table emission.
+ */
+
 #pragma once
 
 #include <cstdint>

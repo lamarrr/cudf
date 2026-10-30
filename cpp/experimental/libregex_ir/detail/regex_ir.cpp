@@ -3,8 +3,16 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "cuda_codegen.hpp"
-#include "regex_ir_detail.hpp"
+/**
+ * @file regex_ir.cpp
+ * @brief Public compilation entry point and regex compiler pipeline.
+ *
+ * Validates operation arguments, runs parsing, lowering, optimization, and CUDA
+ * emission, and translates internal diagnostics into public errors.
+ */
+
+#include <libregex_ir/detail/cuda_codegen.hpp>
+#include <libregex_ir/detail/detail.hpp>
 
 #include <format>
 #include <optional>

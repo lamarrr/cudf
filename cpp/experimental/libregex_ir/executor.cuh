@@ -2,9 +2,18 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
+
+/**
+ * @file executor.cuh
+ * @brief Shared CUDA runtime for generated regex matchers.
+ *
+ * Implements input decoding, predicates, anchors, execution algorithms, lookaround
+ * evaluation, and span, count, replacement, and split operations.
+ */
 #pragma once
 
 namespace regex_ir::device {
+
 // Types.
 using i8  = signed char;
 using i16 = signed short;
@@ -87,41 +96,35 @@ __device__ constexpr bool is_deterministic_executor(executor_kind kind)
 }
 
 namespace constants {
-enum : u32 {
-  byte_bits          = 8,
-  u32_bits           = sizeof(u32) * byte_bits,
-  u64_bits           = sizeof(u64) * byte_bits,
-  u64_bit_index_mask = u64_bits - 1,
-  byte_mask          = 0xffU,
-  ascii_limit        = 0x80U
-};
+constexpr u32 byte_bits          = 8;
+constexpr u32 u32_bits           = sizeof(u32) * byte_bits;
+constexpr u32 u64_bits           = sizeof(u64) * byte_bits;
+constexpr u32 u64_bit_index_mask = u64_bits - 1;
+constexpr u32 byte_mask          = 0xffU;
+constexpr u32 ascii_limit        = 0x80U;
 
-enum : i32 { packed_bytes = sizeof(u64) };
+constexpr i32 packed_bytes = sizeof(u64);
 
-enum : u64 {
-  packed_byte_ones      = 0x0101010101010101ULL,
-  packed_byte_high_bits = 0x8080808080808080ULL,
-  packed_byte_low_bits  = 0x7f7f7f7f7f7f7f7fULL
-};
+constexpr u64 packed_byte_ones      = 0x0101010101010101ULL;
+constexpr u64 packed_byte_high_bits = 0x8080808080808080ULL;
+constexpr u64 packed_byte_low_bits  = 0x7f7f7f7f7f7f7f7fULL;
 
 }  // namespace constants
 
 namespace utf8 {
-enum : u32 {
-  continuation_tag_mask     = 0xc0U,
-  continuation_tag          = 0x80U,
-  continuation_bits         = 6,
-  continuation_payload_mask = 0x3fU,
-  two_byte_lead_min         = 0xc2U,
-  two_byte_lead_max         = 0xdfU,
-  three_byte_lead_min       = 0xe0U,
-  three_byte_lead_max       = 0xefU,
-  four_byte_lead_min        = 0xf0U,
-  four_byte_lead_max        = 0xf4U,
-  two_byte_payload_mask     = 0x1fU,
-  three_byte_payload_mask   = 0x0fU,
-  four_byte_payload_mask    = 0x07U
-};
+constexpr u32 continuation_tag_mask     = 0xc0U;
+constexpr u32 continuation_tag          = 0x80U;
+constexpr u32 continuation_bits         = 6;
+constexpr u32 continuation_payload_mask = 0x3fU;
+constexpr u32 two_byte_lead_min         = 0xc2U;
+constexpr u32 two_byte_lead_max         = 0xdfU;
+constexpr u32 three_byte_lead_min       = 0xe0U;
+constexpr u32 three_byte_lead_max       = 0xefU;
+constexpr u32 four_byte_lead_min        = 0xf0U;
+constexpr u32 four_byte_lead_max        = 0xf4U;
+constexpr u32 two_byte_payload_mask     = 0x1fU;
+constexpr u32 three_byte_payload_mask   = 0x0fU;
+constexpr u32 four_byte_payload_mask    = 0x07U;
 }  // namespace utf8
 
 // Input.
@@ -211,6 +214,26 @@ struct input {
       }
       return {code_point, count};
     }
+  }
+
+  template <bool Bytes, bool FuseContinuationLoads = true>
+  __device__ __forceinline__ decoded read_previous(i64 position, i64& previous_position) const
+  {
+    previous_position = position == 0 ? 0 : position - 1;
+    if constexpr (!Bytes) {
+      constexpr i64 max_utf8_bytes = 4;
+      auto lower                   = position > max_utf8_bytes ? position - max_utf8_bytes : 0;
+      while (previous_position > lower &&
+             (byte(previous_position) & utf8::continuation_tag_mask) == utf8::continuation_tag)
+        --previous_position;
+    }
+    auto character = read<Bytes, FuseContinuationLoads>(previous_position);
+    if (position > 0 && character.width != position - previous_position) {
+      // Match the forward decoder's one-byte fallback for malformed sequences.
+      previous_position = position - 1;
+      character         = read<Bytes, FuseContinuationLoads>(previous_position);
+    }
+    return character;
   }
 
   template <bool Bytes, bool FuseContinuationLoads = true>
@@ -304,6 +327,21 @@ __device__ __forceinline__ bool newline(u32 code_point)
   return code_point == U'\n' || (Extended && (code_point == U'\r' || code_point == U'\u0085' ||
                                               code_point == U'\u2028' || code_point == U'\u2029'));
 }
+
+template <typename Pattern, bool ToggleLines, bool ToggleWords>
+struct assertion_context : Pattern {
+  static constexpr bool multiline = ToggleLines ? !Pattern::multiline : Pattern::multiline;
+
+  __device__ __forceinline__ static bool is_word(u32 code_point)
+  {
+    if constexpr (!ToggleWords)
+      return Pattern::is_word(code_point);
+    else if constexpr (Pattern::ascii_word_classes)
+      return Pattern::unicode_word(code_point);
+    else
+      return ascii_word(code_point);
+  }
+};
 
 template <typename Pattern>
 __device__ __forceinline__ bool assertion(
@@ -995,6 +1033,7 @@ struct closure {
   record_word* stack;
   record_word* next;
   u64* queued;
+  i64* lookaround_storage     = nullptr;
   i64 depth                   = 0;
   i64 produced                = 0;
   static constexpr u32 record = Pattern::live_captures + 1;
@@ -1040,6 +1079,13 @@ struct closure {
 };
 
 template <typename Pattern>
+__device__ constexpr bool reverse_execution()
+{
+  if constexpr (requires { Pattern::reverse; }) return Pattern::reverse;
+  return false;
+}
+
+template <typename Pattern>
 __device__ __forceinline__ bool thompson_run(
   input input_value, i64 start, i64& end, i64* captures, i64* storage)
 {
@@ -1065,12 +1111,19 @@ __device__ __forceinline__ bool thompson_run(
   i64 pos    = start;
   bool found = false;
   for (;;) {
-    pos             = Pattern::scan_run(input_value, pos, current, count);
-    auto character  = input_value.template read<Pattern::bytes, Pattern::fused_unicode_decode>(pos);
+    pos                = Pattern::scan_run(input_value, pos, current, count);
+    auto read_position = pos;
+    auto character =
+      input_value.template read<Pattern::bytes, Pattern::fused_unicode_decode>(read_position);
+    if constexpr (reverse_execution<Pattern>())
+      character = input_value.template read_previous<Pattern::bytes, Pattern::fused_unicode_decode>(
+        pos, read_position);
     auto code_point = character.code_point;
     for (u32 capture_index = 0; capture_index < Pattern::bitset_words; ++capture_index)
       seen[capture_index] = queued[capture_index] = 0;
     closure<Pattern> work{active, stack, next, queued};
+    if constexpr (requires { Pattern::lookaround_storage_offset; })
+      work.lookaround_storage = storage + Pattern::lookaround_storage_offset;
     bool accepted = false;
     for (i64 seed = 0; seed < count && !accepted; ++seed) {
       work.copy(active, current + seed * record);
@@ -1103,14 +1156,45 @@ __device__ __forceinline__ bool thompson_run(
       if (captures != nullptr)
         for (u32 capture_index = 0; capture_index < Pattern::live_captures; ++capture_index)
           captures[Pattern::capture_slot(capture_index)] = active[capture_index + 1];
+      if constexpr (requires { Pattern::accept_first; }) {
+        if constexpr (Pattern::accept_first) return true;
+      }
     }
     if (work.produced == 0) return found;
     count      = work.produced;
     auto* swap = current;
     current    = next;
     next       = swap;
-    pos += character.width;
+    if constexpr (reverse_execution<Pattern>())
+      pos = read_position;
+    else
+      pos += character.width;
   }
+}
+
+// Assertions are atomic: only the highest-priority successful path exports
+// captures, and negative assertions never export speculative capture writes.
+template <typename Parent, typename Assertion, bool Negative, typename Work>
+__device__ __forceinline__ bool lookaround(input value, i64 pos, Work& work)
+{
+  constexpr bool observes_captures =
+    !Negative && Parent::live_captures != 0 && Assertion::live_captures != 0;
+  auto* captures = observes_captures ? work.lookaround_storage + Assertion::storage_words
+                                     : static_cast<i64*>(nullptr);
+  if constexpr (observes_captures) {
+    for (u32 slot = 0; slot < Parent::capture_slots; ++slot)
+      captures[slot] = -1;
+    for (u32 index = 0; index < Parent::live_captures; ++index)
+      captures[Parent::capture_slot(index)] = work.active[index + 1];
+  }
+  i64 end;
+  auto matched = thompson_run<Assertion>(value, pos, end, captures, work.lookaround_storage);
+  if constexpr (observes_captures) {
+    if (matched)
+      for (u32 index = 0; index < Parent::live_captures; ++index)
+        work.active[index + 1] = captures[Parent::capture_slot(index)];
+  }
+  return Negative ? !matched : matched;
 }
 
 // Dispatch.

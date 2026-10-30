@@ -3,9 +3,17 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+/**
+ * @file execution_plan.hpp
+ * @brief Private executor representations and execution-plan interface.
+ *
+ * Describes deterministic, position, and Thompson machines together with capture
+ * layouts, input-search metadata, and workspace requirements.
+ */
+
 #pragma once
 
-#include "regex_ir_detail.hpp"
+#include <libregex_ir/detail/detail.hpp>
 
 #include <array>
 #include <cstddef>
@@ -29,7 +37,8 @@ struct deterministic_nfa_node {
 
 struct deterministic_nfa_graph {
   std::vector<deterministic_nfa_node> nodes = std::vector<deterministic_nfa_node>{};
-  std::size_t entry                         = 0;
+  std::vector<std::optional<test_assertion>> lookarounds;
+  std::size_t entry = 0;
 };
 
 struct deterministic_capture_action {
@@ -124,6 +133,8 @@ class execution_plan {
   };
 
   instruction_ir ir_;
+  std::vector<execution_plan> lookarounds_;
+  std::size_t own_storage_words_                           = 0;
   std::optional<result_shape> anchored_boolean_result_     = std::nullopt;
   std::optional<std::string> exact_ascii_literal_metadata_ = std::nullopt;
   std::optional<std::string> exact_literal_bytes_          = std::nullopt;

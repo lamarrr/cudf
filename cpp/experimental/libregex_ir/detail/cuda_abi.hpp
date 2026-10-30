@@ -2,6 +2,14 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
+
+/**
+ * @file cuda_abi.hpp
+ * @brief Shared ABI descriptions for generated matcher and column-wrapper code.
+ *
+ * Centralizes result types, parameter lists, arguments, and device declarations
+ * so separately compiled matcher and wrapper fragments agree.
+ */
 #pragma once
 
 #include <cstdint>

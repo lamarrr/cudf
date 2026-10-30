@@ -2,11 +2,18 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
+
+/**
+ * @file kernels.cuh
+ * @brief CUDA column-dispatch and output helpers for cuDF regex integration.
+ *
+ * Adapts string offsets and validity masks to matcher calls and implements
+ * capture materialization, span caching, replacement, and split output.
+ */
 #pragma once
 
-#include "pair.cuh"
-
-#include <executor.cuh>
+#include <libregex_ir/detail/pair.cuh>
+#include <libregex_ir/executor.cuh>
 
 namespace cudf::experimental::detail::regex_jit::device {
 using namespace regex_ir::device;

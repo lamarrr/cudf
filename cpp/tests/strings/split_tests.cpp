@@ -578,9 +578,8 @@ TYPED_TEST(StringsRegexSplitTest, SplitRecordRegex)
   {
     auto pattern = std::string("\\s+");
 
-    LCW expected(
-      {LCW{"", "Héllo", "thesé"}, LCW{}, LCW{"are", "some", ""}, LCW{"tést", "String"}, LCW{""}},
-      validity);
+    LCW expected({{"", "Héllo", "thesé"}, {}, {"are", "some", ""}, {"tést", "String"}, {""}},
+                 validity);
     auto prog   = TypeParam::create(cudf::experimental::regex_operation::SPLIT_RECORD, pattern);
     auto result = TypeParam::split_record_re(sv, *prog);
     CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(result->view(), expected);
@@ -669,7 +668,7 @@ TYPED_TEST(StringsRegexSplitTest, SplitRecordRegexLazyQuantifier)
   using LCW        = cudf::test::lists_column_wrapper<cudf::string_view>;
 
   {
-    LCW expected({LCW{"\rbaa", "\ra"}});
+    LCW expected({{"\rbaa", "\ra"}});
     auto prog   = TypeParam::create(cudf::experimental::regex_operation::SPLIT_RECORD,
                                   "[^ \v\n\t\r\f]\\r+?\\n*",
                                   cudf::strings::regex_flags::EXT_NEWLINE,
@@ -680,7 +679,7 @@ TYPED_TEST(StringsRegexSplitTest, SplitRecordRegexLazyQuantifier)
   }
 
   {
-    LCW expected({LCW{"\rbaa", "a"}});
+    LCW expected({{"\rbaa", "a"}});
     auto prog   = TypeParam::create(cudf::experimental::regex_operation::SPLIT_RECORD,
                                   "[^ \v\n\t\r\f]\\r+\\n*",
                                   cudf::strings::regex_flags::EXT_NEWLINE,
@@ -725,9 +724,8 @@ TYPED_TEST(StringsRegexSplitTest, SplitRegexWithMaxSplit)
     auto pattern = std::string("\\s");
 
     using LCW = cudf::test::lists_column_wrapper<cudf::string_view>;
-    LCW expected1(
-      {LCW{"", "Héllo\tthesé"}, LCW{}, LCW{"are", "some  "}, LCW{"tést", "String"}, LCW{""}},
-      validity);
+    LCW expected1({{"", "Héllo\tthesé"}, {}, {"are", "some  "}, {"tést", "String"}, {""}},
+                  validity);
     auto prog = TypeParam::create(
       cudf::experimental::regex_operation::SPLIT_RECORD, pattern, {.maxsplit = 1});
     auto result = TypeParam::split_record_re(sv, *prog, 1);
@@ -736,9 +734,8 @@ TYPED_TEST(StringsRegexSplitTest, SplitRegexWithMaxSplit)
     prog = TypeParam::create(
       cudf::experimental::regex_operation::SPLIT_RECORD, pattern, {.maxsplit = 2});
     result = TypeParam::split_record_re(sv, *prog, 2);
-    LCW expected2(
-      {LCW{"", "Héllo", "thesé"}, LCW{}, LCW{"are", "some", " "}, LCW{"tést", "String"}, LCW{""}},
-      validity);
+    LCW expected2({{"", "Héllo", "thesé"}, {}, {"are", "some", " "}, {"tést", "String"}, {""}},
+                  validity);
     CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(result->view(), expected2);
 
     // split everything is the same output as maxsplit==3 for the test input column here
@@ -775,7 +772,7 @@ TYPED_TEST(StringsRegexSplitTest, SplitRegexWordBoundary)
     auto pattern = std::string("\\B");
 
     using LCW = cudf::test::lists_column_wrapper<cudf::string_view>;
-    LCW expected({LCW{"a"}, LCW{"a", "b"}, LCW{"", "-", "+", ""}, LCW{"e\né"}});
+    LCW expected({{"a"}, {"a", "b"}, {"", "-", "+", ""}, {"e\né"}});
     auto prog   = TypeParam::create(cudf::experimental::regex_operation::SPLIT_RECORD, pattern);
     auto result = TypeParam::split_record_re(sv, *prog);
     CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(result->view(), expected);
@@ -797,7 +794,7 @@ TYPED_TEST(StringsRegexSplitTest, SplitRegexAllEmpty)
   auto record_prog = TypeParam::create(cudf::experimental::regex_operation::SPLIT_RECORD, "[ _]");
   auto rec_result  = TypeParam::split_record_re(sv, *record_prog);
   using LCW        = cudf::test::lists_column_wrapper<cudf::string_view>;
-  LCW expected_record({LCW{""}, LCW{""}, LCW{""}, LCW{""}});
+  LCW expected_record({{""}, {""}, {""}, {""}});
   CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(rec_result->view(), expected_record);
   auto rrecord_prog = TypeParam::create(cudf::experimental::regex_operation::RSPLIT_RECORD, "[ _]");
   rec_result        = TypeParam::rsplit_record_re(sv, *rrecord_prog);
@@ -915,9 +912,7 @@ TYPED_TEST(StringsRegexSplitTest, RSplitRegexWithMaxSplit)
   }
   {
     using LCW = cudf::test::lists_column_wrapper<cudf::string_view>;
-    LCW expected(
-      {LCW{" Héllo", "thesé"}, LCW{}, LCW{"are some", ""}, LCW{"tést", "String"}, LCW{""}},
-      validity);
+    LCW expected({{" Héllo", "thesé"}, {}, {"are some", ""}, {"tést", "String"}, {""}}, validity);
     auto record_prog = TypeParam::create(
       cudf::experimental::regex_operation::RSPLIT_RECORD, pattern, {.maxsplit = 1});
     auto result = TypeParam::rsplit_record_re(sv, *record_prog, 1);

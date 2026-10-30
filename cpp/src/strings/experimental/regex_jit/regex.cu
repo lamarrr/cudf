@@ -3,11 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "device/pair.cuh"
-#include "jit/cache.hpp"
-#include "kernel_ir.hpp"
-#include "regex_ir.hpp"
-
 #include <cudf/aggregation.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/detail/device_scalar.hpp>
@@ -20,6 +15,7 @@
 #include <cudf/strings/detail/strings_children.cuh>
 #include <cudf/strings/detail/strings_column_factories.cuh>
 #include <cudf/strings/experimental/regex.hpp>
+#include <cudf/strings/utilities.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/utilities/error.hpp>
 
@@ -31,6 +27,11 @@
 #include <cuda_runtime_api.h>
 #include <thrust/for_each.h>
 
+#include <jit/cache.hpp>
+#include <libregex_ir/detail/pair.cuh>
+#include <libregex_ir/regex_ir.hpp>
+#include <strings/experimental/regex_jit/kernel_ir.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -38,6 +39,7 @@
 #include <format>
 #include <limits>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -282,13 +284,14 @@ retained_kernel compile_kernel(std::string const& matcher,
   static std::string const matcher_name{"cudf.experimental.regex.matcher"};
 
   auto threads                  = block_size(operation, executor);
-  char const* include_names[]   = {"regex_ir_generated.cuh"};
+  char const* include_names[]   = {"libregex_ir/regex_ir_generated.cuh"};
   char const* matcher_headers[] = {matcher.c_str()};
-  auto matcher_fragment         = get_kernel_fragment(matcher_name,
-                                              "cudf/cpp/experimental/libregex_ir/executor.cu",
-                                              include_names,
-                                              matcher_headers,
-                                                      {});
+  auto matcher_fragment =
+    get_kernel_fragment(matcher_name,
+                        "cudf/cpp/experimental/libregex_ir/detail/executor.cu",
+                        include_names,
+                        matcher_headers,
+                        {});
   auto wrapper_module = detail::regex_jit::make_module(std::move(wrapper), workspace_bytes);
   char const* wrapper_headers[] = {wrapper_module.c_str()};
   auto wrapper_fragment =
@@ -797,7 +800,7 @@ std::unique_ptr<column> enumerate_impl(strings_column_view const& input,
   }
   auto strings_output = make_strings(pairs, stream, mr);
 
-  auto [null_mask, null_count] = [&]() -> std::pair<cuda::device_buffer<std::byte>, size_type> {
+  auto [null_mask, null_count] = [&]() -> std::pair<cuda::device_buffer<bitmask_type>, size_type> {
     if (findall) {
       return {cudf::detail::copy_bitmask(input.parent(), stream, mr.get_output_mr()),
               input.null_count()};
@@ -1166,7 +1169,11 @@ retained_kernel const& regex_jit_program_accessor::kernel(regex_jit_program cons
                                                           bool offset64,
                                                           bool output_offset64)
 {
-  return prog._impl->kernels[kernel_slot(role, offset64, output_offset64)].value();
+  auto const& prepared = prog._impl->kernels[kernel_slot(role, offset64, output_offset64)];
+  CUDF_EXPECTS(prepared.has_value(),
+               "Requested regex JIT kernel is unavailable: recreate the program with "
+               "LIBCUDF_LARGE_STRINGS_ENABLED=1 to use 64-bit string offsets");
+  return *prepared;
 }
 
 std::unique_ptr<regex_jit_program> regex_jit_program::create(
@@ -1258,8 +1265,11 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
     auto cache_values        = size_type{0};
     auto kernel_operation    = replacement_operation ? regex_ir::operation_kind::REPLACE : internal;
 
+    std::array const widths{false, true};
+    auto const offset_widths =
+      std::span{widths}.first(strings::is_large_strings_enabled() ? widths.size() : 1);
     auto add_pass = [&](kernel_role role, auto&& make_wrapper, std::string const& name) {
-      for (auto offset64 : {false, true}) {
+      for (auto offset64 : offset_widths) {
         kernels[kernel_slot(role, offset64)] = compile_kernel(matcher,
                                                               kernel_operation,
                                                               executor,
@@ -1270,8 +1280,8 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
     };
     auto add_output_offset_pass =
       [&](kernel_role role, auto&& make_wrapper, std::string const& name) {
-        for (auto offset64 : {false, true}) {
-          for (auto output_offset64 : {false, true}) {
+        for (auto offset64 : offset_widths) {
+          for (auto output_offset64 : offset_widths) {
             kernels[kernel_slot(role, offset64, output_offset64)] =
               compile_kernel(matcher,
                              kernel_operation,
@@ -1296,7 +1306,7 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
           "cudf.experimental.regex.fixed");
         if (operation == regex_operation::CONTAINS) {
           if (exact_literal_bytes.has_value()) {
-            for (auto offset64 : {false, true}) {
+            for (auto offset64 : offset_widths) {
               auto prepared                                             = compile_kernel(matcher,
                                              internal,
                                              executor,
@@ -1353,7 +1363,7 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
           "cudf.experimental.regex.enumerate_emit");
         if (program_options.span_cache_policy != regex_jit_span_cache_policy::OFF) {
           cache_values = slots;
-          for (auto offset64 : {false, true}) {
+          for (auto offset64 : offset_widths) {
             kernels[kernel_slot(kernel_role::CACHE_SIZE, offset64)] =
               compile_kernel(matcher,
                              kernel_operation,
@@ -1422,7 +1432,7 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
           "cudf.experimental.regex.replace_emit");
         if (program_options.span_cache_policy != regex_jit_span_cache_policy::OFF) {
           cache_values = slots;
-          for (auto offset64 : {false, true}) {
+          for (auto offset64 : offset_widths) {
             kernels[kernel_slot(kernel_role::CACHE_SIZE, offset64)] = compile_kernel(
               matcher,
               kernel_operation,
@@ -1439,7 +1449,7 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
                              detail::regex_jit::make_span_cache_sample_kernel(
                                offset64, false, slots, limit, KERNEL_ENTRY),
                              "cudf.experimental.regex.replace_sample");
-            for (auto output_offset64 : {false, true}) {
+            for (auto output_offset64 : offset_widths) {
               kernels[kernel_slot(kernel_role::CACHE_EMIT, offset64, output_offset64)] =
                 compile_kernel(
                   matcher,
@@ -1476,7 +1486,7 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
           "cudf.experimental.regex.split_emit");
         if (program_options.span_cache_policy != regex_jit_span_cache_policy::OFF) {
           cache_values = 2;
-          for (auto offset64 : {false, true}) {
+          for (auto offset64 : offset_widths) {
             kernels[kernel_slot(kernel_role::CACHE_SIZE, offset64)] = compile_kernel(
               matcher,
               kernel_operation,

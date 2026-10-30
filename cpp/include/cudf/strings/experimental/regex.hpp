@@ -74,6 +74,11 @@ struct regex_jit_program_options {
  * The pattern is parsed into Regex IR when the object is created. The resulting
  * API-specific kernels are compiled and retained by the program, which is
  * immutable after creation.
+ *
+ * Kernels with 64-bit string offsets are prepared only if
+ * `cudf::strings::is_large_strings_enabled()` is true at creation. A program
+ * created with large strings disabled must be recreated to use 64-bit offsets
+ * after enabling large strings.
  */
 struct regex_jit_program {
   struct regex_jit_program_impl;

@@ -2,10 +2,9 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-#include "kernel_ir.hpp"
-
-#include <cuda_abi.hpp>
-#include <regex_ir_detail.hpp>
+#include <libregex_ir/detail/cuda_abi.hpp>
+#include <libregex_ir/detail/detail.hpp>
+#include <strings/experimental/regex_jit/kernel_ir.hpp>
 
 #include <algorithm>
 #include <cctype>

@@ -174,15 +174,14 @@ TYPED_TEST(StringsExtractTests, MultiLine)
   CUDF_TEST_EXPECT_TABLES_EQUAL(*results, expected);
 }
 
-struct RegexInterpreterExtractTests : public cudf::test::BaseFixture {};
-
-TEST_F(RegexInterpreterExtractTests, InlineFlags)
+TYPED_TEST(StringsExtractTests, InlineFlags)
 {
   auto input = cudf::test::strings_column_wrapper({"ABC-123", "abc-456", "xyz\nAbc-789", "abc"});
   auto view  = cudf::strings_column_view(input);
 
-  auto prog    = cudf::strings::regex_program::create("(?im)^([a-c]+)-(\\d+)");
-  auto results = cudf::strings::extract(view, *prog);
+  auto prog =
+    TypeParam::create(cudf::experimental::regex_operation::EXTRACT, "(?im)^([a-c]+)-(\\d+)");
+  auto results = TypeParam::extract(view, *prog);
   cudf::test::strings_column_wrapper expected1({"ABC", "abc", "Abc", ""},
                                                {true, true, true, false});
   cudf::test::strings_column_wrapper expected2({"123", "456", "789", ""},
@@ -190,8 +189,8 @@ TEST_F(RegexInterpreterExtractTests, InlineFlags)
   auto expected = cudf::table_view{{expected1, expected2}};
   CUDF_TEST_EXPECT_TABLES_EQUAL(*results, expected);
 
-  prog    = cudf::strings::regex_program::create("((?i:a)bc)-(\\d+)");
-  results = cudf::strings::extract(view, *prog);
+  prog    = TypeParam::create(cudf::experimental::regex_operation::EXTRACT, "((?i:a)bc)-(\\d+)");
+  results = TypeParam::extract(view, *prog);
   cudf::test::strings_column_wrapper expected3({"", "abc", "Abc", ""}, {false, true, true, false});
   cudf::test::strings_column_wrapper expected4({"", "456", "789", ""}, {false, true, true, false});
   expected = cudf::table_view{{expected3, expected4}};
