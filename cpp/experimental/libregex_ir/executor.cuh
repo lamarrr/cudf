@@ -86,10 +86,48 @@ __device__ constexpr bool is_deterministic_executor(executor_kind kind)
          kind == executor_kind::TAGGED_PRIORITIZED_DETERMINISTIC;
 }
 
+namespace constants {
+enum : u32 {
+  byte_bits          = 8,
+  u32_bits           = sizeof(u32) * byte_bits,
+  u64_bits           = sizeof(u64) * byte_bits,
+  u64_bit_index_mask = u64_bits - 1,
+  byte_mask          = 0xffU,
+  ascii_limit        = 0x80U
+};
+
+enum : i32 { packed_bytes = sizeof(u64) };
+
+enum : u64 {
+  packed_byte_ones      = 0x0101010101010101ULL,
+  packed_byte_high_bits = 0x8080808080808080ULL,
+  packed_byte_low_bits  = 0x7f7f7f7f7f7f7f7fULL
+};
+
+}  // namespace constants
+
+namespace utf8 {
+enum : u32 {
+  continuation_tag_mask     = 0xc0U,
+  continuation_tag          = 0x80U,
+  continuation_bits         = 6,
+  continuation_payload_mask = 0x3fU,
+  two_byte_lead_min         = 0xc2U,
+  two_byte_lead_max         = 0xdfU,
+  three_byte_lead_min       = 0xe0U,
+  three_byte_lead_max       = 0xefU,
+  four_byte_lead_min        = 0xf0U,
+  four_byte_lead_max        = 0xf4U,
+  two_byte_payload_mask     = 0x1fU,
+  three_byte_payload_mask   = 0x0fU,
+  four_byte_payload_mask    = 0x07U
+};
+}  // namespace utf8
+
 // Input.
 __device__ __forceinline__ u32 trailing_zeroes(u64 value)
 {
-  return value == 0 ? 64 : __ffsll(static_cast<i64>(value)) - 1;
+  return value == 0 ? constants::u64_bits : __ffsll(static_cast<i64>(value)) - 1;
 }
 
 template <typename Value>
@@ -118,14 +156,15 @@ struct input {
     if (position >= size) return 0;
     if constexpr (Bytes) return 1;
     auto first = byte(position);
-    if (first < 128) return 1;
-    auto count = first >= 194 && first <= 223   ? 2
-                 : first >= 224 && first <= 239 ? 3
-                 : first >= 240 && first <= 244 ? 4
-                                                : 1;
+    if (first < constants::ascii_limit) return 1;
+    auto count = first >= utf8::two_byte_lead_min && first <= utf8::two_byte_lead_max       ? 2
+                 : first >= utf8::three_byte_lead_min && first <= utf8::three_byte_lead_max ? 3
+                 : first >= utf8::four_byte_lead_min && first <= utf8::four_byte_lead_max   ? 4
+                                                                                            : 1;
     if (size - position < count) return 1;
     for (i32 byte_index = 1; byte_index < count; ++byte_index)
-      if ((byte(position + byte_index) & 192U) != 128U) return 1;
+      if ((byte(position + byte_index) & utf8::continuation_tag_mask) != utf8::continuation_tag)
+        return 1;
     return count;
   }
 
@@ -140,27 +179,35 @@ struct input {
     if (position >= size) return {0, 0};
     auto code_point = byte(position);
     if constexpr (Bytes) return {code_point, 1};
-    if (code_point < 128) return {code_point, 1};
+    if (code_point < constants::ascii_limit) return {code_point, 1};
     if constexpr (!FuseContinuationLoads) {
       auto count = width<false>(position);
       if (count == 1) return {code_point, 1};
-      code_point &= count == 2 ? 31U : count == 3 ? 15U : 7U;
+      code_point &= count == 2   ? utf8::two_byte_payload_mask
+                    : count == 3 ? utf8::three_byte_payload_mask
+                                 : utf8::four_byte_payload_mask;
       for (i64 byte_index = 1; byte_index < count; ++byte_index)
-        code_point = (code_point << 6U) | (byte(position + byte_index) & 63U);
+        code_point = (code_point << utf8::continuation_bits) |
+                     (byte(position + byte_index) & utf8::continuation_payload_mask);
       return {code_point, count};
     } else {
       auto first_byte = code_point;
-      auto count      = first_byte >= 194 && first_byte <= 223   ? 2
-                        : first_byte >= 224 && first_byte <= 239 ? 3
-                        : first_byte >= 240 && first_byte <= 244 ? 4
-                                                                 : 1;
+      auto count =
+        first_byte >= utf8::two_byte_lead_min && first_byte <= utf8::two_byte_lead_max       ? 2
+        : first_byte >= utf8::three_byte_lead_min && first_byte <= utf8::three_byte_lead_max ? 3
+        : first_byte >= utf8::four_byte_lead_min && first_byte <= utf8::four_byte_lead_max   ? 4
+                                                                                             : 1;
       if (count == 1 || size - position < count) return {first_byte, 1};
-      code_point &= count == 2 ? 31U : count == 3 ? 15U : 7U;
+      code_point &= count == 2   ? utf8::two_byte_payload_mask
+                    : count == 3 ? utf8::three_byte_payload_mask
+                                 : utf8::four_byte_payload_mask;
       // Validate and assemble from the same loads. Invalid sequences still consume one byte.
       for (i32 byte_index = 1; byte_index < count; ++byte_index) {
         auto continuation = byte(position + byte_index);
-        if ((continuation & 192U) != 128U) return {first_byte, 1};
-        code_point = (code_point << 6U) | (continuation & 63U);
+        if ((continuation & utf8::continuation_tag_mask) != utf8::continuation_tag)
+          return {first_byte, 1};
+        code_point = (code_point << utf8::continuation_bits) |
+                     (continuation & utf8::continuation_payload_mask);
       }
       return {code_point, count};
     }
@@ -184,7 +231,8 @@ struct input {
     if (position == 0) return 0;
     --position;
     if constexpr (!Bytes) {
-      while (position > 0 && (byte(position) & 192U) == 128U)
+      while (position > 0 &&
+             (byte(position) & utf8::continuation_tag_mask) == utf8::continuation_tag)
         --position;
     }
     return position;
@@ -196,23 +244,26 @@ struct input {
   __device__ __forceinline__ u64 search_word(i64 position) const
   {
     constexpr i64 short_row_bytes = 256;
+    constexpr u32 alignment_mask  = sizeof(u32) - 1;
     if constexpr (AlignedWords || AlignShortRows) {
       if (AlignedWords || size < short_row_bytes) {
         auto address  = reinterpret_cast<u64>(data + position);
         auto base     = reinterpret_cast<u64>(data);
-        auto aligned  = address & ~u64{3};
-        auto offset   = static_cast<u32>(address & 3U);
-        auto required = offset == 0 ? 8U : 12U;
+        auto aligned  = address & ~u64{alignment_mask};
+        auto offset   = static_cast<u32>(address & alignment_mask);
+        auto required = offset == 0 ? 2U * sizeof(u32) : 3U * sizeof(u32);
         if (aligned >= base && aligned + required <= base + size) {
           auto* aligned_words = reinterpret_cast<u32 const*>(data + (aligned - base));
           auto first_word     = aligned_words[0];
           auto second_word    = aligned_words[1];
           if (offset == 0)
-            return static_cast<u64>(first_word) | (static_cast<u64>(second_word) << 32U);
+            return static_cast<u64>(first_word) |
+                   (static_cast<u64>(second_word) << constants::u32_bits);
           auto third_word = aligned_words[2];
-          auto shift      = offset * 8U;
+          auto shift      = offset * constants::byte_bits;
           return static_cast<u64>(__funnelshift_r(first_word, second_word, shift)) |
-                 (static_cast<u64>(__funnelshift_r(second_word, third_word, shift)) << 32U);
+                 (static_cast<u64>(__funnelshift_r(second_word, third_word, shift))
+                  << constants::u32_bits);
         }
       }
     }
@@ -222,18 +273,18 @@ struct input {
   template <bool AlignedWords = false, bool AlignShortRows = false>
   __device__ __forceinline__ i64 seek(i64 position, u32 needle) const
   {
-    auto repeated = static_cast<u64>(needle) * 0x0101010101010101ULL;
-    while (size - position >= 8) {
+    auto repeated = static_cast<u64>(needle) * constants::packed_byte_ones;
+    while (size - position >= constants::packed_bytes) {
       auto differences = search_word<AlignedWords, AlignShortRows>(position) ^ repeated;
-      auto candidates =
-        (differences - 0x0101010101010101ULL) & ~differences & 0x8080808080808080ULL;
+      auto candidates  = (differences - constants::packed_byte_ones) & ~differences &
+                        constants::packed_byte_high_bits;
       while (candidates) {
-        auto candidate = position + trailing_zeroes(candidates) / 8;
+        auto candidate = position + trailing_zeroes(candidates) / constants::byte_bits;
         // Subtraction can propagate a borrow into a neighboring byte.
         if (byte(candidate) == needle) return candidate;
         candidates &= candidates - 1;
       }
-      position += 8;
+      position += constants::packed_bytes;
     }
     while (position < size && byte(position) != needle)
       ++position;
@@ -250,8 +301,8 @@ __device__ __forceinline__ bool ascii_word(u32 code_point)
 template <bool Extended>
 __device__ __forceinline__ bool newline(u32 code_point)
 {
-  return code_point == 10 || (Extended && (code_point == 13 || code_point == 133 ||
-                                           code_point == 8232 || code_point == 8233));
+  return code_point == U'\n' || (Extended && (code_point == U'\r' || code_point == U'\u0085' ||
+                                              code_point == U'\u2028' || code_point == U'\u2029'));
 }
 
 template <typename Pattern>
@@ -260,7 +311,7 @@ __device__ __forceinline__ bool assertion(
 {
   if (kind == assertion_kind::BEGIN_INPUT) return position == 0;
   if (kind == assertion_kind::END_INPUT) return position == input_value.size;
-  auto mid_crlf = Pattern::extended_newline && before == 13 && current == 10;
+  auto mid_crlf = Pattern::extended_newline && before == U'\r' && current == U'\n';
   if (kind == assertion_kind::WORD_BOUNDARY || kind == assertion_kind::NOT_WORD_BOUNDARY) {
     auto boundary = (position > 0 && Pattern::is_word(before)) !=
                     (position < input_value.size && Pattern::is_word(current));
@@ -274,8 +325,9 @@ __device__ __forceinline__ bool assertion(
   if (Pattern::multiline) return true;
   auto next = position + current_width;
   return next == input_value.size ||
-         (Pattern::extended_newline && current == 13 &&
-          input_value.template decode<Pattern::bytes, Pattern::fused_unicode_decode>(next) == 10 &&
+         (Pattern::extended_newline && current == U'\r' &&
+          input_value.template decode<Pattern::bytes, Pattern::fused_unicode_decode>(next) ==
+            U'\n' &&
           input_value.template advance<Pattern::bytes>(next) == input_value.size);
 }
 
@@ -297,7 +349,8 @@ append(char const* source, i64 begin, i64 end, char* output, i64 cursor)
   auto count = end - begin;
   if (output != nullptr && count > 0) {
     i64 chunk_offset = 0;
-    for (; count - chunk_offset >= 8; chunk_offset += 8) {
+    for (; count - chunk_offset >= constants::packed_bytes;
+         chunk_offset += constants::packed_bytes) {
       auto value  = load_unaligned<u64>(source + begin + chunk_offset);
       auto* bytes = reinterpret_cast<char const*>(&value);
 #pragma unroll
@@ -326,44 +379,49 @@ struct buffered_unicode_input {
   __device__ __forceinline__ input::decoded read(i64 position)
   {
     if (remaining_bytes == 0) {
-      constexpr u64 alignment_mask = 7;
+      constexpr u64 alignment_mask = constants::packed_bytes - 1;
       auto address                 = reinterpret_cast<u64>(input_value.data + position);
       auto aligned_address         = address & ~alignment_mask;
       auto leading_bytes           = static_cast<i32>(address & alignment_mask);
-      auto available_bytes         = 8 - leading_bytes;
+      auto available_bytes         = constants::packed_bytes - leading_bytes;
       if (aligned_address >= reinterpret_cast<u64>(input_value.data) &&
           input_value.size - position >= available_bytes) {
         buffered_bytes = *reinterpret_cast<u64 const*>(aligned_address);
-        buffered_bytes >>= 8U * leading_bytes;
+        buffered_bytes >>= constants::byte_bits * leading_bytes;
         remaining_bytes = available_bytes;
       }
     }
     if (remaining_bytes == 0) { return input_value.read<false, true>(position); }
-    auto first_byte = static_cast<u32>(buffered_bytes & 255U);
-    auto width      = first_byte < 128                         ? 1
-                      : first_byte >= 194 && first_byte <= 223 ? 2
-                      : first_byte >= 224 && first_byte <= 239 ? 3
-                      : first_byte >= 240 && first_byte <= 244 ? 4
-                                                               : 1;
+    auto first_byte = static_cast<u32>(buffered_bytes & constants::byte_mask);
+    auto width =
+      first_byte < constants::ascii_limit                                                  ? 1
+      : first_byte >= utf8::two_byte_lead_min && first_byte <= utf8::two_byte_lead_max     ? 2
+      : first_byte >= utf8::three_byte_lead_min && first_byte <= utf8::three_byte_lead_max ? 3
+      : first_byte >= utf8::four_byte_lead_min && first_byte <= utf8::four_byte_lead_max   ? 4
+                                                                                           : 1;
     if (width > remaining_bytes) {
       remaining_bytes = 0;
       return input_value.read<false, true>(position);
     }
     auto code_point = first_byte;
     if (width > 1) {
-      code_point &= width == 2 ? 31U : width == 3 ? 15U : 7U;
+      code_point &= width == 2   ? utf8::two_byte_payload_mask
+                    : width == 3 ? utf8::three_byte_payload_mask
+                                 : utf8::four_byte_payload_mask;
 #pragma unroll 3
       for (i32 byte_index = 1; byte_index < width; ++byte_index) {
-        auto continuation = static_cast<u32>((buffered_bytes >> (8U * byte_index)) & 255U);
-        if ((continuation & 192U) != 128U) {
+        auto continuation = static_cast<u32>(
+          (buffered_bytes >> (constants::byte_bits * byte_index)) & constants::byte_mask);
+        if ((continuation & utf8::continuation_tag_mask) != utf8::continuation_tag) {
           code_point = first_byte;
           width      = 1;
           break;
         }
-        code_point = (code_point << 6U) | (continuation & 63U);
+        code_point = (code_point << utf8::continuation_bits) |
+                     (continuation & utf8::continuation_payload_mask);
       }
     }
-    buffered_bytes >>= 8U * width;
+    buffered_bytes >>= constants::byte_bits * width;
     remaining_bytes -= width;
     return {code_point, width};
   }
@@ -386,9 +444,9 @@ struct policy {
   static constexpr assertion_kind accept_assertion = assertion_kind::NONE;
   static constexpr i64 fixed_match_bytes           = -1;
   static constexpr u32 initial_state               = 0;
-  static constexpr u32 state_mask                  = 16383;
-  static constexpr u32 dead_state                  = 65535;
-  static constexpr u32 restart_state               = 65535;
+  static constexpr u32 state_mask                  = transition_stop_before_mask - 1;
+  static constexpr u32 dead_state                  = 0xffffU;
+  static constexpr u32 restart_state               = dead_state;
   static constexpr u32 assertion_mask              = 0;
   static constexpr u32 boundary_classes            = 1;
   static constexpr bool start_filter               = false;
@@ -432,8 +490,11 @@ template <typename Pattern>
 __device__ __forceinline__ bool literal_find(input input_value, i64 start, i64& begin, i64& end)
 {
   constexpr i64 hybrid_literal_row_bytes = 256;
+  constexpr i64 hybrid_literal_min_bytes = 8;
+  constexpr i64 hybrid_literal_max_bytes = 16;
   if constexpr (Pattern::kmp && Pattern::hybrid && Pattern::scan_input && !Pattern::require_end &&
-                Pattern::literal_size >= 8 && Pattern::literal_size <= 16) {
+                Pattern::literal_size >= hybrid_literal_min_bytes &&
+                Pattern::literal_size <= hybrid_literal_max_bytes) {
     if (input_value.size >= hybrid_literal_row_bytes) {
       // UTF-8 leading bytes can be common throughout a row. Preserve the generated
       // selective pivot and its verification guard instead of always seeking byte zero.
@@ -457,7 +518,7 @@ __device__ __forceinline__ bool literal_find(input input_value, i64 start, i64& 
     }
   }
   if constexpr (Pattern::kmp) {
-    if (Pattern::pivot < 0 || (Pattern::hybrid && input_value.size >= 256)) {
+    if (Pattern::pivot < 0 || (Pattern::hybrid && input_value.size >= hybrid_literal_row_bytes)) {
       u32 matched = 0;
       for (auto pos = start; pos < input_value.size; ++pos) {
         auto value = input_value.byte(pos);
@@ -574,7 +635,7 @@ __device__ __forceinline__ bool dfa_boolean(input input_value)
     auto code_point = character.code_point;
     if constexpr (!Pattern::assertion_aware && Pattern::prefix >= 0) {
       if ((state & Pattern::state_mask) == (Pattern::initial_state & Pattern::state_mask) &&
-          code_point < 128 && code_point != Pattern::prefix) {
+          code_point < constants::ascii_limit && code_point != Pattern::prefix) {
         pos =
           input_value.template seek<Pattern::aligned_prefix_seek, !Pattern::aligned_prefix_seek>(
             pos + 1, Pattern::prefix);
@@ -732,7 +793,7 @@ __device__ __forceinline__ u64 priority_trim(u64 state)
   auto accepts = state & Pattern::accept_mask;
   if (accepts == 0) return state;
   auto first = trailing_zeroes(accepts);
-  return first == 63 ? state : state & ((u64{1} << (first + 1)) - 1);
+  return first == constants::u64_bit_index_mask ? state : state & ((u64{1} << (first + 1)) - 1);
 }
 
 template <typename Pattern>
@@ -817,13 +878,15 @@ __device__ __forceinline__ i64 scan_ascii_run(input input_value, i64 pos)
   constexpr auto filter = Pattern::run_filter(State);
   if constexpr (filter.kind != ascii_run_kind::GENERAL) {
     // Peel at most seven bytes, then keep every wide load aligned and row-bounded.
-    while (pos < input_value.size && (reinterpret_cast<u64>(input_value.data + pos) & 7U)) {
+    while (pos < input_value.size &&
+           (reinterpret_cast<u64>(input_value.data + pos) & (constants::packed_bytes - 1))) {
       auto code_point = input_value.byte(pos);
-      if (code_point >= 128 || !Pattern::run_predicate(State, code_point)) return pos;
+      if (code_point >= constants::ascii_limit || !Pattern::run_predicate(State, code_point))
+        return pos;
       ++pos;
     }
   }
-  while (input_value.size - pos >= 8) {
+  while (input_value.size - pos >= constants::packed_bytes) {
     u64 characters;
     if constexpr (filter.kind == ascii_run_kind::GENERAL)
       characters = input_value.template search_word<true>(pos);
@@ -832,28 +895,29 @@ __device__ __forceinline__ i64 scan_ascii_run(input input_value, i64 pos)
     }
     bool matched;
     if constexpr (filter.kind != ascii_run_kind::GENERAL) {
-      matched = (characters & 0x8080808080808080ULL) == 0;
+      matched = (characters & constants::packed_byte_high_bits) == 0;
       if constexpr (filter.kind == ascii_run_kind::EXCEPT_BYTE) {
         auto differences =
-          characters ^ (static_cast<u64>(filter.excluded_byte) * 0x0101010101010101ULL);
-        auto candidates =
-          (differences - 0x0101010101010101ULL) & ~differences & 0x8080808080808080ULL;
+          characters ^ (static_cast<u64>(filter.excluded_byte) * constants::packed_byte_ones);
+        auto candidates = (differences - constants::packed_byte_ones) & ~differences &
+                          constants::packed_byte_high_bits;
         matched &= candidates == 0;
       }
     } else {
       matched = true;
 #pragma unroll
-      for (u32 byte_index = 0; byte_index < 8; ++byte_index) {
-        auto code_point = static_cast<u32>((characters >> (byte_index * 8)) & 255U);
-        matched &= code_point < 128 && Pattern::run_predicate(State, code_point);
+      for (u32 byte_index = 0; byte_index < constants::packed_bytes; ++byte_index) {
+        auto code_point = static_cast<u32>((characters >> (byte_index * constants::byte_bits)) &
+                                           constants::byte_mask);
+        matched &= code_point < constants::ascii_limit && Pattern::run_predicate(State, code_point);
       }
     }
     if (!matched) break;
-    pos += 8;
+    pos += constants::packed_bytes;
   }
   while (pos < input_value.size) {
     auto code_point = input_value.byte(pos);
-    if (code_point >= 128 || !Pattern::run_predicate(State, code_point)) break;
+    if (code_point >= constants::ascii_limit || !Pattern::run_predicate(State, code_point)) break;
     ++pos;
   }
   return pos;
@@ -867,13 +931,14 @@ scan_runs(input input_value, i64 pos, StateWord const* current, i64 count)
     auto state = static_cast<u32>(current[0]);
     while (pos < input_value.size) {
       auto code_point = input_value.byte(pos);
-      if (code_point >= 128 || !Pattern::run_predicate(state, code_point)) break;
+      if (code_point >= constants::ascii_limit || !Pattern::run_predicate(state, code_point)) break;
       ++pos;
     }
     return pos;
   }
   if constexpr (Pattern::multi_run) {
-    if (count > 8) return pos;
+    constexpr i64 max_combined_runs = 8;
+    if (count > max_combined_runs) return pos;
     u64 low  = ~u64{0};
     u64 high = ~u64{0};
     for (i64 capture_index = 0; capture_index < count; ++capture_index) {
@@ -889,7 +954,10 @@ scan_runs(input input_value, i64 pos, StateWord const* current, i64 count)
     }
     while (pos < input_value.size) {
       auto code_point = input_value.byte(pos);
-      if (code_point >= 128 || (((code_point < 64 ? low : high) >> (code_point & 63U)) & 1U) == 0)
+      if (code_point >= constants::ascii_limit ||
+          (((code_point < constants::u64_bits ? low : high) >>
+            (code_point & constants::u64_bit_index_mask)) &
+           1U) == 0)
         break;
       ++pos;
     }
@@ -935,7 +1003,7 @@ struct closure {
   {
     target[0] = state;
     if constexpr (Pattern::live_captures > 0) {
-      if constexpr (Pattern::live_captures <= 64) {
+      if constexpr (Pattern::live_captures <= constants::u64_bits) {
         auto live = Pattern::capture_mask(state);
 #pragma unroll
         for (u32 capture_index = 0; capture_index < Pattern::live_captures; ++capture_index)
@@ -962,8 +1030,8 @@ struct closure {
 
   __device__ __forceinline__ void enqueue(u32 state)
   {
-    auto mask  = u64{1} << (state & 63U);
-    auto& word = queued[state / 64];
+    auto mask  = u64{1} << (state & constants::u64_bit_index_mask);
+    auto& word = queued[state / constants::u64_bits];
     if (word & mask) return;
     word |= mask;
     auto* target = next + produced++ * record;
@@ -1010,8 +1078,8 @@ __device__ __forceinline__ bool thompson_run(
       bool expand = true;
       while (expand) {
         auto state = static_cast<u32>(active[0]);
-        auto mask  = u64{1} << (state & 63U);
-        auto& word = seen[state / 64];
+        auto mask  = u64{1} << (state & constants::u64_bit_index_mask);
+        auto& word = seen[state / constants::u64_bits];
         i32 direct = static_cast<i32>(dispatch_status::EXHAUSTED);
         if ((word & mask) == 0) {
           word |= mask;
@@ -1129,10 +1197,12 @@ __device__ __forceinline__ bool find(input input_value,
   } else {
     if (!Pattern::mandatory_present(input_value)) return false;
     if constexpr (Pattern::simple_capture) {
-      if (input_value.size <= 256)
+      constexpr i64 simple_capture_row_bytes = 256;
+      if (input_value.size <= simple_capture_row_bytes)
         return Pattern::simple_capture_find(input_value, search, begin, end, captures);
     }
-    alignas(8) u8 local[(Pattern::external_workspace ? 1 : Pattern::storage_words) * sizeof(i64)];
+    alignas(alignof(i64))
+      u8 local[(Pattern::external_workspace ? 1 : Pattern::storage_words) * sizeof(i64)];
     auto* storage = Pattern::external_workspace ? external : reinterpret_cast<i64*>(local);
     for (auto start = search; start <= input_value.size;) {
       if (start < input_value.size && !Pattern::candidate_byte(input_value.byte(start))) {
@@ -1270,11 +1340,8 @@ __device__ __forceinline__ i64 count(input input_value, i64* workspace, char con
   if constexpr (Pattern::executor == executor_kind::SINGLE_BYTE_LITERAL && Pattern::scan_input &&
                 !Pattern::require_end) {
     auto needle                  = Pattern::literal_byte(0);
-    auto repeated                = static_cast<u64>(needle) * 0x0101010101010101ULL;
-    constexpr u64 byte_low_bits  = 0x7f7f7f7f7f7f7f7fULL;
-    constexpr u64 byte_high_bits = 0x8080808080808080ULL;
-    constexpr i64 packed_bytes   = sizeof(u64);
-    constexpr u64 alignment_mask = packed_bytes - 1;
+    auto repeated                = static_cast<u64>(needle) * constants::packed_byte_ones;
+    constexpr u64 alignment_mask = constants::packed_bytes - 1;
     i64 total                    = 0;
     i64 position                 = 0;
     while (position < input_value.size &&
@@ -1282,14 +1349,16 @@ __device__ __forceinline__ i64 count(input input_value, i64* workspace, char con
       total += input_value.byte(position) == needle;
       ++position;
     }
-    while (input_value.size - position >= packed_bytes) {
+    while (input_value.size - position >= constants::packed_bytes) {
       auto characters  = *reinterpret_cast<u64 const*>(input_value.data + position);
       auto differences = characters ^ repeated;
       // Exact zero-byte detection avoids borrow propagation into neighboring bytes.
       auto matching_bytes =
-        ~(((differences & byte_low_bits) + byte_low_bits) | differences) & byte_high_bits;
+        ~(((differences & constants::packed_byte_low_bits) + constants::packed_byte_low_bits) |
+          differences) &
+        constants::packed_byte_high_bits;
       total += __popcll(matching_bytes);
-      position += packed_bytes;
+      position += constants::packed_bytes;
     }
     while (position < input_value.size) {
       total += input_value.byte(position) == needle;

@@ -1169,6 +1169,9 @@ add_library(
   src/strings/positions.cu
   experimental/libregex_ir/cuda_codegen.cpp
   experimental/libregex_ir/execution_plan.cpp
+  experimental/libregex_ir/lowering.cpp
+  experimental/libregex_ir/optimizer.cpp
+  experimental/libregex_ir/parser.cpp
   experimental/libregex_ir/regex_ir.cpp
   src/strings/experimental/regex_jit/kernel_ir.cpp
   src/strings/experimental/regex_jit/regex.cu

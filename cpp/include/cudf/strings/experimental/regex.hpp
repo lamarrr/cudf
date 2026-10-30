@@ -167,41 +167,97 @@ struct regex_jit_program {
   friend struct regex_jit_program_accessor;
 };
 
-/** @brief Tests whether each input string contains a match. */
+/**
+ * @brief Tests whether each input string contains a match.
+ *
+ * @param input Strings to search.
+ * @param prog Compiled JIT program created for `regex_operation::CONTAINS`.
+ * @param stream CUDA stream used to execute the operation.
+ * @param mr Device memory resource used to allocate the result.
+ * @return A Boolean column with one value per input string; null rows remain null.
+ * @throw cudf::logic_error If `prog` was created for a different operation.
+ */
 std::unique_ptr<column> contains_re(
   strings_column_view const& input,
   regex_jit_program const& prog,
   cuda::stream_ref stream   = cudf::get_default_stream(),
   cudf::memory_resources mr = cudf::get_current_device_resource_ref());
 
-/** @brief Tests whether a match begins at the start of each input string. */
+/**
+ * @brief Tests whether each input string matches from its first character.
+ *
+ * @param input Strings to test.
+ * @param prog Compiled JIT program created for `regex_operation::MATCHES`.
+ * @param stream CUDA stream used to execute the operation.
+ * @param mr Device memory resource used to allocate the result.
+ * @return A Boolean column with one value per input string; null rows remain null.
+ * @throw cudf::logic_error If `prog` was created for a different operation.
+ */
 std::unique_ptr<column> matches_re(
   strings_column_view const& input,
   regex_jit_program const& prog,
   cuda::stream_ref stream   = cudf::get_default_stream(),
   cudf::memory_resources mr = cudf::get_current_device_resource_ref());
 
-/** @brief Counts non-overlapping matches in each input string. */
+/**
+ * @brief Counts non-overlapping matches in each input string.
+ *
+ * @param input Strings to search.
+ * @param prog Compiled JIT program created for `regex_operation::COUNT`.
+ * @param stream CUDA stream used to execute the operation.
+ * @param mr Device memory resource used to allocate the result.
+ * @return An INT32 column containing the match count for each row; null rows remain null.
+ * @throw cudf::logic_error If `prog` was created for a different operation.
+ */
 std::unique_ptr<column> count_re(
   strings_column_view const& input,
   regex_jit_program const& prog,
   cuda::stream_ref stream   = cudf::get_default_stream(),
   cudf::memory_resources mr = cudf::get_current_device_resource_ref());
 
-/** @brief Extracts every capture group into a separate strings column. */
+/**
+ * @brief Extracts the first match's capture groups into separate strings columns.
+ *
+ * @param input Strings to search.
+ * @param prog Compiled JIT program created for `regex_operation::EXTRACT` with capture groups.
+ * @param stream CUDA stream used to execute the operation.
+ * @param mr Device memory resource used to allocate the result.
+ * @return A table with one strings column per capture group.
+ * @throw cudf::logic_error If `prog` was created for a different operation or has no groups.
+ */
 std::unique_ptr<table> extract(strings_column_view const& input,
                                regex_jit_program const& prog,
                                cuda::stream_ref stream   = cudf::get_default_stream(),
                                cudf::memory_resources mr = cudf::get_current_device_resource_ref());
 
-/** @brief Extracts all capture-group records into a lists column. */
+/**
+ * @brief Extracts capture-group records for all matches into a lists column.
+ *
+ * @param input Strings to search.
+ * @param prog Compiled JIT program created for `regex_operation::EXTRACT_ALL_RECORD`.
+ * @param stream CUDA stream used to execute the operation.
+ * @param mr Device memory resource used to allocate the result.
+ * @return A lists column whose rows contain the extracted records.
+ * @throw cudf::logic_error If `prog` was created for a different operation or lacks groups.
+ */
 std::unique_ptr<column> extract_all_record(
   strings_column_view const& input,
   regex_jit_program const& prog,
   cuda::stream_ref stream   = cudf::get_default_stream(),
   cudf::memory_resources mr = cudf::get_current_device_resource_ref());
 
-/** @brief Extracts one capture group into a strings column. */
+/**
+ * @brief Extracts one capture group from the first match in each input string.
+ *
+ * @param input Strings to search.
+ * @param prog Compiled JIT program created for `regex_operation::EXTRACT_SINGLE`.
+ * @param group Zero-based capture-group index selected when creating `prog`.
+ * @param stream CUDA stream used to execute the operation.
+ * @param mr Device memory resource used to allocate the result.
+ * @return A strings column containing the selected group; null rows remain null.
+ * @throw cudf::logic_error If the operation or configured group does not match the arguments.
+ * @throw std::invalid_argument If `group` is outside the program's capture-group range.
+ */
 std::unique_ptr<column> extract_single(
   strings_column_view const& input,
   regex_jit_program const& prog,
@@ -209,21 +265,53 @@ std::unique_ptr<column> extract_single(
   cuda::stream_ref stream   = cudf::get_default_stream(),
   cudf::memory_resources mr = cudf::get_current_device_resource_ref());
 
-/** @brief Finds all non-overlapping matches in each input string. */
+/**
+ * @brief Finds all non-overlapping matches in each input string.
+ *
+ * @param input Strings to search.
+ * @param prog Compiled JIT program created for `regex_operation::FINDALL`.
+ * @param stream CUDA stream used to execute the operation.
+ * @param mr Device memory resource used to allocate the result.
+ * @return A lists column containing each row's matches.
+ * @throw cudf::logic_error If `prog` was created for a different operation.
+ */
 std::unique_ptr<column> findall(
   strings_column_view const& input,
   regex_jit_program const& prog,
   cuda::stream_ref stream   = cudf::get_default_stream(),
   cudf::memory_resources mr = cudf::get_current_device_resource_ref());
 
-/** @brief Finds the starting character position of the first match. */
+/**
+ * @brief Finds the starting character position of the first match.
+ *
+ * @param input Strings to search.
+ * @param prog Compiled JIT program created for `regex_operation::FIND`.
+ * @param stream CUDA stream used to execute the operation.
+ * @param mr Device memory resource used to allocate the result.
+ * @return An INT32 column containing the character position, or -1 when no match is found.
+ * @throw cudf::logic_error If `prog` was created for a different operation.
+ */
 std::unique_ptr<column> find_re(
   strings_column_view const& input,
   regex_jit_program const& prog,
   cuda::stream_ref stream   = cudf::get_default_stream(),
   cudf::memory_resources mr = cudf::get_current_device_resource_ref());
 
-/** @brief Replaces matches using a literal replacement string. */
+/**
+ * @brief Replaces matches using a literal replacement string.
+ *
+ * @param input Strings to transform.
+ * @param prog Compiled JIT program created for `regex_operation::REPLACE`.
+ * @param replacement Literal text inserted for each match.
+ * @param max_replace_count Maximum number of replacements per row, if limited; it must match the
+ *                          limit configured in `prog`.
+ * @param stream CUDA stream used to execute the operation.
+ * @param mr Device memory resource used to allocate the result.
+ * @return A strings column containing the transformed rows.
+ * @throw cudf::logic_error If the operation, replacement, or limit differs from `prog`, or if the
+ *                           replacement scalar is null.
+ * @throw std::overflow_error If the output exceeds the supported column size.
+ */
 std::unique_ptr<column> replace_re(
   strings_column_view const& input,
   regex_jit_program const& prog,
@@ -232,7 +320,19 @@ std::unique_ptr<column> replace_re(
   cuda::stream_ref stream                    = cudf::get_default_stream(),
   cudf::memory_resources mr                  = cudf::get_current_device_resource_ref());
 
-/** @brief Replaces matches using a replacement template containing back-references. */
+/**
+ * @brief Replaces matches using a template containing capture-group back-references.
+ *
+ * @param input Strings to transform.
+ * @param prog Compiled JIT program created for `regex_operation::REPLACE_WITH_BACKREFS`.
+ * @param replacement Replacement template, which must equal the template used to create `prog`.
+ * @param stream CUDA stream used to execute the operation.
+ * @param mr Device memory resource used to allocate the result.
+ * @return A strings column containing the transformed rows.
+ * @throw cudf::logic_error If the operation or replacement differs from `prog`, or validation
+ *                           found an unsupported replacement reference.
+ * @throw std::overflow_error If the output exceeds the supported column size.
+ */
 std::unique_ptr<column> replace_with_backrefs(
   strings_column_view const& input,
   regex_jit_program const& prog,
@@ -240,7 +340,17 @@ std::unique_ptr<column> replace_with_backrefs(
   cuda::stream_ref stream   = cudf::get_default_stream(),
   cudf::memory_resources mr = cudf::get_current_device_resource_ref());
 
-/** @brief Splits strings from the beginning and returns a table. */
+/**
+ * @brief Splits strings from the beginning and returns fields as table columns.
+ *
+ * @param input Strings to split.
+ * @param prog Compiled JIT program created for `regex_operation::SPLIT`.
+ * @param maxsplit Maximum number of splits per row, or -1 for no limit; must match `prog`.
+ * @param stream CUDA stream used to execute the operation.
+ * @param mr Device memory resource used to allocate the result.
+ * @return A table with one strings column per resulting field position.
+ * @throw cudf::logic_error If the operation or split limit differs from `prog`.
+ */
 std::unique_ptr<table> split_re(
   strings_column_view const& input,
   regex_jit_program const& prog,
@@ -248,7 +358,17 @@ std::unique_ptr<table> split_re(
   cuda::stream_ref stream   = cudf::get_default_stream(),
   cudf::memory_resources mr = cudf::get_current_device_resource_ref());
 
-/** @brief Splits strings from the end and returns a table. */
+/**
+ * @brief Splits strings from the end and returns fields as table columns.
+ *
+ * @param input Strings to split.
+ * @param prog Compiled JIT program created for `regex_operation::RSPLIT`.
+ * @param maxsplit Maximum number of splits per row, or -1 for no limit; must match `prog`.
+ * @param stream CUDA stream used to execute the operation.
+ * @param mr Device memory resource used to allocate the result.
+ * @return A table with one strings column per resulting field position.
+ * @throw cudf::logic_error If the operation or split limit differs from `prog`.
+ */
 std::unique_ptr<table> rsplit_re(
   strings_column_view const& input,
   regex_jit_program const& prog,
@@ -256,7 +376,17 @@ std::unique_ptr<table> rsplit_re(
   cuda::stream_ref stream   = cudf::get_default_stream(),
   cudf::memory_resources mr = cudf::get_current_device_resource_ref());
 
-/** @brief Splits strings from the beginning and returns a lists column. */
+/**
+ * @brief Splits strings from the beginning and returns each row's fields in a list.
+ *
+ * @param input Strings to split.
+ * @param prog Compiled JIT program created for `regex_operation::SPLIT_RECORD`.
+ * @param maxsplit Maximum number of splits per row, or -1 for no limit; must match `prog`.
+ * @param stream CUDA stream used to execute the operation.
+ * @param mr Device memory resource used to allocate the result.
+ * @return A lists column containing each row's split fields.
+ * @throw cudf::logic_error If the operation or split limit differs from `prog`.
+ */
 std::unique_ptr<column> split_record_re(
   strings_column_view const& input,
   regex_jit_program const& prog,
@@ -264,7 +394,17 @@ std::unique_ptr<column> split_record_re(
   cuda::stream_ref stream   = cudf::get_default_stream(),
   cudf::memory_resources mr = cudf::get_current_device_resource_ref());
 
-/** @brief Splits strings from the end and returns a lists column. */
+/**
+ * @brief Splits strings from the end and returns each row's fields in a list.
+ *
+ * @param input Strings to split.
+ * @param prog Compiled JIT program created for `regex_operation::RSPLIT_RECORD`.
+ * @param maxsplit Maximum number of splits per row, or -1 for no limit; must match `prog`.
+ * @param stream CUDA stream used to execute the operation.
+ * @param mr Device memory resource used to allocate the result.
+ * @return A lists column containing each row's split fields.
+ * @throw cudf::logic_error If the operation or split limit differs from `prog`.
+ */
 std::unique_ptr<column> rsplit_record_re(
   strings_column_view const& input,
   regex_jit_program const& prog,

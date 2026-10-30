@@ -11,22 +11,33 @@
 namespace cudf::experimental::detail::regex_jit::device {
 using namespace regex_ir::device;
 
+inline constexpr i32 max_i32 = 0x7fffffff;
+
 struct worker {
-  i32 index = threadIdx.x + blockDim.x * blockIdx.x;
+  i32 index;
   i32 end;
   char* workspace;
 
-  __device__ worker(char* scratch       = nullptr,
+  __device__ worker(i32 worker_index,
+                    char* scratch       = nullptr,
                     i32 begin           = 0,
-                    i32 limit           = 2147483647,
+                    i32 limit           = max_i32,
                     i64 workspace_bytes = 0)
-    : end(limit), workspace(scratch == nullptr ? nullptr : scratch + i64(index) * workspace_bytes)
+    : index(worker_index),
+      end(limit),
+      workspace(scratch == nullptr ? nullptr : scratch + i64(worker_index) * workspace_bytes)
   {
     index += begin;
   }
 
   __device__ bool active(i32 rows) const { return index < rows && index < end; }
 };
+
+__device__ inline void store_size(void* output, i32 row, i64 size, i32* overflow)
+{
+  if (size > max_i32) atomicMax(overflow, 1);
+  static_cast<i32*>(output)[row] = static_cast<i32>(size);
+}
 
 template <typename Offset>
 struct column {
@@ -38,8 +49,10 @@ struct column {
 
   __device__ bool valid(i32 row) const
   {
-    auto physical = row + row_offset;
-    return mask == nullptr || (mask[physical / 32] & (1u << (physical % 32)));
+    constexpr i32 mask_word_bits = 32;
+    auto physical                = row + row_offset;
+    return mask == nullptr ||
+           (mask[physical / mask_word_bits] & (1u << (physical % mask_word_bits)));
   }
 
   __device__ input load(i32 row) const
@@ -68,15 +81,17 @@ __device__ inline i64 advance(input input_value, i64 pos)
 
 __device__ inline i32 character_index(input input_value, i64 byte_offset)
 {
-  i32 count          = 0;
-  i64 position       = 0;
-  auto aligned_input = (reinterpret_cast<u64>(input_value.data) & 7U) == 0;
-  while (byte_offset - position >= 8) {
+  constexpr i64 packed_bytes    = sizeof(u64);
+  constexpr u64 ascii_high_bits = 0x8080808080808080ULL;
+  i32 count                     = 0;
+  i64 position                  = 0;
+  auto aligned_input = (reinterpret_cast<u64>(input_value.data) & (packed_bytes - 1)) == 0;
+  while (byte_offset - position >= packed_bytes) {
     auto characters = aligned_input ? *reinterpret_cast<u64 const*>(input_value.data + position)
                                     : load_unaligned<u64>(input_value.data + position);
-    if ((characters & 0x8080808080808080ULL) != 0) break;
-    position += 8;
-    count += 8;
+    if ((characters & ascii_high_bits) != 0) break;
+    position += packed_bytes;
+    count += packed_bytes;
   }
   // Keep the existing character-width behavior after the first non-ASCII block.
   for (; position < byte_offset; position = advance(input_value, position))
@@ -223,7 +238,8 @@ template <typename Matcher, bool Emit, typename OutOffset, typename Column>
 __device__ void replace(worker worker_state,
                         Column strings,
                         void* output,
-                        OutOffset const* offsets = nullptr)
+                        OutOffset const* offsets = nullptr,
+                        i32* size_overflow       = nullptr)
 {
   if (!worker_state.active(strings.rows)) return;
   auto row = worker_state.index;
@@ -241,7 +257,7 @@ __device__ void replace(worker worker_state,
       auto input_value = strings.load(row);
       size = Matcher::call(worker_state.workspace, input_value.data, input_value.size, nullptr);
     }
-    static_cast<i32*>(output)[row] = i32(size);
+    store_size(output, row, size, size_overflow);
   }
 }
 
@@ -296,8 +312,7 @@ __device__ void limited_replace(worker worker_state,
     cursor = append(input_value.data, copied, input_value.size, destination, cursor);
   }
   if constexpr (!Emit) {
-    static_cast<i32*>(output)[row] = i32(cursor);
-    if (cursor > 2147483647) atomicMax(size_overflow, 1);
+    store_size(output, row, cursor, size_overflow);
     if constexpr (Cache) counts[row] = count;
   }
 }
@@ -396,8 +411,11 @@ __device__ void sample(worker worker_state, Column strings, i32 samples, i32 cap
 template <typename Pattern, typename Column>
 __device__ void warp_literal(Column strings, char* output)
 {
-  i32 lane = threadIdx.x % 32;
-  i32 row  = (threadIdx.x + blockDim.x * blockIdx.x) / 32;
+  constexpr i32 warp_size           = 32;
+  constexpr u32 full_warp_mask      = 0xffffffffu;
+  constexpr i32 candidates_per_lane = 4;
+  i32 lane                          = threadIdx.x % warp_size;
+  i32 row                           = (threadIdx.x + blockDim.x * blockIdx.x) / warp_size;
   if (row >= strings.rows) return;
   bool found = false;
   if (strings.valid(row)) {
@@ -406,8 +424,8 @@ __device__ void warp_literal(Column strings, char* output)
     i64 last         = input_value.size - Pattern::size;
     bool first_round = true;
     while (base <= last) {
-      auto lane_position = base + (first_round ? lane : lane * 4);
-      auto candidates    = first_round ? 1 : 4;
+      auto lane_position = base + (first_round ? lane : lane * candidates_per_lane);
+      auto candidates    = first_round ? 1 : candidates_per_lane;
       bool hit           = false;
 #pragma unroll 1
       for (i32 candidate_index = 0; candidate_index < candidates; ++candidate_index) {
@@ -419,11 +437,11 @@ __device__ void warp_literal(Column strings, char* output)
           break;
         }
       }
-      if (__any_sync(0xffffffffu, hit)) {
+      if (__any_sync(full_warp_mask, hit)) {
         found = true;
         break;
       }
-      base += first_round ? 32 : 128;
+      base += first_round ? warp_size : warp_size * candidates_per_lane;
       first_round = false;
     }
   }

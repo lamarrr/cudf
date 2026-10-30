@@ -186,6 +186,14 @@ void build_assertion_start_byte_filter(deterministic_machine& machine)
       machine.dead_state > machine.state_mask) {
     return;
   }
+  auto first_boundary =
+    machine.boundary_accepts.begin() + machine.initial_state * machine.boundary_class_count;
+  // A nullable match can succeed before a byte that cannot start a consuming path.
+  if (std::any_of(first_boundary, first_boundary + machine.boundary_class_count, [](auto accepts) {
+        return accepts != 0;
+      })) {
+    return;
+  }
   std::size_t candidates        = 0;
   auto previous_ascii_candidate = false;
   for (std::size_t byte = 0; byte < machine.byte_classes.size(); ++byte) {
@@ -439,6 +447,89 @@ std::optional<std::vector<std::uint32_t>> make_deterministic_alphabet(
   return representatives;
 }
 
+bool has_unique_assertion_match_end(instruction_ir const& ir, deterministic_nfa_graph const& graph)
+{
+  // Without multiline matching, $ accepts only at EOF or before the final newline.
+  // If no consuming node matches a newline, a single candidate start cannot reach
+  // both positions. Branch priority then cannot change the observable match span.
+  auto line_end_is_unique =
+    !ir.options.multiline &&
+    std::none_of(graph.nodes.begin(), graph.nodes.end(), [&](auto const& node) {
+      return node.consumes &&
+             (node.predicate.matches(U'\n') ||
+              (ir.options.extended_newline &&
+               (node.predicate.matches(U'\r') || node.predicate.matches(U'\u0085') ||
+                node.predicate.matches(U'\u2028') || node.predicate.matches(U'\u2029'))));
+    });
+  std::vector<bool> visited(graph.nodes.size());
+  std::vector<std::size_t> pending{graph.entry};
+  while (!pending.empty()) {
+    auto index = pending.back();
+    pending.pop_back();
+    if (visited[index]) continue;
+    visited[index]   = true;
+    auto const& node = graph.nodes[index];
+    if (node.assertion == assertion_kind::END_INPUT ||
+        (line_end_is_unique && node.assertion == assertion_kind::END_LINE)) {
+      continue;
+    }
+    if (node.accepts) return false;
+    pending.insert(pending.end(), node.targets.begin(), node.targets.end());
+  }
+  return true;
+}
+
+bool has_unambiguous_branch_priorities(deterministic_nfa_graph const& graph,
+                                       std::vector<std::uint32_t> const& representatives)
+{
+  struct first_set {
+    std::vector<std::uint8_t> matches;
+    bool nullable = false;
+  };
+
+  auto collect_first_set = [&](std::size_t start) {
+    first_set result;
+    result.matches.resize(representatives.size(), 0);
+    std::vector<std::size_t> pending{start};
+    std::vector<bool> visited(graph.nodes.size(), false);
+    while (!pending.empty()) {
+      auto index = pending.back();
+      pending.pop_back();
+      if (index >= graph.nodes.size() || visited[index]) continue;
+      visited[index] = true;
+
+      auto const& node = graph.nodes[index];
+      if (node.accepts) result.nullable = true;
+      if (node.consumes) {
+        for (std::size_t character_index = 0; character_index < representatives.size();
+             ++character_index) {
+          auto code_point = static_cast<char32_t>(representatives[character_index]);
+          if (node.predicate.matches(code_point)) { result.matches[character_index] = 1; }
+        }
+        continue;
+      }
+      pending.insert(pending.end(), node.targets.begin(), node.targets.end());
+    }
+    return result;
+  };
+
+  for (auto const& node : graph.nodes) {
+    if (node.targets.size() < 2U) continue;
+
+    std::vector<std::uint8_t> earlier(representatives.size());
+    for (std::size_t branch_index = 0; branch_index < node.targets.size(); ++branch_index) {
+      auto first = collect_first_set(node.targets[branch_index]);
+      // An earlier empty alternative can win before a later consuming branch.
+      if (first.nullable && branch_index + 1U < node.targets.size()) return false;
+      for (std::size_t i = 0; i < representatives.size(); ++i) {
+        if (earlier[i] && first.matches[i]) return false;
+        earlier[i] |= first.matches[i];
+      }
+    }
+  }
+  return true;
+}
+
 std::optional<glushkov_machine> make_glushkov_machine(instruction_ir const& ir, bool scan_input)
 {
   auto graph = make_deterministic_graph(ir);
@@ -623,6 +714,11 @@ std::optional<deterministic_machine> make_assertion_deterministic_machine(
 
   auto representatives = make_deterministic_alphabet(graph.nodes, machine);
   if (!representatives) return std::nullopt;
+  // The assertion DFA does not retain prioritized threads. A unique possible end
+  // makes branch order irrelevant to spans; otherwise require disjoint first sets.
+  if (ir.control.result != result_shape::BOOLEAN && !has_unique_assertion_match_end(ir, graph) &&
+      !has_unambiguous_branch_priorities(graph, *representatives))
+    return std::nullopt;
 
   struct assertion_closure {
     std::vector<std::size_t> consumers = std::vector<std::size_t>{};
@@ -1906,11 +2002,8 @@ void execution_plan::select()
     if (streaming_span_result && !glushkov_.has_value()) {
       deterministic_ = make_deterministic_machine(ir_, false, true);
     }
-    // This assertion machine records longest matches, so keep priority-sensitive syntax on the
-    // ordered executor until assertion closures carry branch-priority metadata.
-    auto assertion_candidate = !boolean_result && !deterministic_.has_value() &&
-                               !uses_capture_buffer() && !ir_.has_alternation &&
-                               ir_.pattern.find('?') == std::string::npos;
+    auto assertion_candidate =
+      !boolean_result && !deterministic_.has_value() && !uses_capture_buffer();
     auto keep_prefix_count =
       ir_.control.result == result_shape::MATCH_COUNT && required_ascii_prefix().has_value();
     if (assertion_candidate && !keep_prefix_count) {

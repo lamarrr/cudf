@@ -12,8 +12,12 @@ notes:
 
 - `regex_ir.hpp`: public compiler API and generated-code metadata
 - `regex_ir_detail.hpp`: private compiler intermediate representations and passes
-- `regex_ir.cpp`: parser and compiler passes
+- `regex_ir.cpp`: compiler pipeline and public entry point
+- `parser.cpp`: parser, private AST, predicates, and Thompson automata construction
+- `lowering.cpp`: automata-to-instruction lowering, replacement parsing, and instruction validation
+- `optimizer.cpp`: instruction optimization passes and their private helpers
 - `regex_ir_unicode.hpp`: attributed Unicode predicate tables
+- `regex_ir_case_mapping.hpp`: generated Unicode 15.0.0 simple case mappings
 - `execution_plan.hpp` / `execution_plan.cpp`: private plan types, executor selection,
   machine construction, and bounded workspace analysis
 - `cuda_codegen.hpp` / `cuda_codegen.cpp`: source-generation interface and CUDA emission
@@ -24,6 +28,11 @@ notes:
 
 The implementation includes its private header directly; no implementation
 macro changes the declarations exposed by `regex_ir.hpp`.
+
+The parser and Thompson builder share an AST that stays local to `parser.cpp`.
+The compiler stages exchange the private automata and instruction IRs through
+`regex_ir_detail.hpp`; the same header carries compilation diagnostics to the
+public entry point for formatting.
 
 The private libcudf integration, kernel wrappers, and compiled layout adapter
 live in `cpp/src/strings/experimental/regex_jit`.

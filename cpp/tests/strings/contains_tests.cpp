@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <array>
+#include <initializer_list>
 #include <ranges>
 #include <span>
 #include <type_traits>
@@ -53,6 +54,100 @@ TEST_F(RegexJitProgramTest, MetadataAndOperationValidation)
   auto input = cudf::test::strings_column_wrapper({"a"});
   EXPECT_THROW(cudf::experimental::contains_re(cudf::strings_column_view{input}, *program),
                cudf::logic_error);
+}
+
+TEST_F(RegexJitProgramTest, NullableAlternationDoesNotJoinSuccessiveBranches)
+{
+  auto input = cudf::test::strings_column_wrapper({"abcdefgh"});
+  auto prog  = cudf::experimental::regex_jit_program::create(
+    "a(bc|de|fg|)h", cudf::experimental::regex_operation::CONTAINS);
+  auto results = cudf::experimental::contains_re(cudf::strings_column_view{input}, *prog);
+  cudf::test::fixed_width_column_wrapper<bool> expected({false});
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*results, expected);
+}
+
+TEST_F(RegexJitProgramTest, PrioritySensitivePatternsPreserveMatchSpan)
+{
+  auto verify_matches = [](std::string_view pattern,
+                           char const* input_value,
+                           cudf::test::lists_column_wrapper<cudf::string_view> const& expected,
+                           cudf::strings::regex_flags flags = cudf::strings::regex_flags::DEFAULT) {
+    auto input = cudf::test::strings_column_wrapper({input_value});
+    auto prog =
+      cudf::experimental::regex_jit_program::create(pattern,
+                                                    cudf::experimental::regex_operation::FINDALL,
+                                                    {},
+                                                    flags,
+                                                    cudf::strings::capture_groups::NON_CAPTURE);
+    auto matches = cudf::experimental::findall(cudf::strings_column_view{input}, *prog);
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(matches->view(), expected);
+  };
+
+  using LCW = cudf::test::lists_column_wrapper<cudf::string_view>;
+  verify_matches(R"(\ba*(ab)*)", "aab", LCW({LCW{"aa", ""}}));
+  verify_matches(R"(\ba{0,1}(ab){0,1})", "ab", LCW({LCW{"a", ""}}));
+  verify_matches(R"((?:a|\n)*?$)", "a\n", LCW({LCW{"a", "", ""}}));
+  verify_matches(R"((?:a|\n)*$)", "a\n", LCW({LCW{"a\n", ""}}));
+  verify_matches(R"((?:a|a\nb)$)", "a\nb", LCW({LCW{"a"}}), cudf::strings::regex_flags::MULTILINE);
+}
+
+TYPED_TEST(StringsContainsTests, IgnoreCaseSimpleMappings)
+{
+  // Preserve the existing one-code-point case mapping, including dotted capital I.
+  auto input = cudf::test::strings_column_wrapper(
+    {"İ", "i", "I", "ı", "K", "k", "K", "S", "s", "ſ", "ǅ", "ǆ", "Ǆ"});
+  auto view  = cudf::strings_column_view(input);
+  auto check = [&](std::string_view pattern, std::initializer_list<bool> values) {
+    auto program = TypeParam::create(cudf::experimental::regex_operation::CONTAINS,
+                                     pattern,
+                                     cudf::strings::regex_flags::IGNORECASE);
+    auto actual  = TypeParam::contains_re(view, *program);
+    cudf::test::fixed_width_column_wrapper<bool> expected(values.begin(), values.end());
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(*actual, expected);
+  };
+  check("İ", {1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+  check("I", {0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+  check("K", {0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0});
+  check("S", {0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0});
+  check("ǅ", {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0});
+}
+
+TYPED_TEST(StringsContainsTests, PrioritySensitiveFindStarts)
+{
+  auto input =
+    cudf::test::strings_column_wrapper({"aab", "ab", "!aab", "foo", " foo baz ", "!!", ""});
+  auto view = cudf::strings_column_view(input);
+  cudf::test::fixed_width_column_wrapper<cudf::size_type> expected({0, 0, 1, 0, 1, -1, -1});
+  for (auto pattern : {R"(\ba*(ab)*)", R"(\ba{0,1}(ab){0,1})", R"(\ba*\b)"}) {
+    auto program = TypeParam::create(cudf::experimental::regex_operation::FIND, pattern);
+    auto actual  = TypeParam::find_re(view, *program);
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(*actual, expected);
+  }
+}
+
+TYPED_TEST(StringsContainsTests, PrioritySensitiveEndAnchors)
+{
+  auto input = cudf::test::strings_column_wrapper(
+    {"aab", "!ab", "ab\n", "ab\nab", "ab\nx", "", "\n", "ab\r\n", "ab"});
+  auto view   = cudf::strings_column_view(input);
+  using flags = cudf::strings::regex_flags;
+  for (auto pattern : {R"((?:a|aa)*ab$)", R"((?:a|aa)*?ab$)"}) {
+    for (auto mode : {flags::DEFAULT,
+                      flags::MULTILINE,
+                      flags::EXT_NEWLINE,
+                      static_cast<flags>(flags::MULTILINE | flags::EXT_NEWLINE)}) {
+      auto multiline = (mode & flags::MULTILINE) != flags::DEFAULT;
+      auto extended  = (mode & flags::EXT_NEWLINE) != flags::DEFAULT;
+      cudf::test::fixed_width_column_wrapper<cudf::size_type> starts(
+        {0, 1, 0, multiline ? 0 : 3, multiline ? 0 : -1, -1, -1, extended ? 0 : -1, 0});
+      cudf::test::fixed_width_column_wrapper<cudf::size_type> counts(
+        {1, 1, 1, multiline ? 2 : 1, multiline ? 1 : 0, 0, 0, extended ? 1 : 0, 1});
+      auto find  = TypeParam::create(cudf::experimental::regex_operation::FIND, pattern, mode);
+      auto count = TypeParam::create(cudf::experimental::regex_operation::COUNT, pattern, mode);
+      CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(*TypeParam::find_re(view, *find), starts);
+      CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(*TypeParam::count_re(view, *count), counts);
+    }
+  }
 }
 
 TYPED_TEST(StringsContainsTests, ContainsTest)
@@ -1065,6 +1160,51 @@ TYPED_TEST(StringsContainsTests, IgnoreCase)
   CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(*results, expected);
 }
 
+TEST_F(RegexJitProgramTest, IgnoreCaseCharacterClassRanges)
+{
+  // The interpreter retains the old range semantics; these exercise the JIT correction.
+  auto input = cudf::test::strings_column_wrapper(
+    {"à", "ÿ", "Ÿ", "Ā", "ł", "W", "w", "Z", "z", "A", "a", "C", "c", "D", "!", "b", "z"});
+  auto view = cudf::strings_column_view(input);
+
+  auto check = [&](std::string_view pattern, std::initializer_list<bool> expected_values) {
+    auto program =
+      cudf::test::jit_regex_backend::create(cudf::experimental::regex_operation::CONTAINS,
+                                            pattern,
+                                            cudf::strings::regex_flags::IGNORECASE);
+    auto results = cudf::test::jit_regex_backend::contains_re(view, *program);
+    cudf::test::fixed_width_column_wrapper<bool> expected(expected_values.begin(),
+                                                          expected_values.end());
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(*results, expected);
+  };
+
+  check("[À-ÿ]", {1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+  check("[W-c]", {0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1});
+  check("[!-a]", {0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1});
+  check(R"([\x41-\x5A])", {0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1});
+}
+
+TEST_F(RegexJitProgramTest, AsciiWhitespaceBoundaries)
+{
+  // The interpreter retains the old range semantics; these exercise the JIT correction.
+  auto input = cudf::test::strings_column_wrapper({"\x1b", " ", "\t", "\n", "\x0e", "\x1f"});
+  auto view  = cudf::strings_column_view(input);
+  auto flags = cudf::strings::regex_flags::ASCII;
+
+  auto whitespace = cudf::test::jit_regex_backend::create(
+    cudf::experimental::regex_operation::COUNT, R"(\s)", flags);
+  auto results = cudf::test::jit_regex_backend::count_re(view, *whitespace);
+  cudf::test::fixed_width_column_wrapper<cudf::size_type> whitespace_expected({0, 1, 1, 1, 0, 0});
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(*results, whitespace_expected);
+
+  auto non_whitespace = cudf::test::jit_regex_backend::create(
+    cudf::experimental::regex_operation::COUNT, R"(\S)", flags);
+  results = cudf::test::jit_regex_backend::count_re(view, *non_whitespace);
+  cudf::test::fixed_width_column_wrapper<cudf::size_type> non_whitespace_expected(
+    {1, 0, 0, 0, 1, 1});
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(*results, non_whitespace_expected);
+}
+
 TYPED_TEST(StringsContainsTests, MediumRegex)
 {
   // This results in 95 regex instructions and falls in the 'medium' range.
@@ -1337,25 +1477,19 @@ TYPED_TEST(StringsContainsTests, AlternationNullableBranch)
 {
   // "a(bc|de|fg|)h" has an explicit empty branch that makes 'h' directly reachable after 'a'.
   auto input = cudf::test::strings_column_wrapper(
-    {"ah", "abch", "adeh", "afghh", "abcde", "a", "h", "", "abcdefgh", "xabchx"});
+    {"ah", "abch", "adeh", "afghh", "abcde", "a", "h", "", "xabchx"});
   auto sv = cudf::strings_column_view(input);
 
   auto prog = TypeParam::create(cudf::experimental::regex_operation::CONTAINS, "a(bc|de|fg|)h");
-  // The interpreter currently accepts "abcdefgh" by continuing through successive alternatives.
-  // Regex IR retains standard contiguous-alternation semantics for that row.
-  auto constexpr concatenated_alternatives_match =
-    std::is_same_v<TypeParam, cudf::test::interpreter_regex_backend> ? 1 : 0;
   {
     auto results = TypeParam::contains_re(sv, *prog);
-    cudf::test::fixed_width_column_wrapper<bool> expected(
-      {1, 1, 1, 1, 0, 0, 0, 0, concatenated_alternatives_match, 1});
+    cudf::test::fixed_width_column_wrapper<bool> expected({1, 1, 1, 1, 0, 0, 0, 0, 1});
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(*results, expected);
   }
   prog = TypeParam::create(cudf::experimental::regex_operation::COUNT, "a(bc|de|fg|)h");
   {
     auto results = TypeParam::count_re(sv, *prog);
-    cudf::test::fixed_width_column_wrapper<int32_t> expected(
-      {1, 1, 1, 1, 0, 0, 0, 0, concatenated_alternatives_match, 1});
+    cudf::test::fixed_width_column_wrapper<int32_t> expected({1, 1, 1, 1, 0, 0, 0, 0, 1});
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(*results, expected);
   }
 }

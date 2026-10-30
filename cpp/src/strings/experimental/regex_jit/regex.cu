@@ -13,6 +13,7 @@
 #include <cudf/detail/device_scalar.hpp>
 #include <cudf/detail/iterator.cuh>
 #include <cudf/detail/null_mask.hpp>
+#include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/utilities/cuda_memcpy.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/strings/detail/char_tables.hpp>
@@ -560,6 +561,10 @@ struct cached_split_writer {
     }
   }
 };
+}  // namespace
+
+namespace detail {
+
 std::unique_ptr<column> fixed_result(strings_column_view const& input,
                                      regex_jit_program const& prog,
                                      data_type output_type,
@@ -1154,7 +1159,7 @@ std::unique_ptr<table> split_table_impl(strings_column_view const& input,
   }
   return std::make_unique<table>(std::move(columns));
 }
-}  // namespace
+}  // namespace detail
 
 retained_kernel const& regex_jit_program_accessor::kernel(regex_jit_program const& prog,
                                                           kernel_role role,
@@ -1205,14 +1210,14 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
       CUDF_EXPECTS(program_options.replacement.has_value(),
                    "replace_with_backrefs requires a replacement in regex_jit_program_options");
     }
-    auto replacement      = literal_replacement(replacement_text);
+    auto replacement      = detail::literal_replacement(replacement_text);
     auto validation_error = std::optional<std::string>{};
     if (native_replace && operation == regex_operation::REPLACE_WITH_BACKREFS) {
       try {
-        replacement = parse_backref_replacement(replacement_text, std::nullopt);
+        replacement = detail::parse_backref_replacement(replacement_text, std::nullopt);
       } catch (cudf::logic_error const& error) {
         validation_error = error.what();
-        replacement      = literal_replacement("");
+        replacement      = detail::literal_replacement("");
         native_replace   = false;
       }
     }
@@ -1230,7 +1235,7 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
         if (operation != regex_operation::REPLACE_WITH_BACKREFS) { throw; }
         auto fallback = regex_ir::compile(compile_pattern, internal, std::nullopt, compile_options);
         validation_error = error.what();
-        replacement      = literal_replacement("");
+        replacement      = detail::literal_replacement("");
         native_replace   = false;
         return fallback;
       }
@@ -1239,10 +1244,10 @@ regex_jit_program::regex_jit_program(std::string_view pattern,
     if (!native_replace && operation == regex_operation::REPLACE_WITH_BACKREFS &&
         !validation_error.has_value()) {
       try {
-        replacement = parse_backref_replacement(replacement_text, capture_count);
+        replacement = detail::parse_backref_replacement(replacement_text, capture_count);
       } catch (cudf::logic_error const& error) {
         validation_error = error.what();
-        replacement      = literal_replacement("");
+        replacement      = detail::literal_replacement("");
       }
     }
     auto executor            = compiled.executor;
@@ -1532,8 +1537,9 @@ std::unique_ptr<column> contains_re(strings_column_view const& input,
                                     cuda::stream_ref stream,
                                     cudf::memory_resources mr)
 {
+  CUDF_FUNC_RANGE();
   expect_operation(prog, regex_operation::CONTAINS, "contains_re");
-  return fixed_result(input, prog, data_type{type_id::BOOL8}, stream, mr);
+  return detail::fixed_result(input, prog, data_type{type_id::BOOL8}, stream, mr);
 }
 
 std::unique_ptr<column> matches_re(strings_column_view const& input,
@@ -1541,8 +1547,9 @@ std::unique_ptr<column> matches_re(strings_column_view const& input,
                                    cuda::stream_ref stream,
                                    cudf::memory_resources mr)
 {
+  CUDF_FUNC_RANGE();
   expect_operation(prog, regex_operation::MATCHES, "matches_re");
-  return fixed_result(input, prog, data_type{type_id::BOOL8}, stream, mr);
+  return detail::fixed_result(input, prog, data_type{type_id::BOOL8}, stream, mr);
 }
 
 std::unique_ptr<column> count_re(strings_column_view const& input,
@@ -1550,8 +1557,9 @@ std::unique_ptr<column> count_re(strings_column_view const& input,
                                  cuda::stream_ref stream,
                                  cudf::memory_resources mr)
 {
+  CUDF_FUNC_RANGE();
   expect_operation(prog, regex_operation::COUNT, "count_re");
-  return fixed_result(input, prog, data_type{type_id::INT32}, stream, mr);
+  return detail::fixed_result(input, prog, data_type{type_id::INT32}, stream, mr);
 }
 
 std::unique_ptr<column> find_re(strings_column_view const& input,
@@ -1559,8 +1567,9 @@ std::unique_ptr<column> find_re(strings_column_view const& input,
                                 cuda::stream_ref stream,
                                 cudf::memory_resources mr)
 {
+  CUDF_FUNC_RANGE();
   expect_operation(prog, regex_operation::FIND, "find_re");
-  return fixed_result(input, prog, data_type{type_id::INT32}, stream, mr);
+  return detail::fixed_result(input, prog, data_type{type_id::INT32}, stream, mr);
 }
 
 std::unique_ptr<table> extract(strings_column_view const& input,
@@ -1568,8 +1577,9 @@ std::unique_ptr<table> extract(strings_column_view const& input,
                                cuda::stream_ref stream,
                                cudf::memory_resources mr)
 {
+  CUDF_FUNC_RANGE();
   expect_operation(prog, regex_operation::EXTRACT, "extract");
-  return extract_impl(input, prog, stream, mr);
+  return detail::extract_impl(input, prog, stream, mr);
 }
 
 std::unique_ptr<column> extract_single(strings_column_view const& input,
@@ -1578,6 +1588,7 @@ std::unique_ptr<column> extract_single(strings_column_view const& input,
                                        cuda::stream_ref stream,
                                        cudf::memory_resources mr)
 {
+  CUDF_FUNC_RANGE();
   expect_operation(prog, regex_operation::EXTRACT_SINGLE, "extract_single");
   auto& options = regex_jit_program_accessor::options(prog);
   CUDF_EXPECTS(options.group == group,
@@ -1586,7 +1597,7 @@ std::unique_ptr<column> extract_single(strings_column_view const& input,
   CUDF_EXPECTS(group >= 0 && group < prog.groups_count(),
                "group parameter outside the range of capture groups found in the regex pattern",
                std::invalid_argument);
-  return extract_single_impl(input, prog, stream, mr);
+  return detail::extract_single_impl(input, prog, stream, mr);
 }
 
 std::unique_ptr<column> extract_all_record(strings_column_view const& input,
@@ -1594,8 +1605,9 @@ std::unique_ptr<column> extract_all_record(strings_column_view const& input,
                                            cuda::stream_ref stream,
                                            cudf::memory_resources mr)
 {
+  CUDF_FUNC_RANGE();
   expect_operation(prog, regex_operation::EXTRACT_ALL_RECORD, "extract_all_record");
-  return enumerate_impl(input, prog, stream, mr);
+  return detail::enumerate_impl(input, prog, stream, mr);
 }
 
 std::unique_ptr<column> findall(strings_column_view const& input,
@@ -1603,8 +1615,9 @@ std::unique_ptr<column> findall(strings_column_view const& input,
                                 cuda::stream_ref stream,
                                 cudf::memory_resources mr)
 {
+  CUDF_FUNC_RANGE();
   expect_operation(prog, regex_operation::FINDALL, "findall");
-  return enumerate_impl(input, prog, stream, mr);
+  return detail::enumerate_impl(input, prog, stream, mr);
 }
 
 std::unique_ptr<column> replace_re(strings_column_view const& input,
@@ -1614,6 +1627,7 @@ std::unique_ptr<column> replace_re(strings_column_view const& input,
                                    cuda::stream_ref stream,
                                    cudf::memory_resources mr)
 {
+  CUDF_FUNC_RANGE();
   expect_operation(prog, regex_operation::REPLACE, "replace_re");
   CUDF_EXPECTS(replacement.is_valid(stream), "Parameter replacement must be valid");
   auto& options = regex_jit_program_accessor::options(prog);
@@ -1621,7 +1635,7 @@ std::unique_ptr<column> replace_re(strings_column_view const& input,
                "replace_re replacement does not match the regex_jit_program replacement");
   CUDF_EXPECTS(options.max_replace_count == max_replace_count,
                "replace_re max_replace_count does not match the regex_jit_program limit");
-  return replace_impl(input, prog, stream, mr);
+  return detail::replace_impl(input, prog, stream, mr);
 }
 
 std::unique_ptr<column> replace_with_backrefs(strings_column_view const& input,
@@ -1630,6 +1644,7 @@ std::unique_ptr<column> replace_with_backrefs(strings_column_view const& input,
                                               cuda::stream_ref stream,
                                               cudf::memory_resources mr)
 {
+  CUDF_FUNC_RANGE();
   expect_operation(prog, regex_operation::REPLACE_WITH_BACKREFS, "replace_with_backrefs");
   CUDF_EXPECTS(!prog.pattern().empty(), "Parameter pattern must not be empty");
   auto& options = regex_jit_program_accessor::options(prog);
@@ -1638,7 +1653,7 @@ std::unique_ptr<column> replace_with_backrefs(strings_column_view const& input,
     "replace_with_backrefs replacement does not match the regex_jit_program replacement");
   auto& validation_error = regex_jit_program_accessor::validation_error(prog);
   CUDF_EXPECTS(!validation_error.has_value(), validation_error.value_or(""));
-  return replace_impl(input, prog, stream, mr);
+  return detail::replace_impl(input, prog, stream, mr);
 }
 
 std::unique_ptr<table> split_re(strings_column_view const& input,
@@ -1647,9 +1662,10 @@ std::unique_ptr<table> split_re(strings_column_view const& input,
                                 cuda::stream_ref stream,
                                 cudf::memory_resources mr)
 {
+  CUDF_FUNC_RANGE();
   expect_operation(prog, regex_operation::SPLIT, "split_re");
   expect_split_parameters(prog, maxsplit, "split_re");
-  return split_table_impl(input, prog, stream, mr);
+  return detail::split_table_impl(input, prog, stream, mr);
 }
 
 std::unique_ptr<table> rsplit_re(strings_column_view const& input,
@@ -1658,9 +1674,10 @@ std::unique_ptr<table> rsplit_re(strings_column_view const& input,
                                  cuda::stream_ref stream,
                                  cudf::memory_resources mr)
 {
+  CUDF_FUNC_RANGE();
   expect_operation(prog, regex_operation::RSPLIT, "rsplit_re");
   expect_split_parameters(prog, maxsplit, "rsplit_re");
-  return split_table_impl(input, prog, stream, mr);
+  return detail::split_table_impl(input, prog, stream, mr);
 }
 
 std::unique_ptr<column> split_record_re(strings_column_view const& input,
@@ -1669,9 +1686,10 @@ std::unique_ptr<column> split_record_re(strings_column_view const& input,
                                         cuda::stream_ref stream,
                                         cudf::memory_resources mr)
 {
+  CUDF_FUNC_RANGE();
   expect_operation(prog, regex_operation::SPLIT_RECORD, "split_record_re");
   expect_split_parameters(prog, maxsplit, "split_record_re");
-  return split_record_impl(input, prog, stream, mr);
+  return detail::split_record_impl(input, prog, stream, mr);
 }
 
 std::unique_ptr<column> rsplit_record_re(strings_column_view const& input,
@@ -1680,9 +1698,10 @@ std::unique_ptr<column> rsplit_record_re(strings_column_view const& input,
                                          cuda::stream_ref stream,
                                          cudf::memory_resources mr)
 {
+  CUDF_FUNC_RANGE();
   expect_operation(prog, regex_operation::RSPLIT_RECORD, "rsplit_record_re");
   expect_split_parameters(prog, maxsplit, "rsplit_record_re");
-  return split_record_impl(input, prog, stream, mr);
+  return detail::split_record_impl(input, prog, stream, mr);
 }
 
 }  // namespace cudf::experimental

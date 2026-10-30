@@ -27,7 +27,7 @@ std::string preamble(bool offset64, std::optional<matcher_abi> abi = std::nullop
   if (abi) {
     auto symbol =
       *abi == matcher_abi::LIMITED_SPLIT ? "regex_ir_split_execute_limited" : "regex_ir_execute";
-    result += std::format(R"CUDA(#if CUDF_REGEX_WORKSPACE_BYTES
+    result += std::format(R"CUDA(#if CUDF_REGEX_IR_DISPATCH_WORKSPACE_BYTES
 {};
 #else
 {};
@@ -41,7 +41,7 @@ std::string preamble(bool offset64, std::optional<matcher_abi> abi = std::nullop
 struct matcher {{
   __device__ static {} call(char* workspace, char const* data, i64 size{})
   {{
-    return {}(RX_MATCHER_ARGUMENT data, size{});
+    return {}(CUDF_REGEX_IR_DISPATCH_MATCHER_ARGUMENT data, size{});
   }}
 }};
 )CUDA",
@@ -53,7 +53,7 @@ struct matcher {{
   return result;
 }
 
-std::string entry(std::string source,
+std::string entry(std::string_view source,
                   std::string_view name,
                   std::string_view parameters,
                   std::string_view body)
@@ -63,23 +63,23 @@ std::string entry(std::string source,
         return std::isalnum(character) || character == '_';
       }))
     throw std::invalid_argument("kernel_name must be a valid source identifier");
-  source += std::format(
-    R"CUDA(
-extern "C" __global__ void {}(RX_KERNEL_PARAMETERS char const* chars,
+  return std::format(
+    R"CUDA({}
+extern "C" __global__ void {}(CUDF_REGEX_IR_DISPATCH_KERNEL_PARAMETERS char const* chars,
                                            input_offset const* offsets,
                                            u32 const* validity,
                                            i32 row_offset,
                                            i32 rows{})
 {{
-  RX_WORKER
+  CUDF_REGEX_IR_DISPATCH_WORKER
   column<input_offset> strings{{chars, offsets, validity, row_offset, rows}};
   {}
 }}
 )CUDA",
+    source,
     name,
     parameters,
     body);
-  return source;
 }
 
 std::string bytes(std::string_view value)
@@ -95,16 +95,15 @@ std::string_view output_type(bool offset64) { return offset64 ? "i64" : "i32"; }
 
 std::string make_module(std::string wrapper, std::size_t workspace_bytes)
 {
-  return std::format(R"CUDA(#define CUDF_REGEX_WORKSPACE_BYTES {}
-#if CUDF_REGEX_WORKSPACE_BYTES
-#define RX_KERNEL_PARAMETERS char* scratch, i32 tile_begin, i32 tile_end,
-#define RX_MATCHER_ARGUMENT workspace,
-#define RX_WORKER \
-  worker worker_state{{scratch, tile_begin, tile_end, CUDF_REGEX_WORKSPACE_BYTES}};
+  return std::format(R"CUDA(#define CUDF_REGEX_IR_DISPATCH_WORKSPACE_BYTES {}
+#if CUDF_REGEX_IR_DISPATCH_WORKSPACE_BYTES > 0
+#define CUDF_REGEX_IR_DISPATCH_KERNEL_PARAMETERS char* scratch, i32 tile_begin, i32 tile_end,
+#define CUDF_REGEX_IR_DISPATCH_MATCHER_ARGUMENT workspace,
+#define CUDF_REGEX_IR_DISPATCH_WORKER worker worker_state{{i32(threadIdx.x + blockDim.x * blockIdx.x), scratch, tile_begin, tile_end, CUDF_REGEX_IR_DISPATCH_WORKSPACE_BYTES}};
 #else
-#define RX_KERNEL_PARAMETERS
-#define RX_MATCHER_ARGUMENT
-#define RX_WORKER worker worker_state{{}};
+#define CUDF_REGEX_IR_DISPATCH_KERNEL_PARAMETERS
+#define CUDF_REGEX_IR_DISPATCH_MATCHER_ARGUMENT
+#define CUDF_REGEX_IR_DISPATCH_WORKER worker worker_state{{i32(threadIdx.x + blockDim.x * blockIdx.x)}};
 #endif
 {}
 )CUDA",
@@ -380,11 +379,11 @@ std::string make_replace_kernel(bool offset64, bool emit, bool output64, std::st
   return entry(preamble(offset64, matcher_abi::REPLACE),
                name,
                emit ? std::format(", void* output, {} const* output_offsets", output_type(output64))
-                    : ", void* output",
+                    : ", void* output, i32* size_overflow",
                std::format("replace<matcher, {}, {}>(worker_state, strings, output{});",
                            emit,
                            output_type(output64),
-                           emit ? ", output_offsets" : ""));
+                           emit ? ", output_offsets" : ", nullptr, size_overflow"));
 }
 
 std::string make_split_size_kernel(bool offset64,

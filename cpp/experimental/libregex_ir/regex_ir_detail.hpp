@@ -7,6 +7,7 @@
 
 #include <regex_ir.hpp>
 
+#include <exception>
 #include <limits>
 #include <optional>
 #include <span>
@@ -24,6 +25,17 @@ namespace regex_ir {
 struct source_span {
   std::size_t offset = 0;  ///< Zero-based byte offset
   std::size_t length = 0;  ///< Length in bytes
+};
+
+/** @brief Internal compilation diagnostic rendered at the public API boundary. */
+struct compile_failure : std::exception {
+  compile_failure(source_span source, std::string message)
+    : source{source}, message{std::move(message)}
+  {
+  }
+
+  source_span source;
+  std::string message;
 };
 
 }  // namespace regex_ir
@@ -70,7 +82,7 @@ using state_id = std::uint32_t;
 /**
  * @brief Sentinel that does not identify an Automata IR state
  */
-inline constexpr state_id invalid_state = static_cast<state_id>(-1);
+inline constexpr state_id invalid_state = std::numeric_limits<state_id>::max();
 
 /**
  * @brief Inclusive Unicode code-point interval
@@ -238,7 +250,7 @@ using block_id = std::uint32_t;
 /**
  * @brief Sentinel that does not identify an Instruction IR block
  */
-inline constexpr block_id invalid_block = static_cast<block_id>(-1);
+inline constexpr block_id invalid_block = std::numeric_limits<block_id>::max();
 
 /**
  * @brief Require a number of characters to remain at the cursor
@@ -385,6 +397,21 @@ struct cuda_codegen_options {
   std::string symbol_prefix    = "regex_ir_sym";      ///< Prefix for internal symbols
   std::string execute_function = "regex_ir_execute";  ///< Public matcher function name
 };
+
+/** @brief Parse a pattern and construct its ordered Thompson automaton. */
+automata_ir compile_automata(std::string_view pattern, compile_options const& options);
+
+/** @brief Validate the ordered Thompson automaton. */
+void verify(automata_ir const& ir);
+
+/** @brief Lower an automaton into an operation-specialized instruction graph. */
+instruction_ir lower(automata_ir const& automata, operation const& selected);
+
+/** @brief Parse, lower, and optimize a pattern for the requested operation. */
+instruction_ir compile_instruction_ir(std::string_view pattern,
+                                      operation const& selected,
+                                      compile_options const& options,
+                                      optimization_options const& optimization);
 
 /** @brief Validate the operation-specialized instruction graph. */
 void verify(instruction_ir const& ir);
