@@ -59,6 +59,33 @@ def test_array_dtype_uses_physical_list():
     assert result.id() == plc.TypeId.LIST
 
 
+@pytest.mark.parametrize("inner", [pl.String(), pl.List(pl.Int8())])
+def test_array_dtype_requires_fixed_width_inner(inner):
+    with pytest.raises(NotImplementedError, match="fixed-width"):
+        DataType(pl.Array(inner, 2))
+
+
+def test_time_dtype_uses_nanosecond_timestamp():
+    result = DataType(pl.Time())
+
+    assert result.polars_type == pl.Time()
+    assert result.id() == plc.TypeId.TIMESTAMP_NANOSECONDS
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pl.List(pl.Time()),
+        pl.Array(pl.Time(), 2),
+        pl.Struct({"a": pl.Time()}),
+        pl.List(pl.Struct({"a": pl.Time()})),
+    ],
+)
+def test_nested_time_raises(dtype):
+    with pytest.raises(NotImplementedError, match="Time nested"):
+        DataType(dtype)
+
+
 @pytest.mark.parametrize(
     "dtype, expected",
     [

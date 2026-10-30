@@ -121,7 +121,7 @@ TYPED_TEST(StringsFindallTests, SpecialNewLines)
     cudf::experimental::regex_operation::FINDALL, "^zzé$", cudf::strings::regex_flags::EXT_NEWLINE);
   auto results = TypeParam::findall(view, *prog);
   using LCW    = cudf::test::lists_column_wrapper<cudf::string_view>;
-  LCW expected({LCW{}, LCW{}, LCW{"zzé"}, LCW{}, LCW{"zzé"}, LCW{}});
+  LCW expected({{}, {}, {"zzé"}, {}, {"zzé"}, {}});
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(results->view(), expected);
 
   auto both_flags = static_cast<cudf::strings::regex_flags>(
@@ -145,7 +145,7 @@ TYPED_TEST(StringsFindallTests, MediumRegex)
   auto results      = TypeParam::findall(strings_view, *prog);
 
   using LCW = cudf::test::lists_column_wrapper<cudf::string_view>;
-  LCW expected({LCW{"first words 1234", "just numbers 9876"}, LCW{}});
+  LCW expected({{"first words 1234", "just numbers 9876"}, {}});
   CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(results->view(), expected);
 }
 
@@ -171,7 +171,7 @@ TYPED_TEST(StringsFindallTests, LargeRegex)
   auto results      = TypeParam::findall(strings_view, *prog);
 
   using LCW = cudf::test::lists_column_wrapper<cudf::string_view>;
-  LCW expected({LCW{large_regex.c_str()}, LCW{}, LCW{}});
+  LCW expected({{large_regex.c_str()}, {}, {}});
   CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(results->view(), expected);
 }
 
@@ -285,7 +285,7 @@ TYPED_TEST(StringsFindallTests, AlternationPriorityFirstWins)
   auto results = TypeParam::findall(sv, *prog);
 
   using LCW = cudf::test::lists_column_wrapper<cudf::string_view>;
-  LCW expected({LCW{"foo"}, LCW{"foo"}, LCW{"foo"}, LCW{}, LCW{"foo"}, LCW{}});
+  LCW expected({{"foo"}, {"foo"}, {"foo"}, {}, {"foo"}, {}});
   CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(results->view(), expected);
 }
 

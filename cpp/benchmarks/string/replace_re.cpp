@@ -6,6 +6,7 @@
 #include <benchmarks/common/generate_input.hpp>
 #include <benchmarks/common/memory_stats.hpp>
 
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/experimental/regex.hpp>
 #include <cudf/strings/regex/regex_program.hpp>
 #include <cudf/strings/replace_re.hpp>

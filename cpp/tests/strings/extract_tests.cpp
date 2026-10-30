@@ -174,6 +174,30 @@ TYPED_TEST(StringsExtractTests, MultiLine)
   CUDF_TEST_EXPECT_TABLES_EQUAL(*results, expected);
 }
 
+struct RegexInterpreterExtractTests : public cudf::test::BaseFixture {};
+
+TEST_F(RegexInterpreterExtractTests, InlineFlags)
+{
+  auto input = cudf::test::strings_column_wrapper({"ABC-123", "abc-456", "xyz\nAbc-789", "abc"});
+  auto view  = cudf::strings_column_view(input);
+
+  auto prog    = cudf::strings::regex_program::create("(?im)^([a-c]+)-(\\d+)");
+  auto results = cudf::strings::extract(view, *prog);
+  cudf::test::strings_column_wrapper expected1({"ABC", "abc", "Abc", ""},
+                                               {true, true, true, false});
+  cudf::test::strings_column_wrapper expected2({"123", "456", "789", ""},
+                                               {true, true, true, false});
+  auto expected = cudf::table_view{{expected1, expected2}};
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*results, expected);
+
+  prog    = cudf::strings::regex_program::create("((?i:a)bc)-(\\d+)");
+  results = cudf::strings::extract(view, *prog);
+  cudf::test::strings_column_wrapper expected3({"", "abc", "Abc", ""}, {false, true, true, false});
+  cudf::test::strings_column_wrapper expected4({"", "456", "789", ""}, {false, true, true, false});
+  expected = cudf::table_view{{expected3, expected4}};
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*results, expected);
+}
+
 TYPED_TEST(StringsExtractTests, DotAll)
 {
   auto input = cudf::test::strings_column_wrapper({"abc\nfa\nef", "fff\nabbc\nfff", "abcdef", ""});
@@ -316,13 +340,13 @@ TYPED_TEST(StringsExtractTests, ExtractAllTest)
 
   std::array valids{true, true, true, false, false, false, true};
   using LCW = cudf::test::lists_column_wrapper<cudf::string_view>;
-  LCW expected({LCW{"123", "banana", "7", "eleven"},
-                LCW{"41", "apple"},
-                LCW{"6", "péar", "0", "pair"},
-                LCW{},
-                LCW{},
-                LCW{},
-                LCW{"4", "paré"}},
+  LCW expected({{"123", "banana", "7", "eleven"},
+                {"41", "apple"},
+                {"6", "péar", "0", "pair"},
+                {},
+                {},
+                {},
+                {"4", "paré"}},
                valids.data());
   auto prog = TypeParam::create(cudf::experimental::regex_operation::EXTRACT_ALL_RECORD, pattern);
   auto results = TypeParam::extract_all_record(sv, *prog);
