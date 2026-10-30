@@ -24,6 +24,7 @@
 #pragma once
 
 #include <cudf_test/column_utilities.hpp>
+#include <cudf_test/column_wrapper.hpp>
 #include <cudf_test/cudf_gtest.hpp>
 
 #include <cudf/scalar/scalar.hpp>
@@ -31,6 +32,7 @@
 #include <cudf/utilities/traits.hpp>
 
 #include <limits>
+#include <vector>
 
 // This is used to convert the expected binop result computed by the test utilities and the
 // result returned by the binop operation into string, which is then used for display purposes
@@ -195,26 +197,38 @@ void ASSERT_BINOP(cudf::column_view const& out,
                   TypeOp&& op,
                   ValueComparator const& value_comparator = ValueComparator())
 {
-  auto lhs_h    = cudf::test::to_host<TypeLhs>(lhs);
-  auto lhs_data = lhs_h.first;
-  auto rhs_h    = cudf::test::to_host<TypeRhs>(rhs);
-  auto rhs_data = rhs_h.first;
-  auto out_h    = cudf::test::to_host<TypeOut>(out);
-  auto out_data = out_h.first;
+  auto const [lhs_data, lhs_mask] = cudf::test::to_host<TypeLhs>(lhs);
+  auto const [rhs_data, rhs_mask] = cudf::test::to_host<TypeRhs>(rhs);
 
-  ASSERT_EQ(out_data.size(), lhs_data.size());
-  ASSERT_EQ(out_data.size(), rhs_data.size());
+  ASSERT_EQ(out.size(), lhs.size());
+  ASSERT_EQ(out.size(), rhs.size());
   EXPECT_EQ(out.nullable(), lhs.nullable() || rhs.nullable());
-  for (size_t i = 0; i < out_data.size(); ++i) {
-    auto const lhs_valid = !lhs.nullable() || cudf::bit_is_set(lhs_h.second.data(), i);
-    auto const rhs_valid = !rhs.nullable() || cudf::bit_is_set(rhs_h.second.data(), i);
-    auto const out_valid = !out.nullable() || cudf::bit_is_set(out_h.second.data(), i);
-    EXPECT_EQ(out_valid, lhs_valid && rhs_valid) << "Row " << i;
-    // Transform does not evaluate null rows, whose data is unspecified.
-    if (!lhs_valid || !rhs_valid) { continue; }
 
-    auto const actual   = out_data[i];
-    auto const expected = static_cast<TypeOut>(op(lhs_data[i], rhs_data[i]));
-    EXPECT_TRUE(value_comparator(actual, expected)) << stringify_out_values{}(i, actual, expected);
+  std::vector<TypeOut> expected_data(out.size());
+  std::vector<bool> expected_validity(out.size());
+  for (size_t i = 0; i < expected_data.size(); ++i) {
+    expected_validity[i] = (!lhs.nullable() || cudf::bit_is_set(lhs_mask.data(), i)) &&
+                           (!rhs.nullable() || cudf::bit_is_set(rhs_mask.data(), i));
+    if (expected_validity[i]) {
+      expected_data[i] = static_cast<TypeOut>(op(lhs_data[i], rhs_data[i]));
+    }
+  }
+
+  auto const expected = [&] {
+    if (lhs.nullable() || rhs.nullable()) {
+      return cudf::test::fixed_width_column_wrapper<TypeOut>(
+        expected_data.begin(), expected_data.end(), expected_validity.begin());
+    }
+    return cudf::test::fixed_width_column_wrapper<TypeOut>(expected_data.begin(),
+                                                           expected_data.end());
+  }();
+  if constexpr (std::is_same_v<ValueComparator, std::equal_to<TypeOut>>) {
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(out, expected);
+  } else {
+    static_assert(std::is_same_v<ValueComparator, NearEqualComparator<TypeOut>>);
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(out,
+                                        expected,
+                                        cudf::test::debug_output_level::FIRST_ERROR,
+                                        static_cast<cudf::size_type>(value_comparator.ulp_));
   }
 }

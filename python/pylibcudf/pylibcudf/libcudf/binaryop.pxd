@@ -3,6 +3,7 @@
 from libc.stdint cimport int32_t
 from libcpp cimport bool
 from libcpp.memory cimport unique_ptr
+from libcpp.string cimport string
 from pylibcudf.exception_handler cimport libcudf_exception_handler
 from pylibcudf.libcudf.column.column cimport column
 from pylibcudf.libcudf.column.column_view cimport column_view
@@ -78,6 +79,15 @@ cdef extern from "cudf/binaryop.hpp" namespace "cudf" nogil:
         const column_view& lhs,
         const column_view& rhs,
         binary_operator op,
+        data_type output_type,
+        cudaStream_t stream,
+        device_async_resource_ref mr
+    ) except +libcudf_exception_handler
+
+    cdef unique_ptr[column] binary_operation (
+        const column_view& lhs,
+        const column_view& rhs,
+        const string& op,
         data_type output_type,
         cudaStream_t stream,
         device_async_resource_ref mr
