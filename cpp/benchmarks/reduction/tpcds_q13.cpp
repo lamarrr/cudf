@@ -191,6 +191,7 @@ void tpcds_q13(nvbench::state& state)
   for (auto const& column : input) {
     arguments.emplace_back(column->view());
     all_views.push_back(column->view());
+    state.add_global_memory_reads(column->alloc_size());
   }
 
   cudf::table_view const all_inputs{all_views};
