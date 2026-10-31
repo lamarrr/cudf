@@ -1367,6 +1367,7 @@ std::optional<execution_plan::string_operation> execution_plan::string_operation
   auto ends              = ir_.control.require_end;
   auto line_end          = false;
   auto explicit_boundary = false;
+  auto explicit_end      = false;
   std::vector<bool> visited(ir_.blocks.size(), false);
   std::string literal;
   auto current = ir_.entry;
@@ -1407,6 +1408,7 @@ std::optional<execution_plan::string_operation> execution_plan::string_operation
           ends              = true;
           line_end          = assertion->kind == assertion_kind::END_LINE;
           explicit_boundary = true;
+          explicit_end      = true;
         } else {
           return std::nullopt;
         }
@@ -1417,12 +1419,12 @@ std::optional<execution_plan::string_operation> execution_plan::string_operation
         if (reads_character) return std::nullopt;
         reads_character = true;
       } else if (auto* character_match = std::get_if<match_character>(&item)) {
-        if (!consumed.empty() || !character_match->predicate.is_singleton()) {
+        if (explicit_end || !consumed.empty() || !character_match->predicate.is_singleton()) {
           return std::nullopt;
         }
         consumed.push_back(character_match->predicate.singleton());
       } else if (auto* literal_match = std::get_if<match_literal>(&item)) {
-        if (!consumed.empty()) return std::nullopt;
+        if (explicit_end || !consumed.empty()) return std::nullopt;
         consumed = literal_match->value;
       } else if (auto* advance = std::get_if<advance_cursor>(&item)) {
         if (advance_count.has_value()) return std::nullopt;

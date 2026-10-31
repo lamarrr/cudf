@@ -49,6 +49,24 @@ class source_buffer {
   std::string value_ = "";
 };
 
+class constant_memory_budget {
+ public:
+  bool reserve(std::size_t bytes)
+  {
+    // Round each array up conservatively, including padding between namespaces.
+    constexpr std::size_t alignment = 16;
+    auto const aligned              = (bytes + alignment - 1) / alignment * alignment;
+    if (aligned > remaining_) return false;
+    remaining_ -= aligned;
+    return true;
+  }
+
+ private:
+  // CUDA provides 64 KiB; leave room for constants in the embedding wrapper.
+  static constexpr std::size_t capacity = 0x10000 - 0x1000;
+  std::size_t remaining_                = capacity;
+};
+
 void require_identifier(std::string_view value, std::string_view field)
 {
   auto first_is_valid = [](std::uint8_t character) {
@@ -131,8 +149,12 @@ class cuda_source_emitter {
  public:
   cuda_source_emitter(execution_plan const& plan,
                       cuda_codegen_options options,
+                      constant_memory_budget& constants,
                       std::string word_namespace = {})
-    : plan_(plan), options_(std::move(options)), word_namespace_(std::move(word_namespace))
+    : plan_(plan),
+      options_(std::move(options)),
+      constants_(constants),
+      word_namespace_(std::move(word_namespace))
   {
   }
 
@@ -161,10 +183,11 @@ class cuda_source_emitter {
       auto suffix         = std::format("_lookaround_{}", index);
       nested_options.symbol_prefix += suffix;
       nested_options.execute_function += suffix;
-      output_.emit("{}",
-                   cuda_source_emitter(plan_.lookarounds_[index], nested_options, word_namespace_)
-                     .render()
-                     .cuda_source);
+      output_.emit(
+        "{}",
+        cuda_source_emitter(plan_.lookarounds_[index], nested_options, constants_, word_namespace_)
+          .render()
+          .cuda_source);
     }
     output_.emit(R"CUDA(namespace {} {{
 using namespace regex_ir::device;)CUDA",
@@ -251,9 +274,12 @@ struct pattern : policy {{)CUDA");
   template <typename Range>
   void array(std::string_view name, std::string_view type, Range const& values, bool small = true)
   {
+    auto const width = type == "u8" ? 1U : type == "u16" ? 2U : type == "u32" ? 4U : 8U;
+    auto const bytes = std::max(std::size(values), std::size_t{1}) * width;
+    auto const in_constant_memory = small && constants_.reserve(bytes);
     output_.emit(R"CUDA(
 __device__ {} {} const {}[] = {{)CUDA",
-                 small ? "__constant__" : "",
+                 in_constant_memory ? "__constant__" : "",
                  type,
                  name);
     if (std::empty(values)) output_.emit("0,");
@@ -896,7 +922,9 @@ auto* scratch = {};)CUDA",
     {{data, size}}, spans, {}, limit, capacity, overflow);
 }})CUDA",
                    matcher_signature(matcher_abi::LIMITED_SPLIT,
-                                     "regex_ir_split_execute_limited",
+                                     options_.execute_function == "regex_ir_execute"
+                                       ? "regex_ir_split_execute_limited"
+                                       : options_.execute_function + "_limited",
                                      plan_.workspace_bytes_ != 0),
                    options_.symbol_prefix,
                    plan_.workspace_bytes_ ? "reinterpret_cast<i64*>(workspace)" : "nullptr");
@@ -905,6 +933,7 @@ auto* scratch = {};)CUDA",
 
   execution_plan const& plan_;
   cuda_codegen_options options_;
+  constant_memory_budget& constants_;
   source_buffer output_;
   std::string word_namespace_;
   std::optional<std::string> literal_;
@@ -1301,7 +1330,9 @@ __device__ __forceinline__ static bool mandatory_present(input) {{ return true; 
   }
 }
 
-compile_result render_cuda(instruction_ir const& ir, cuda_codegen_options const& options)
+compile_result render_cuda(instruction_ir const& ir,
+                           cuda_codegen_options const& options,
+                           constant_memory_budget& constants)
 {
   if (ir.lookarounds.empty() && !ir.assertion_program &&
       ir.control.result == result_shape::BOOLEAN && ir.blocks.size() >= 80 &&
@@ -1317,7 +1348,7 @@ compile_result render_cuda(instruction_ir const& ir, cuda_codegen_options const&
       auto suffix         = std::format("_alternative_{}", functions.size());
       branch_options.symbol_prefix += suffix;
       branch_options.execute_function += suffix;
-      auto result = render_cuda(optimize(std::move(branch), {}), branch_options);
+      auto result = render_cuda(optimize(std::move(branch), {}), branch_options, constants);
       source += result.cuda_source;
       functions.emplace_back(branch_options.execute_function, result.workspace_bytes != 0);
       workspace = std::max(workspace, result.workspace_bytes);
@@ -1344,7 +1375,13 @@ compile_result render_cuda(instruction_ir const& ir, cuda_codegen_options const&
             std::nullopt,
             workspace};
   }
-  return cuda_source_emitter(execution_plan(ir), options).render();
+  return cuda_source_emitter(execution_plan(ir), options, constants).render();
+}
+
+compile_result render_cuda(instruction_ir const& ir, cuda_codegen_options const& options)
+{
+  constant_memory_budget constants;
+  return render_cuda(ir, options, constants);
 }
 
 }  // namespace
