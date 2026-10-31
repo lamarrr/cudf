@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cudf/column/column_child_offsets.hpp>
+#include <cudf/column/column_view.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/utilities/traits.hpp>
@@ -14,8 +15,24 @@
 #include <rtcx/rtcx.hpp>
 
 #include <format>
+#include <string>
 
 namespace cudf::jit {
+
+inline transform_input_spec make_input_spec(column_view const& column, bool is_scalar)
+{
+  transform_input_spec result{.type = column.type().id(), .is_scalar = is_scalar};
+  if (is_dictionary(column.type())) {
+    for (size_type i = 0; i < column.num_children(); ++i) {
+      result.children.push_back(make_input_spec(column.child(i), false));
+    }
+  } else if (column.type().id() == type_id::STRING &&
+             column.num_children() > strings_column_view::offsets_column_index) {
+    result.children.push_back(
+      make_input_spec(column.child(strings_column_view::offsets_column_index), false));
+  }
+  return result;
+}
 
 inline std::string get_element_type_name(transform_input_spec const& spec, bool use_physical_type);
 
@@ -101,6 +118,7 @@ inline rtcx::binary_type as_rtcx_binary_type(lto_binary_type type)
   switch (type) {
     case lto_binary_type::LTO_IR: return rtcx::binary_type::LTO_IR;
     case lto_binary_type::FATBIN: return rtcx::binary_type::FATBIN;
+    case lto_binary_type::PTX: return rtcx::binary_type::PTX;
     default:
       CUDF_FAIL(std::format("Unrecognized LTO binary type {} for LTO UDF", static_cast<int>(type)),
                 std::invalid_argument);

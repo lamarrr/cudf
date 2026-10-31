@@ -8,9 +8,9 @@
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/scalar_column_view.hpp>
 #include <cudf/types.hpp>
+#include <cudf/udf.hpp>
 #include <cudf/utilities/export.hpp>
 #include <cudf/utilities/memory_resource.hpp>
-#include <cudf/utilities/udf.hpp>
 
 #include <cuda/buffer>
 

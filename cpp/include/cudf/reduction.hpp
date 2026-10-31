@@ -6,12 +6,26 @@
 #pragma once
 
 #include <cudf/aggregation.hpp>
-#include <cudf/reduction/jit.hpp>
+#include <cudf/column/column.hpp>
+#include <cudf/column/column_view.hpp>
+#include <cudf/column/scalar_column_view.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/types.hpp>
+#include <cudf/udf.hpp>
+#include <cudf/user_data.hpp>
+#include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/export.hpp>
 #include <cudf/utilities/memory_resource.hpp>
+#include <cudf/utilities/span.hpp>
 
+#include <functional>
+#include <memory>
 #include <optional>
+#include <span>
+#include <string_view>
+#include <utility>
+#include <variant>
+#include <vector>
 
 /**
  * @file
@@ -263,6 +277,169 @@ namespace reduction {
  */
 bool is_valid_aggregation(data_type source, aggregation::Kind kind);
 }  // namespace reduction
+
+/**
+ * @brief An input to a user-defined reduction.
+ *
+ * A `column_view` supplies one value per input row. A `scalar_column_view` broadcasts its
+ * single value to every row. A `user_data` input passes the same `void*` to every update
+ * invocation, at its specified position in the input parameter list.
+ * Column and scalar inputs support the same types as `transform`, including dictionary-encoded
+ * inputs. Dictionary inputs supply decoded values to the callbacks.
+ *
+ * These alternatives do not own the referenced device storage. The caller must keep that
+ * storage accessible to device code until operations using it have completed on the execution
+ * stream.
+ */
+using reduce_input = std::variant<column_view, scalar_column_view, user_data>;
+
+/**
+ * @brief Compiled device functions defining a user-defined reduction.
+ *
+ * The named functions must be defined in `fragments` and return `cudf::errc`, using
+ * `cudf::errc::SUCCESS` to indicate success. Their parameters follow these conventions:
+ *
+ * - `init` takes pointers to all state fields, in `state_types` order, and initializes every
+ *   field to the reduction's identity state.
+ * - Optional `filter` takes the input row index, a `bool*` result, and input values in `inputs`
+ *   order. It writes whether to include the row. A successful true result invokes `update`;
+ *   false or an error skips the update. An empty filter symbol includes every row.
+ * - `update` takes the input row index as a leading `cudf::size_type`, followed by pointers
+ *   to all state fields and then input values in `inputs` order. It updates the state for
+ *   that row.
+ * - `merge` takes pointers to the destination state fields, followed by source state fields
+ *   passed by value, both in `state_types` order. It combines independently accumulated
+ *   partial states. The merge operation must be associative and preserve the identity state;
+ *   the order and grouping of updates and merges are unspecified.
+ * - `finalize` takes pointers to the output values, in `outputs` order, followed by state
+ *   fields passed by value, in `state_types` order. It writes one result row.
+ *
+ * For `segmented_reduce_lto`, every callback takes an additional leading `cudf::size_type`
+ * containing the zero-based segment ID. The update signature therefore starts with
+ * `(cudf::size_type segment_id, cudf::size_type row_index, ...)`. The row index is relative
+ * to the input columns, rather than the start of the segment. The segment ID is also passed
+ * when initializing and finalizing empty segments. Initialization and merging may each run
+ * multiple times for the same segment.
+ *
+ * Only `filter` and `update` take a row index. Both receive the same input values, loaded once
+ * per row. The filter's `bool*` result is never wrapped in an optional. Packed selections can
+ * be supplied through `user_data` and interpreted by the filter.
+ * Inputs use the same decoded value types as `transform`; string inputs use `cudf::string_view`.
+ * State and output types may be fixed-width or `STRING`, represented by `cudf::string_view`.
+ * String views in state and outputs must refer to device character storage that remains valid
+ * until the operation completes. Returned string columns own a copy of those characters.
+ *
+ * With `null_aware::YES`, column and scalar inputs and all state fields use
+ * `cuda::std::optional<T>`. State pointers in `init`, `update`, and `merge`, and output pointers
+ * in `finalize`, therefore use `cuda::std::optional<T>*`; source state fields in `merge` and
+ * `finalize` are passed as optional values. An empty optional represents a null value; leaving
+ * an output optional empty produces a null output. Callbacks define each state's identity and
+ * how empty state values combine. User-data inputs remain `void*`. With `null_aware::NO`, inputs,
+ * state fields, and outputs use their value types, pointer parameters remain pointers, and rows
+ * with any null column or scalar input are skipped before filtering.
+ *
+ * The fragment span, fragment bytes, and symbol names are non-owning views. Their backing
+ * storage must remain valid for the duration of the reduction call. See `lto_fragment` for device
+ * function linkage and parameter type conventions.
+ */
+struct reduce_udf {
+  lto_fragments fragments{};    ///< Compiled fragments defining the reduction callbacks
+  std::string_view init{};      ///< Symbol for initializing an independent reduction state
+  std::string_view update{};    ///< Symbol for incorporating one selected input row into a state
+  std::string_view merge{};     ///< Symbol for combining two partial reduction states
+  std::string_view finalize{};  ///< Symbol for converting a reduced state into output values
+  std::string_view filter{};    ///< Optional symbol for selecting rows before updating state
+};
+
+/**
+ * @brief Reduces selected input rows using compiled user-defined device functions.
+ *
+ * Column inputs must have the same number of rows. Scalar and user-data inputs are broadcast
+ * to every row. The optional filter callback selects rows before updating the reduction state.
+ * Null handling and callback signatures follow `reduce_udf`. With no column inputs, the
+ * reduction has zero rows and finalizes the identity state.
+ *
+ * Input column types follow `transform`, including strings and dictionary-encoded inputs.
+ * State fields and output columns support fixed-width types and strings. String state fields
+ * and callback outputs use `cudf::string_view`; returned string columns own their characters.
+ *
+ * The result contains one column per entry in `outputs`, in the same order. Each result column
+ * has one row. An empty input, or an input with no selected rows, is finalized from the identity
+ * state. The finalization callback determines the output values and, in null-aware mode, their
+ * validity.
+ *
+ * @throws std::invalid_argument if input lengths differ or a type is unsupported
+ * @throws cudf::evaluation_error if a callback returns an error code other than `SUCCESS`
+ *
+ * @param udf Compiled fragments and symbols for initialization, filtering, update, merge, and
+ * finalization
+ * @param is_null_aware Whether inputs, state fields, and outputs use optional values
+ * @param inputs Column, broadcast scalar, and user-data inputs in update parameter order
+ * @param state_types Logical types of the state fields in callback parameter order
+ * @param outputs Logical types of the returned columns in finalization parameter order
+ * @param stream CUDA stream used for the operation
+ * @param mr Memory resources used for output and temporary allocations
+ * @return One single-row column for each requested output type
+ */
+std::vector<std::unique_ptr<column>> reduce_lto(
+  reduce_udf const& udf,
+  null_aware is_null_aware,
+  std::span<reduce_input const> inputs,
+  std::span<data_type const> state_types,
+  std::span<data_type const> outputs,
+  cuda::stream_ref stream   = cudf::get_default_stream(),
+  cudf::memory_resources mr = cudf::get_current_device_resource_ref());
+
+/**
+ * @brief Reduces selected rows of each segment using compiled user-defined device functions.
+ *
+ * Segment `i` covers input rows `[offsets[i], offsets[i + 1])`. Offsets must contain at least
+ * one entry, be non-negative and nondecreasing, and lie within the input columns' row range.
+ * Adjacent equal offsets describe an empty segment. The first offset may be nonzero, and the
+ * last offset need not include every input row.
+ *
+ * Column inputs must have the same number of rows. Scalar and user-data inputs are broadcast
+ * to every row. The optional filter uses input row indices, including for segments beginning
+ * at nonzero offsets. Null handling and callback signatures follow `reduce_udf`, including a
+ * leading segment ID on every callback.
+ *
+ * The result contains `outputs.size() * (offsets.size() - 1)` independent single-row columns,
+ * ordered by segment and then by output: `result[segment * outputs.size() + output]` contains
+ * that segment's value for the requested output type. Zero segments return an empty vector.
+ * Empty segments and segments with no selected rows are finalized from the identity state.
+ * The finalization callback determines the output values and, in null-aware mode, their validity.
+ *
+ * Input, state, and output types have the same requirements as the scalar UDF reduction.
+ * When there are no column inputs, offsets specify the input row range. A supplied maximum
+ * segment size must be nonnegative and at least as large as every segment.
+ *
+ * @throws std::invalid_argument if input lengths differ, offsets are empty or contain too many
+ * segments, the maximum segment size is negative, or a type is unsupported
+ * @throws cudf::evaluation_error if a callback returns an error code other than `SUCCESS`
+ *
+ * @param udf Compiled fragments and symbols for initialization, filtering, update, merge, and
+ * finalization
+ * @param is_null_aware Whether inputs, state fields, and outputs use optional values
+ * @param inputs Column, broadcast scalar, and user-data inputs in update parameter order
+ * @param offsets Device-accessible segment boundaries, with `num_segments + 1` entries
+ * @param state_types Logical types of the state fields in callback parameter order
+ * @param outputs Logical types of the returned columns in finalization parameter order
+ * @param max_segment_size Upper bound on segment length, or `std::nullopt` when unknown;
+ * supplied as an optimization hint
+ * @param stream CUDA stream used for the operation
+ * @param mr Memory resources used for output and temporary allocations
+ * @return One single-row column per segment and requested output type, ordered by segment
+ */
+std::vector<std::unique_ptr<column>> segmented_reduce_lto(
+  reduce_udf const& udf,
+  null_aware is_null_aware,
+  std::span<reduce_input const> inputs,
+  device_span<size_type const> offsets,
+  std::span<data_type const> state_types,
+  std::span<data_type const> outputs,
+  std::optional<size_type> max_segment_size,
+  cuda::stream_ref stream   = cudf::get_default_stream(),
+  cudf::memory_resources mr = cudf::get_current_device_resource_ref());
 
 /** @} */  // end of group
 

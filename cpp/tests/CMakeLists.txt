@@ -228,6 +228,20 @@ ConfigureTest(
 
 # ##################################################################################################
 # * reduction tests -------------------------------------------------------------------------------
+rtcx_add_embed(cudf_reduce_lto_test_fragments)
+foreach(fragment IN ITEMS sum_count filtering strings input_output errors tpch_q6_sales)
+  add_fragment(
+    cudf_reduce_lto_test_fragments FRAGMENT ${fragment} SOURCE reductions/udfs/${fragment}.cu
+  )
+endforeach()
+rtcx_embed_blob(
+  cudf_reduce_lto_test_fragments FILE "${CMAKE_CURRENT_SOURCE_DIR}/reductions/udfs/tpch_q6_sales.cu"
+  DEST fragments/tpch_q6_sales.cu ID tpch_q6_sales_source
+)
+rtcx_embed(
+  cudf_reduce_lto_test_fragments COMPRESSION none OUTPUT_DIRECTORY
+  "${CMAKE_CURRENT_BINARY_DIR}/reduce_lto_embed"
+)
 ConfigureTest(
   REDUCTIONS_TEST
   reductions/approx_distinct_count_tests.cpp
@@ -238,14 +252,19 @@ ConfigureTest(
   reductions/host_udf_example_tests.cu
   reductions/list_rank_test.cpp
   reductions/rank_tests.cpp
+  reductions/reduce_lto.cpp
   reductions/reduction_tests.cpp
   reductions/scan_tests.cpp
   reductions/segmented_reduction_tests.cpp
   reductions/tdigest_tests.cpp
   reductions/unique_count_tests.cpp
+  ${cudf_reduce_lto_test_fragments_SOURCE_DIR}/cudf_reduce_lto_test_fragments.s
   GPUS 1
   PERCENT 70
 )
+
+add_dependencies(REDUCTIONS_TEST cudf_reduce_lto_test_fragments)
+target_include_directories(REDUCTIONS_TEST PRIVATE ${cudf_reduce_lto_test_fragments_SOURCE_DIR})
 
 # ##################################################################################################
 # * replace tests ---------------------------------------------------------------------------------
@@ -727,58 +746,6 @@ ConfigureTest(
 add_dependencies(TRANSFORM_LTO_TEST cudf_test_fragments)
 target_include_directories(TRANSFORM_LTO_TEST PRIVATE ${cudf_test_fragments_SOURCE_DIR})
 
-# Reduction lifecycle fixtures exercise both accepted LTO container formats.
-rtcx_add_embed(cudf_reduce_test_fragments)
-add_fragment(cudf_reduce_test_fragments FRAGMENT sum_count SOURCE reductions/fragments/sum_count.cu)
-set(REDUCE_IR_INCLUDES)
-foreach(INC_DIR IN LISTS LIBCUDACXX_RAW_INCLUDE_DIRS)
-  list(APPEND REDUCE_IR_INCLUDES "-I${INC_DIR}")
-endforeach()
-foreach(FRAGMENT IN ITEMS sum_count errors nullable_sum_count)
-  if(NOT FRAGMENT STREQUAL "sum_count")
-    add_fragment(
-      cudf_reduce_test_fragments FRAGMENT ${FRAGMENT} SOURCE reductions/fragments/${FRAGMENT}.cu
-    )
-  endif()
-  set(REDUCE_IR "${CMAKE_CURRENT_BINARY_DIR}/reduce_${FRAGMENT}.ltoir")
-  add_custom_command(
-    OUTPUT "${REDUCE_IR}"
-    COMMAND
-      "${CMAKE_CUDA_COMPILER}" --ltoir --dlink-time-opt --std=c++20
-      "--gpu-architecture=lto_${CUDF_LTO_ARCHITECTURE}" ${REDUCE_IR_INCLUDES}
-      "${CMAKE_CURRENT_SOURCE_DIR}/reductions/fragments/${FRAGMENT}.cu" -o "${REDUCE_IR}"
-    DEPENDS reductions/fragments/${FRAGMENT}.cu reductions/fragments/sum_count.cu
-    VERBATIM
-  )
-  add_custom_target(reduce_${FRAGMENT}_ir_build DEPENDS "${REDUCE_IR}")
-  add_library(reduce_${FRAGMENT}_ir OBJECT IMPORTED)
-  set_target_properties(reduce_${FRAGMENT}_ir PROPERTIES IMPORTED_OBJECTS "${REDUCE_IR}")
-  add_dependencies(reduce_${FRAGMENT}_ir reduce_${FRAGMENT}_ir_build)
-  rtcx_embed_blob(
-    cudf_reduce_test_fragments FILE $<TARGET_OBJECTS:reduce_${FRAGMENT}_ir> DEST
-    fragments/${FRAGMENT}.ltoir ID ${FRAGMENT}_ir
-  )
-  rtcx_embed_blob(
-    cudf_reduce_test_fragments
-    FILE
-    "${CMAKE_CURRENT_SOURCE_DIR}/reductions/fragments/${FRAGMENT}.cu"
-    DEST
-    fragments/${FRAGMENT}.cu
-    ID
-    ${FRAGMENT}_source
-  )
-endforeach()
-rtcx_embed(
-  cudf_reduce_test_fragments COMPRESSION none OUTPUT_DIRECTORY
-  "${CMAKE_CURRENT_BINARY_DIR}/reduce_rtcx_embed"
-)
-ConfigureTest(
-  REDUCTION_JIT_TEST reductions/jit_reduce_tests.cpp
-  ${cudf_reduce_test_fragments_SOURCE_DIR}/cudf_reduce_test_fragments.s
-)
-add_dependencies(REDUCTION_JIT_TEST cudf_reduce_test_fragments)
-target_include_directories(REDUCTION_JIT_TEST PRIVATE ${cudf_reduce_test_fragments_SOURCE_DIR})
-
 # ##################################################################################################
 # * lists tests ----------------------------------------------------------------------------------
 ConfigureTest(
@@ -850,13 +817,6 @@ ConfigureTest(STREAM_PARTITIONING_TEST streams/partitioning_test.cpp STREAM_MODE
 ConfigureTest(STREAM_POOL_TEST streams/pool_test.cu STREAM_MODE testing)
 ConfigureTest(STREAM_QUANTILE_TEST streams/quantile_test.cpp STREAM_MODE testing)
 ConfigureTest(STREAM_REDUCTION_TEST streams/reduction_test.cpp STREAM_MODE testing)
-target_sources(
-  STREAM_REDUCTION_TEST
-  PRIVATE ${cudf_reduce_test_fragments_SOURCE_DIR}/cudf_reduce_test_fragments.s
-)
-add_dependencies(STREAM_REDUCTION_TEST cudf_reduce_test_fragments)
-target_include_directories(STREAM_REDUCTION_TEST PRIVATE ${cudf_reduce_test_fragments_SOURCE_DIR})
-
 ConfigureTest(STREAM_REPLACE_TEST streams/replace_test.cpp STREAM_MODE testing)
 ConfigureTest(STREAM_RESHAPE_TEST streams/reshape_test.cpp STREAM_MODE testing)
 ConfigureTest(

@@ -223,6 +223,19 @@ ConfigureNVBench(
   reduction/unique_count.cpp
 )
 
+rtcx_add_embed(cudf_tpc_reduction_fragments)
+add_fragment(cudf_tpc_reduction_fragments FRAGMENT tpcds_q13 SOURCE reduction/udfs/tpcds_q13.cu)
+rtcx_embed(
+  cudf_tpc_reduction_fragments COMPRESSION none OUTPUT_DIRECTORY
+  "${CMAKE_CURRENT_BINARY_DIR}/tpc_reduction_embed"
+)
+ConfigureNVBench(
+  REDUCE_LTO_NVBENCH reduction/tpcds_q13.cpp
+  ${cudf_tpc_reduction_fragments_SOURCE_DIR}/cudf_tpc_reduction_fragments.s
+)
+target_include_directories(REDUCE_LTO_NVBENCH PRIVATE ${cudf_tpc_reduction_fragments_SOURCE_DIR})
+add_dependencies(REDUCE_LTO_NVBENCH cudf_tpc_reduction_fragments)
+
 # ##################################################################################################
 # * replace benchmark ---------------------------------------------------------------------------
 ConfigureNVBench(REPLACE_NVBENCH replace/clamp.cpp replace/nans.cpp replace/nulls.cpp)

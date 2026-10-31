@@ -275,20 +275,7 @@ auto reflect(std::variant<udf_source_type, lto_binary_type> source_type,
   return std::make_tuple(ins, outs, ptx_in_types, ptx_out_types);
 }
 
-transform_input_spec make_input_spec(column_view const& column, bool is_scalar)
-{
-  transform_input_spec result{.type = column.type().id(), .is_scalar = is_scalar};
-  if (is_dictionary(column.type())) {
-    for (size_type i = 0; i < column.num_children(); ++i) {
-      result.children.push_back(make_input_spec(column.child(i), false));
-    }
-  } else if (column.type().id() == type_id::STRING &&
-             column.num_children() > strings_column_view::offsets_column_index) {
-    result.children.push_back(
-      make_input_spec(column.child(strings_column_view::offsets_column_index), false));
-  }
-  return result;
-}
+using jit::make_input_spec;
 
 transform_input_spec make_input_spec(input_column_view const& input)
 {
@@ -373,7 +360,7 @@ std::string reflect_udf_signature(bool is_null_aware,
   std::vector<std::string> in_types;
 
   for (size_t i = 0; i < inputs.size(); i++) {
-    auto element = reflect_input_element(inputs[i], use_physical_types);
+    auto element = reflect_input_value_type(inputs[i], use_physical_types);
     in_types.push_back(is_null_aware ? std::format("cuda::std::optional<{}>", element) : element);
   }
 

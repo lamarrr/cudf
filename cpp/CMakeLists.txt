@@ -1014,7 +1014,6 @@ add_library(
   src/reductions/count.cpp
   src/reductions/distinct_count.cu
   src/reductions/histogram.cu
-  src/reductions/jit_reduce.cu
   src/reductions/max.cu
   src/reductions/mean.cu
   src/reductions/min.cu
@@ -1023,6 +1022,7 @@ add_library(
   src/reductions/nunique.cpp
   src/reductions/product.cu
   src/reductions/quantile.cu
+  src/reductions/reduce_lto.cu
   src/reductions/reductions.cpp
   src/reductions/scan/ewm.cu
   src/reductions/scan/rank_scan.cu
