@@ -44,6 +44,7 @@
 
 #include <transform/checked_arithmetic.hpp>
 
+#include <array>
 #include <string>
 
 namespace cudf {
