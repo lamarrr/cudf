@@ -36,6 +36,9 @@ struct scalar_column_view : private column_view {
       this->size() == 1, "A scalar column view must have exactly one element.", std::logic_error);
   }
 
+  using column_view::child;
+  using column_view::child_begin;
+  using column_view::child_end;
   using column_view::data;
   using column_view::has_nulls;
   using column_view::head;
@@ -43,6 +46,7 @@ struct scalar_column_view : private column_view {
   using column_view::null_count;
   using column_view::null_mask;
   using column_view::nullable;
+  using column_view::num_children;
   using column_view::offset;
   using column_view::size;
   using column_view::type;
@@ -52,6 +56,46 @@ struct scalar_column_view : private column_view {
    * @return A reference to the underlying `column_view`
    */
   [[nodiscard]] column_view const& as_column_view() const noexcept { return *this; }
+};
+
+/**
+ * @brief A mutable one-row column view. Construction does not allocate device memory.
+ *
+ * Mask mutation requires an allocated mask. The caller must update the owning
+ * column's null count after modifying validity, as for mutable_column_view.
+ */
+struct mutable_scalar_column_view : private mutable_column_view {
+  /// Construct from exactly one row; throws std::logic_error otherwise.
+  explicit mutable_scalar_column_view(mutable_column_view view)
+    : mutable_column_view(std::move(view))
+  {
+    CUDF_EXPECTS(
+      size() == 1, "A scalar column view must have exactly one element.", std::logic_error);
+  }
+
+  using mutable_column_view::child;
+  using mutable_column_view::child_begin;
+  using mutable_column_view::child_end;
+  using mutable_column_view::data;
+  using mutable_column_view::has_nulls;
+  using mutable_column_view::head;
+  using mutable_column_view::is_empty;
+  using mutable_column_view::null_count;
+  using mutable_column_view::null_mask;
+  using mutable_column_view::nullable;
+  using mutable_column_view::num_children;
+  using mutable_column_view::offset;
+  using mutable_column_view::set_null_count;
+  using mutable_column_view::size;
+  using mutable_column_view::type;
+
+  /// Return the underlying mutable column view.
+  [[nodiscard]] mutable_column_view const& as_column_view() const noexcept { return *this; }
+  /// Convert to an immutable view of the same buffers.
+  operator scalar_column_view() const
+  {
+    return scalar_column_view{static_cast<column_view>(as_column_view())};
+  }
 };
 
 }  // namespace CUDF_EXPORT cudf

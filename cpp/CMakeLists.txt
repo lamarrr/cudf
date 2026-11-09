@@ -1045,6 +1045,7 @@ add_library(
   src/row_operator/primitive_row_operators.cu
   src/row_operator/row_operators.cu
   src/runtime/context.cpp
+  src/scalar/scalar_column_factories.cpp
   src/scalar/scalar.cpp
   src/scalar/scalar_factories.cpp
   src/search/contains_column.cu

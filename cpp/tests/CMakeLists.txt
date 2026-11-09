@@ -130,7 +130,7 @@ ConfigureTest(
 
 # ##################################################################################################
 # * scalar tests ----------------------------------------------------------------------------------
-ConfigureTest(SCALAR_TEST scalar/scalar_test.cpp scalar/scalar_device_view_test.cu)
+ConfigureTest(SCALAR_TEST scalar/scalar_test.cpp scalar/scalar_device_view_test.cu scalar/scalar_column_test.cu)
 
 # ##################################################################################################
 # * timestamps tests ------------------------------------------------------------------------------
