@@ -39,7 +39,7 @@ class string_view {
    *
    * The number of characters in a string is computed on-demand.
    */
-  static inline cudf::size_type const UNKNOWN_STRING_LENGTH{-1};
+  static constexpr cudf::size_type UNKNOWN_STRING_LENGTH{-1};
 
   /**
    * @brief Return the number of bytes in this string
