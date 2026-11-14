@@ -13,7 +13,6 @@
 #include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/traits.hpp>
 
-#include <cuda/std/algorithm>
 #include <cuda/std/optional>
 #include <cuda/std/type_traits>
 
