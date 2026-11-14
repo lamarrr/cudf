@@ -81,7 +81,7 @@ TYPED_TEST(FilterNumericTest, NoAssertions)
   auto const symbol              = this->equality_symbol(cudf::column_view{a}.type());
   cudf::transform_input inputs[] = {a, b};
 
-  EXPECT_NO_THROW(results = transform_and_apply_retention_mask(
+  ASSERT_NO_THROW(results = transform_and_apply_retention_mask(
                     std::span{inputs}, get_filter_udf(symbol), cudf::table_view{{a}}));
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, results[0]->view());
 }
@@ -132,7 +132,7 @@ TYPED_TEST(FilterFixedPointTest, NoAssertions)
   auto const symbol              = this->equality_symbol(cudf::column_view{a}.type());
   cudf::transform_input inputs[] = {a, b};
 
-  EXPECT_NO_THROW(results = transform_and_apply_retention_mask(
+  ASSERT_NO_THROW(results = transform_and_apply_retention_mask(
                     std::span{inputs}, get_filter_udf(symbol), cudf::table_view{{a}}));
 
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, results[0]->view());
@@ -150,7 +150,7 @@ TEST_F(FilterTestFixture, StringNoAssertions)
   std::vector<std::unique_ptr<cudf::column>> results;
   auto const symbol              = this->equality_symbol(cudf::column_view{a}.type());
   cudf::transform_input inputs[] = {a, b};
-  EXPECT_NO_THROW(results = transform_and_apply_retention_mask(
+  ASSERT_NO_THROW(results = transform_and_apply_retention_mask(
                     std::span{inputs}, get_filter_udf(symbol), cudf::table_view{{a}}));
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, results[0]->view());
 }

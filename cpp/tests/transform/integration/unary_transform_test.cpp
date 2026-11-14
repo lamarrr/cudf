@@ -1064,7 +1064,7 @@ TEST_F(UnaryOperationIntegrationTest, Transform_ErrorHandling)
     cudf::transform_output outputs[] = {
       {cudf::data_type(cudf::type_id::INT32), cudf::output_nullability::ALL_VALID}};
     std::unique_ptr<cudf::table> result;
-    EXPECT_NO_THROW(
+    ASSERT_NO_THROW(
       result = cudf::transform(
         cudf::test::get_transform_udf("divide_checked"), inputs, outputs, {}, std::nullopt));
 
