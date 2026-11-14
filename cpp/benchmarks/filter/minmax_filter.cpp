@@ -87,7 +87,7 @@ void BM_filter_min_max(nvbench::state& state)
                  std::back_inserter(filter_column_views),
                  [](auto const& col) { return col->view(); });
 
-  auto const symbol =
+  auto symbol =
     std::format("minmax_{}", cudf::type_to_name(cudf::data_type{cudf::type_to_id<key_type>()}));
 
   auto tree              = cudf::ast::tree{};
