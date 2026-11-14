@@ -11,11 +11,6 @@
 
 #include <string_view>
 
-/**
- * @brief Returns a named UDF from the shared embedded benchmark module.
- *
- * The fragment has static storage. The caller must keep the symbol alive during evaluation.
- */
 inline cudf::transform_udf get_benchmark_udf(std::string_view symbol)
 {
   static cudf::lto_fragment const fragment{

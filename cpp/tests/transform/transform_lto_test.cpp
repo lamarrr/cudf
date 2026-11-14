@@ -29,10 +29,6 @@ using column_wrapper = cudf::test::fixed_width_column_wrapper<T>;
 template <typename T>
 using decimal_wrapper = cudf::test::fixed_point_column_wrapper<typename T::rep>;
 
-namespace {
-
-}  // namespace
-
 TEST_F(TransformLTOTest, UdfAbiLayouts)
 {
   // Physical value types and the additional types used in UDF signatures.
@@ -53,7 +49,7 @@ TEST_F(TransformLTOTest, UdfAbiLayouts)
 #include <jit/udf_abi.cuh>
 #pragma nv_hdrstop
 )CUDA";
-  for (auto const* type : abi_types) {
+  for (auto type : abi_types) {
     source += std::format(R"CUDA(
 static_assert(sizeof({0}) == sizeof({1}), "ABI size: {0}");
 static_assert(alignof({0}) == alignof({1}), "ABI alignment: {0}");

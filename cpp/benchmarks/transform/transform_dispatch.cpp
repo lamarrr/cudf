@@ -39,13 +39,13 @@ transform_api api_from_string(std::string_view api)
   CUDF_FAIL("Unrecognized transform API: " + std::string{api});
 }
 
-std::string make_udf(cudf::size_type expression_depth)
+cudf::compiled_fragment make_udf(cudf::size_type expression_depth)
 {
   std::string expression = "in + in";
   for (cudf::size_type level = 1; level < expression_depth; ++level) {
     expression = std::format("({}) + in", expression);
   }
-  return std::format(R"CUDA(
+  auto source = std::format(R"CUDA(
 #include <cudf/udf_includes.hpp>
 extern "C" __device__ cudf::errc transform(int32_t* out, int32_t in)
 {{
@@ -53,7 +53,8 @@ extern "C" __device__ cudf::errc transform(int32_t* out, int32_t in)
   return cudf::errc::SUCCESS;
 }}
 )CUDA",
-                     expression);
+                            expression);
+  return cudf::compile_cuda_to_lto_ir(source.c_str());
 }
 
 // Measures warm dispatch overhead for equivalent LTO UDF and AST expressions through both the
@@ -72,14 +73,8 @@ void BM_transform_dispatch(nvbench::state& state)
   std::array<cudf::transform_input, 1> inputs{source_table->get_column(0).view()};
   std::array outputs{cudf::transform_output{cudf::data_type{cudf::type_id::INT32},
                                             cudf::output_nullability::ALL_VALID}};
-  auto const source = make_udf(expression_depth);
-  std::optional<cudf::compiled_fragment> compiled;
-  cudf::lto_fragment module;
-  if (api == transform_api::TRANSFORM || api == transform_api::TRANSFORM_PROGRAM) {
-    (void)compiled.emplace(cudf::compile_cuda_to_lto_ir(source.c_str()));
-    module = compiled->view();
-  }
-  cudf::transform_udf udf{"transform", {&module, 1}};
+  auto const compiled = make_udf(expression_depth);
+  auto fragment       = compiled.view();
 
   cudf::ast::tree tree;
   tree.push(cudf::ast::column_reference{0});
@@ -93,8 +88,11 @@ void BM_transform_dispatch(nvbench::state& state)
   switch (api) {
     case transform_api::TRANSFORM: cudf::transform(udf, inputs, outputs, {}, std::nullopt); break;
     case transform_api::TRANSFORM_PROGRAM:
-      program = std::make_unique<cudf::transform_program>(
-        udf, inputs, outputs, std::span<std::unique_ptr<cudf::column> const>{});
+      program =
+        std::make_unique<cudf::transform_program>(cudf::transform_udf{"transform", {&fragment, 1}},
+                                                  inputs,
+                                                  outputs,
+                                                  std::span<std::unique_ptr<cudf::column> const>{});
       break;
     case transform_api::AST: cudf::compute_column_jit(table, expression); break;
     case transform_api::AST_TRANSFORM_PROGRAM: {

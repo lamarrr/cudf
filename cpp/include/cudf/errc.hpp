@@ -26,14 +26,12 @@ namespace CUDF_EXPORT cudf {
 using error_int = cuda::std::int32_t;
 
 /**
- * @brief Operation error codes. Values in [CUDF_RESERVED_BEGIN, CUDF_RESERVED_END] are reserved for
- * libcudf.
- * User-defined error codes will be interpreted by the consumer.
- * @warning User-defined error codes must be in (`USER_RESERVED_BEGIN`, `USER_RESERVED_END`]
- * exceeding this range will result in undefined behavior.
+ * @brief Operation error codes. Values in range [CUDF_RESERVED_BEGIN, CUDF_RESERVED_END) are
+ * reserved for libcudf. User-defined error codes must be in range [`USER_RESERVED_BEGIN`,
+ * `USER_RESERVED_END`) and will be interpreted by the consumer.
  */
 enum class [[nodiscard]] errc : error_int {
-  CUDF_RESERVED_BEGIN = 0x0,
+  CUDF_RESERVED_BEGIN = 0,
   SUCCESS             = 0,
   ARITHMETIC_OVERFLOW = 1,
   DIVISION_BY_ZERO    = 2,

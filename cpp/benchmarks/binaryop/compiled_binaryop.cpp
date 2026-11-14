@@ -12,8 +12,6 @@
 
 #include <nvbench/nvbench.cuh>
 
-#include <optional>
-
 template <typename TypeLhs, typename TypeRhs, typename TypeOut>
 void BM_compiled_binaryop(nvbench::state& state, cudf::binary_operator binop)
 {

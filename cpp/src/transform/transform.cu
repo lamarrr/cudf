@@ -375,12 +375,19 @@ auto get_null_transformation(null_aware is_null_aware,
   return output_may_be_nullable;
 }
 
-void perform_checks(null_aware is_null_aware,
+void perform_checks(std::optional<transform_udf> const& udf,
+                    null_aware is_null_aware,
                     std::optional<size_type> in_row_size,
                     std::span<transform_input const> inputs,
                     std::span<transform_output const> outputs,
                     std::span<std::unique_ptr<column> const> string_offsets)
 {
+  if (udf.has_value()) {
+    CUDF_EXPECTS(!udf.symbol.empty() && !udf.fragments.empty(),
+                 "A transform requires an exported symbol and device modules",
+                 std::invalid_argument);
+  }
+
   CUDF_EXPECTS(std::none_of(outputs.begin(),
                             outputs.end(),
                             [](auto& out) {
@@ -767,11 +774,7 @@ static std::unique_ptr<table> execute_lto_transform(
   cuda::stream_ref stream,
   cudf::memory_resources mr)
 {
-  auto const is_null_aware = udf.is_null_aware;
-  CUDF_EXPECTS(!udf.symbol.empty() && !udf.fragments.empty(),
-               "A transform requires an exported symbol and device modules",
-               std::invalid_argument);
-  perform_checks(is_null_aware, in_row_size, inputs, outputs, string_offsets);
+  perform_checks(udf, in_row_size, inputs, outputs, string_offsets);
   auto row_size = in_row_size.has_value() ? *in_row_size : jit::get_projection_size(inputs);
   auto [columns, stencil] = make_outputs(is_null_aware,
                                          row_size,
@@ -949,7 +952,7 @@ std::unique_ptr<table> transform_program::run(std::span<transform_input const> i
 {
   CUDF_FUNC_RANGE();
   impl_->validate(inputs, outputs, string_offsets);
-  perform_checks(impl_->is_null_aware_, row_size, inputs, outputs, string_offsets);
+  perform_checks(std::nullopt, impl_->is_null_aware_, row_size, inputs, outputs, string_offsets);
   return execute_transform(impl_->kernel_,
                            impl_->is_null_aware_,
                            row_size,

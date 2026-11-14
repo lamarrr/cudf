@@ -367,11 +367,9 @@ std::unique_ptr<column> binary_operation(column_view const& lhs,
     std::invalid_argument);
   std::array<transform_input, 2> inputs{lhs, rhs};
   std::array<transform_output, 1> outputs{transform_output{.type = output_type}};
-  auto result =
-    cudf::transform(udf, inputs, outputs, {}, std::nullopt, stream, mr)->release();
-  return std::move(result.front());
+  return std::move(
+    cudf::transform(udf, inputs, outputs, {}, std::nullopt, stream, mr)->release().front());
 }
-
 }  // namespace detail
 
 int32_t binary_operation_fixed_point_scale(binary_operator op,
